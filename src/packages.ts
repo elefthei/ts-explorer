@@ -1,4 +1,4 @@
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import type { PackageInfo } from "./types.ts";
 
@@ -27,23 +27,24 @@ async function expandPattern(root: string, pattern: string): Promise<string[]> {
   const glob = new Bun.Glob(`${pattern.replace(/\\/g, "/")}/package.json`);
   const matches: string[] = [];
   for await (const match of glob.scan({ cwd: root, onlyFiles: true, dot: true })) {
-    matches.push(match.replace(/\/package\.json$/, ""));
+    matches.push(toPosix(match).replace(/\/package\.json$/, ""));
   }
   return matches;
 }
 
 export async function discoverPackages(sourceDir: string): Promise<readonly PackageInfo[]> {
-  const rootManifest = await readManifest(join(sourceDir, "package.json"));
-  const rootText = await readFile(join(sourceDir, "package.json"), "utf8").catch(() => null);
+  const root = await realpath(sourceDir).catch(() => sourceDir);
+  const rootManifest = await readManifest(join(root, "package.json"));
+  const rootText = await readFile(join(root, "package.json"), "utf8").catch(() => null);
   if (rootText !== null && !rootManifest) throw new Error("root package.json is malformed");
 
   let directories: string[] = [];
   const patterns = workspacePatterns(rootManifest?.workspaces);
   if (patterns.length) {
-    const expanded = await Promise.all(patterns.map((pattern) => expandPattern(sourceDir, pattern)));
+    const expanded = await Promise.all(patterns.map((pattern) => expandPattern(root, pattern)));
     directories = expanded.flat();
   } else {
-    const packagesDir = join(sourceDir, "packages");
+    const packagesDir = join(root, "packages");
     const entries = await readdir(packagesDir, { withFileTypes: true }).catch(() => []);
     directories = entries.filter((entry) => entry.isDirectory()).map((entry) => `packages/${entry.name}`);
   }
@@ -52,7 +53,7 @@ export async function discoverPackages(sourceDir: string): Promise<readonly Pack
   const candidates = [...new Set(directories)].sort();
   const raw: Array<{ name: string; path: string; manifest: Record<string, unknown> }> = [];
   for (const path of candidates) {
-    const manifestPath = join(sourceDir, path, "package.json");
+    const manifestPath = join(root, path, "package.json");
     const manifest = await readManifest(manifestPath);
     if (!manifest || typeof manifest.name !== "string" || !manifest.name) continue;
     raw.push({ name: manifest.name, path: toPosix(path), manifest });

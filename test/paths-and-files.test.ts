@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveInside, PathError } from "../src/paths.ts";
@@ -9,14 +9,19 @@ test("rejects traversal and symlink escapes", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-"));
   const outside = await mkdtemp(join(tmpdir(), "ts-explorer-outside-"));
   await mkdir(join(root, "src"));
-  await writeFile(join(root, "src", "ok.ts"), "export const ok = 1;\n");
+  const file = join(root, "src", "ok.ts");
+  await writeFile(file, "export const ok = 1;\n");
   await writeFile(join(outside, "secret.ts"), "secret");
   await symlink(outside, join(root, "escape"));
+  const canonicalRoot = await realpath(root);
+  const canonicalFile = await realpath(file);
 
   await expect(resolveInside(root, "../secret.ts", true)).rejects.toMatchObject({ code: "FORBIDDEN" });
   await expect(resolveInside(root, "/etc/passwd", true)).rejects.toMatchObject({ code: "FORBIDDEN" });
   await expect(resolveInside(root, "escape/secret.ts", true)).rejects.toMatchObject({ code: "FORBIDDEN" });
-  expect(await resolveInside(root, "src/ok.ts", true)).toBe(join(root, "src", "ok.ts"));
+  await expect(resolveInside(canonicalRoot, "escape/secret.ts", true)).rejects.toMatchObject({ code: "FORBIDDEN" });
+  expect(await resolveInside(root, "src/ok.ts", true)).toBe(canonicalFile);
+  expect(await resolveInside(canonicalRoot, "src/ok.ts", true)).toBe(canonicalFile);
 });
 
 test("formats without writing and saves only with a matching content hash", async () => {

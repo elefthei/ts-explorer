@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { discoverPackages, buildPackageDiagram } from "../src/packages.ts";
@@ -18,11 +18,14 @@ test("discovers workspace packages and only workspace dependency edges", async (
   await writeFile(join(root, "packages", "a", "package.json"), JSON.stringify({ name: "a", dependencies: { b: "*", external: "*" } }));
   await writeFile(join(root, "packages", "b", "package.json"), JSON.stringify({ name: "b", devDependencies: {} }));
 
-  const packages = await discoverPackages(root);
-  expect(packages).toEqual([
+  const expected = [
     { name: "a", path: "packages/a", dependencies: ["b"] },
     { name: "b", path: "packages/b", dependencies: [] },
-  ]);
+  ];
+  const packages = await discoverPackages(root);
+  const canonicalPackages = await discoverPackages(await realpath(root));
+  expect(packages).toEqual(expected);
+  expect(canonicalPackages).toEqual(expected);
   expect(buildPackageDiagram(packages)).toContain("p0 --> p1");
 });
 
