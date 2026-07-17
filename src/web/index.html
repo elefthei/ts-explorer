@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TypeScript Explorer</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">TS</span><div><strong>Project Explorer</strong><small id="source-label">Loading source…</small></div></div>
+      <nav class="modes" aria-label="Diagram mode"><button id="packages-mode" class="mode active">Packages</button><button id="uml-mode" class="mode">UML</button></nav>
+      <div class="top-actions"><span id="status" class="status">Starting watcher…</span><button id="zoom-out" title="Zoom out">−</button><button id="zoom-in" title="Zoom in">+</button><button id="zoom-reset" title="Reset diagram view">Reset</button><button id="legend-toggle" title="Toggle legend">Legend</button></div>
+    </header>
+    <main class="workspace">
+      <aside class="sidebar" id="sidebar"><div class="sidebar-head"><h2>Files</h2><button id="sidebar-toggle" aria-label="Collapse file tree">‹</button></div><input id="tree-filter" type="search" placeholder="Filter files…" aria-label="Filter files" /><div id="tree" class="tree" role="tree"></div></aside>
+      <section class="graph-panel"><div id="error-panel" class="error-panel" hidden></div><div id="diagram-stage" class="diagram-stage"><div id="svg-holder" class="svg-holder"></div></div><details id="raw-dsl"><summary>Raw Mermaid DSL</summary><pre id="dsl-content"></pre></details><div id="legend" class="legend" hidden><span><i class="swatch interface"></i>Interface</span><span><i class="swatch abstract"></i>Abstract</span><span><i class="swatch concrete"></i>Concrete</span><span><i class="swatch type"></i>Type</span><span><i class="swatch enum"></i>Enum</span><span><i class="swatch test"></i>Test</span></div></section>
+      <aside id="editor-panel" class="editor-panel" hidden><div class="editor-head"><div><strong id="editor-name">File</strong><small id="editor-path"></small></div><button id="editor-close" aria-label="Close editor">×</button></div><div id="conflict" class="conflict" hidden>File changed on disk. <button id="reload-file">Reload</button><button id="keep-file">Keep mine</button></div><div id="editor" class="editor"></div><div class="editor-actions"><button id="format-file">Format</button><button id="save-file" class="primary">Save</button></div></aside>
+    </main>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>
