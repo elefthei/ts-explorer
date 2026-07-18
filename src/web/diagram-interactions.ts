@@ -11,8 +11,6 @@ export type ViewportState = {
   y: number;
 };
 
-export const MIN_ZOOM = 0.2;
-export const MAX_ZOOM = 4;
 
 export function shouldStackDiagram(kind: DiagramKind): boolean {
   return kind === "uml";
@@ -64,12 +62,12 @@ export function formatUmlMethodReturnLabel(text: string): string | undefined {
 
 export function zoomViewportAt(
   viewport: ViewportState,
-  delta: number,
+  factor: number,
   originX: number,
   originY: number,
 ): void {
-  const nextScale = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, viewport.scale + delta));
-  if (nextScale === viewport.scale) return;
+  const nextScale = viewport.scale * factor;
+  if (!Number.isFinite(nextScale) || nextScale <= 0 || nextScale === viewport.scale) return;
   const worldX = (originX - viewport.x) / viewport.scale;
   const worldY = (originY - viewport.y) / viewport.scale;
   viewport.scale = nextScale;

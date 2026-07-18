@@ -6,8 +6,6 @@ import {
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
   hasPassedDragThreshold,
-  MAX_ZOOM,
-  MIN_ZOOM,
   panViewport,
   resolveUmlSource,
   shouldStackDiagram,
@@ -172,33 +170,40 @@ test("panViewport accumulates signed movement deltas", () => {
   expect(viewport).toEqual({ scale: 1, x: 5, y: 1 });
 });
 
-test("zoomViewportAt zooms in and out around the supplied origin", () => {
+test("zoomViewportAt applies multiplicative zoom-in and zoom-out factors around the supplied origin", () => {
   const viewport = { scale: 1, x: 8, y: -6 };
 
-  zoomViewportAt(viewport, 0.5, 0, 0);
+  zoomViewportAt(viewport, 1.5, 0, 0);
   expect(viewport).toEqual({ scale: 1.5, x: 12, y: -9 });
 
-  zoomViewportAt(viewport, -0.25, 0, 0);
-  expect(viewport).toEqual({ scale: 1.25, x: 10, y: -7.5 });
+  zoomViewportAt(viewport, 0.5, 0, 0);
+  expect(viewport).toEqual({ scale: 0.75, x: 6, y: -4.5 });
 });
 
-test("zoomViewportAt clamps to the exported bounds without boundary translation drift", () => {
-  expect(MIN_ZOOM).toBe(0.2);
-  expect(MAX_ZOOM).toBe(4);
+test("zoomViewportAt scales above and below the former bounds", () => {
+  const upper = { scale: 1, x: 10, y: -5 };
+  zoomViewportAt(upper, 8, 40, 25);
+  expect(upper).toEqual({ scale: 8, x: -200, y: -215 });
 
-  const lower = { scale: 0.3, x: 10, y: -5 };
-  zoomViewportAt(lower, -1, 40, 25);
-  expect(lower).toEqual({ scale: 0.2, x: 20, y: 5 });
+  const lower = { scale: 1, x: 10, y: -5 };
+  zoomViewportAt(lower, 0.125, 40, 25);
+  expect(lower).toEqual({ scale: 0.125, x: 36.25, y: 21.25 });
+});
 
-  zoomViewportAt(lower, -1, 40, 25);
-  expect(lower).toEqual({ scale: 0.2, x: 20, y: 5 });
+test("zoomViewportAt leaves the viewport unchanged for invalid factors", () => {
+  const initial = { scale: 2, x: 10, y: -20 };
+  const cases = [
+    { name: "zero", factor: 0 },
+    { name: "negative", factor: -0.5 },
+    { name: "Infinity", factor: Infinity },
+    { name: "NaN", factor: NaN },
+  ] as const;
 
-  const upper = { scale: 3.5, x: -10, y: 20 };
-  zoomViewportAt(upper, 1, 60, -15);
-  expect(upper).toEqual({ scale: 4, x: -20, y: 25 });
-
-  zoomViewportAt(upper, 1, 60, -15);
-  expect(upper).toEqual({ scale: 4, x: -20, y: 25 });
+  for (const { name, factor } of cases) {
+    const viewport = { ...initial };
+    zoomViewportAt(viewport, factor, 110, 80);
+    expect(viewport, name).toEqual(initial);
+  }
 });
 
 test("zoomViewportAt preserves the world point under a nonzero pointer origin", () => {
@@ -209,7 +214,7 @@ test("zoomViewportAt preserves the world point under a nonzero pointer origin", 
     y: (origin.y - viewport.y) / viewport.scale,
   };
 
-  zoomViewportAt(viewport, 0.5, origin.x, origin.y);
+  zoomViewportAt(viewport, 1.25, origin.x, origin.y);
 
   expect(viewport).toEqual({ scale: 2.5, x: -15, y: -45 });
   expect((origin.x - viewport.x) / viewport.scale).toBe(worldBefore.x);
