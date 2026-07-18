@@ -56,7 +56,7 @@ Use `--host 0.0.0.0` only when you intentionally want the server reachable beyon
 ## Explorer workflow
 
 - **Packages** shows workspace package dependencies as a Mermaid graph.
-- **UML** shows TsUML2 class relationships for the selected package or folder.
+- **UML** shows TsUML2 class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
 - The file tree lists packages, folders, and files. Use the filter to narrow it.
 - Select a TypeScript file to open it in the editor. Other text files are read-only.
 - **Format** formats the editor buffer in memory with Prettier.

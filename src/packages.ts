@@ -1,5 +1,5 @@
 import { readFile, readdir, realpath } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { join, sep } from "node:path";
 import type { PackageInfo } from "./types.ts";
 
 function toPosix(path: string): string {

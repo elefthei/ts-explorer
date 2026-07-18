@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { format } from "prettier";
 import { buildPackageDiagram, discoverPackages } from "./packages.ts";
-import { ensureRegularFile, PathError, resolveInside } from "./paths.ts";
+import { ensureRegularFile, resolveInside } from "./paths.ts";
 import { readTree } from "./tree.ts";
 import { isEditablePath, isTypeScriptPath, type DiagramKind, type DiagramResponse, type FileResponse, type PackageInfo, type TreeNode, type WatchEventName } from "./types.ts";
-import { buildUmlDiagram } from "./uml.ts";
+import { buildUmlDiagrams } from "./uml.ts";
 import { startSourceWatcher } from "./watcher.ts";
 
 export class ConflictError extends Error {
@@ -38,6 +38,11 @@ type ExplorerStore = {
   close(): Promise<void>;
 };
 
+type DiagramPayload = Pick<
+  DiagramResponse,
+  "dsl" | "dsls" | "sources" | "externalUsers" | "localUsers"
+>;
+
 function hashContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
 }
@@ -55,7 +60,7 @@ export function createExplorerStore(sourceDir: string, onWatcherError?: (error: 
   let treeCache: TreeNode | undefined;
   let packagesCache: readonly PackageInfo[] | undefined;
   const diagramCache = new Map<string, DiagramResponse>();
-  const lastGood = new Map<string, string>();
+  const lastGood = new Map<string, DiagramPayload>();
   let closed = false;
   const watcherPromise = startSourceWatcher(sourceDir, (paths, events) => store.applyWatchBatch(paths, events), onWatcherError ?? (() => undefined));
 
@@ -77,23 +82,42 @@ export function createExplorerStore(sourceDir: string, onWatcherError?: (error: 
       if (cached && cached.version === version) return cached;
       const requestedVersion = version;
       try {
-        let dsl: string;
-        if (kind === "packages") dsl = buildPackageDiagram(await store.getPackages());
-        else dsl = await buildUmlDiagram(sourceDir, scopePath, await store.getPackages());
-        const response: DiagramResponse = { kind, scopePath, version: requestedVersion, status: "ready", dsl };
+        let diagram: DiagramPayload;
+        if (kind === "packages") {
+          const dsl = buildPackageDiagram(await store.getPackages());
+          diagram = { dsl, dsls: [dsl], sources: [], externalUsers: [], localUsers: [] };
+        } else {
+          const uml = await buildUmlDiagrams(sourceDir, scopePath, await store.getPackages());
+          diagram = {
+            dsl: uml.dsl,
+            dsls: uml.dsls,
+            sources: uml.sources,
+            externalUsers: uml.externalUsers,
+            localUsers: uml.localUsers,
+          };
+        }
+        const response: DiagramResponse = { kind, scopePath, version: requestedVersion, status: "ready", ...diagram };
         if (requestedVersion === version) {
           diagramCache.set(cacheKey, response);
-          lastGood.set(cacheKey, dsl);
+          lastGood.set(cacheKey, diagram);
         }
         return response;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const fallback = kind === "packages" ? "flowchart LR" : "classDiagram";
+        const diagram = lastGood.get(cacheKey) ?? {
+          dsl: fallback,
+          dsls: [fallback],
+          sources: [],
+          externalUsers: [],
+          localUsers: [],
+        };
         const response: DiagramResponse = {
           kind,
           scopePath,
           version,
           status: "error",
-          dsl: lastGood.get(cacheKey) ?? (kind === "packages" ? "flowchart LR" : "classDiagram"),
+          ...diagram,
           error: message,
         };
         diagramCache.set(cacheKey, response);
@@ -128,14 +152,14 @@ export function createExplorerStore(sourceDir: string, onWatcherError?: (error: 
       await writeFile(absolute, content, "utf8");
       return store.readFile(relativePath);
     },
-    applyWatchBatch(paths, events) {
+    applyWatchBatch(paths, _events) {
       if (closed) return;
       version += 1;
       treeCache = undefined;
       packagesCache = undefined;
       diagramCache.clear();
       for (const key of [...lastGood.keys()]) {
-        if (paths.some((path) => key.endsWith(path) || key.includes(path))) lastGood.delete(key);
+        if (paths.some((path) => key.includes(path))) lastGood.delete(key);
       }
     },
     async close() {
