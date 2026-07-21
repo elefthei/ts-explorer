@@ -2,13 +2,27 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import yargs from "yargs/yargs";
 import { stat } from "node:fs/promises";
-import { startServer } from "./server.ts";
+import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
+import type { WatchEventName } from "./types.ts";
+import { ExplorerServer } from "./server.ts";
 
-export type CliOptions = {
+type CliOptions = {
   sourceDir: string;
   host: string;
   port: number;
 };
+
+export function formatSyncProgress(event: PreprocessProgressEvent): string {
+  return `[sync] ${event.event} ${event.component} ${event.resource} generation=${event.generationId} cause=${event.cause}`;
+}
+
+export function formatWatchInvalidation(
+  paths: readonly string[],
+  events: readonly WatchEventName[],
+  version: number,
+): string {
+  return `[sync] invalidate watch version=${version} paths=${JSON.stringify(paths)} events=${JSON.stringify(events)}`;
+}
 
 function expandHome(value: string): string {
   if (value === "~") return homedir();
@@ -50,7 +64,7 @@ export function parseCliOptions(args: string[]): CliOptions | null {
   return { sourceDir: resolve(expandHome(parsed.dir)), host: parsed.host, port: parsed.port };
 }
 
-export async function validateSourceDir(sourceDir: string): Promise<void> {
+async function validateSourceDir(sourceDir: string): Promise<void> {
   try {
     const sourceStat = await stat(sourceDir);
     if (!sourceStat.isDirectory()) throw new Error("not a directory");
@@ -64,10 +78,13 @@ if (import.meta.main) {
     const options = parseCliOptions(process.argv.slice(2));
     if (options) {
       await validateSourceDir(options.sourceDir);
-      const server = await startServer({
+      const server = await ExplorerServer.start({
         ...options,
         onSyncProgress(event) {
-          console.log(`[sync] ${event.event} ${event.component} ${event.resource}`);
+          console.log(formatSyncProgress(event));
+        },
+        onWatchBatch(paths, events, version) {
+          console.log(formatWatchInvalidation(paths, events, version));
         },
       });
       console.log(`TS explorer listening at http://${options.host}:${server.port}`);

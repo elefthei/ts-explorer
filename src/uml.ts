@@ -24,8 +24,6 @@ import { partitionUmlCommunities } from "./uml/partition.ts";
 import { renderUmlDsl } from "./uml/render.ts";
 import { analyzeUmlTypes } from "./uml/usage.ts";
 
-export type { UmlDiagramBundle, UmlGraph } from "./uml/model.ts";
-
 function isProjectSourcePath(path: string): boolean {
   return !isUmlIgnoredPath(path);
 }
@@ -201,6 +199,17 @@ export async function buildUmlDiagrams(
     categories,
     ignoredExternalUserFiles,
   );
+  const localOwnerEntityIds = new Set<string>();
+  for (const local of analysis.localUserNodes) {
+    if (local.ownerEntityId) localOwnerEntityIds.add(local.ownerEntityId);
+  }
+  if (localOwnerEntityIds.size) {
+    for (const declaration of declarations) {
+      for (let index = declaration.types.length - 1; index >= 0; index -= 1) {
+        if (localOwnerEntityIds.has(declaration.types[index]!.id)) declaration.types.splice(index, 1);
+      }
+    }
+  }
 
   const dsl = renderUmlDsl(
     declarations,
@@ -238,12 +247,4 @@ export async function buildUmlDiagrams(
     localUsers: analysis.localUserNodes.map((node) => node.navigation),
     graph,
   };
-}
-
-export async function buildUmlDiagram(
-  sourceDir: string,
-  scopePath: string,
-  packages: readonly PackageInfo[],
-): Promise<string> {
-  return (await buildUmlDiagrams(sourceDir, scopePath, packages)).dsl;
 }

@@ -2,16 +2,16 @@ import { lstat, readFile as readFileBytes } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { format, formatWithCursor } from "prettier";
 import {
-  openCache,
+  Cache,
   type CacheDiagramResponse,
   type CacheFileWrite,
   type CacheGotoDefinitionWrite,
-  type ExplorerCacheDatabase,
 } from "./cache.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
 import { buildPackageDiagram, discoverPackages } from "./packages.ts";
 import { ensureRegularFile, normalizeRelativePath, PathError, resolveInside } from "./paths.ts";
 import type {
+  PreprocessCause,
   PreprocessFailure,
   PreprocessRequest,
   PreprocessResponse,
@@ -40,7 +40,7 @@ class PreprocessRequestError extends Error {
 
 type PreprocessState = {
   sourceDir: string;
-  cache: ExplorerCacheDatabase;
+  cache: Cache;
 };
 
 let state: PreprocessState | undefined;
@@ -75,6 +75,13 @@ function requireString(value: unknown, field: string): string {
 function requireBoolean(value: unknown, field: string): boolean {
   if (typeof value !== "boolean") {
     throw new PreprocessRequestError("BAD_REQUEST", `${field} must be a boolean`);
+  }
+  return value;
+}
+
+function parseCause(value: unknown): PreprocessCause {
+  if (value !== "startup" && value !== "watch") {
+    throw new PreprocessRequestError("BAD_REQUEST", "cause must be startup or watch");
   }
   return value;
 }
@@ -131,12 +138,8 @@ function parseRequest(value: unknown): PreprocessRequest {
         dbPath: requireString(value.dbPath, "dbPath"),
         recover: requireBoolean(value.recover, "recover"),
       };
-    case "begin-generation": {
-      if (value.cause !== "startup" && value.cause !== "watch") {
-        throw new PreprocessRequestError("BAD_REQUEST", "cause must be startup or watch");
-      }
-      return { id, type, cause: value.cause };
-    }
+    case "begin-generation":
+      return { id, type, cause: parseCause(value.cause) };
     case "discover-packages":
     case "read-tree":
     case "read-packages":
@@ -147,6 +150,7 @@ function parseRequest(value: unknown): PreprocessRequest {
         id,
         type,
         generationId: requireSafeInteger(value.generationId, "generationId"),
+        cause: parseCause(value.cause),
         scope: parseScope(value.scope),
         packages: parsePackages(value.packages),
       };
@@ -431,19 +435,22 @@ async function preprocessFile(
 }
 
 async function runPhase<Value>(
+  generationId: number,
+  cause: PreprocessCause,
   component: PreprocessProgressEvent["component"],
   resource: string,
   operation: () => Promise<Value>,
 ): Promise<Value> {
-  await sendMessage({ event: "start", component, resource });
+  await sendMessage({ event: "start", component, resource, generationId, cause });
   const value = await operation();
-  await sendMessage({ event: "done", component, resource });
+  await sendMessage({ event: "done", component, resource, generationId, cause });
   return value;
 }
 
 async function preprocessScope(
   preprocessState: PreprocessState,
   generationId: number,
+  cause: PreprocessCause,
   requestedScope: PreprocessScope,
   packages: readonly PackageInfo[],
 ): Promise<{ children: PreprocessScope[] }> {
@@ -484,19 +491,27 @@ async function preprocessScope(
     packages,
   );
   const diagram = shouldBuildUml
-    ? await runPhase("uml", resource, buildDiagram)
+    ? await runPhase(generationId, cause, "uml", resource, buildDiagram)
     : await buildDiagram();
   const processedFile = isDirectoryScope
     ? undefined
-    : await runPhase(
-      "code",
-      resource,
-      () => preprocessFile(
+    : isSourcePath(scope.path)
+      ? await runPhase(
+        generationId,
+        cause,
+        "code",
+        resource,
+        () => preprocessFile(
+          absolutePath,
+          scope.path,
+          diagram.status === "ready" ? diagram.definitions : [],
+        ),
+      )
+      : await preprocessFile(
         absolutePath,
         scope.path,
         diagram.status === "ready" ? diagram.definitions : [],
-      ),
-    );
+      );
   preprocessState.cache.writeScope(generationId, {
     entries: [ownEntry, ...children],
     diagram,
@@ -584,7 +599,7 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
   if (request.type === "init") {
     if (state) throw new PreprocessRequestError("BAD_REQUEST", "preprocess child is already initialized");
     const sourceDir = await resolveInside(request.sourceDir, "", true);
-    const cache = openCache(request.dbPath);
+    const cache = new Cache(request.dbPath);
     try {
       const activeGenerationId = request.recover
         ? cache.recover()
@@ -615,7 +630,13 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
     case "preprocess-scope":
       return success(
         request,
-        await preprocessScope(preprocessState, request.generationId, request.scope, request.packages),
+        await preprocessScope(
+          preprocessState,
+          request.generationId,
+          request.cause,
+          request.scope,
+          request.packages,
+        ),
       );
     case "read-tree": {
       const entries = preprocessState.cache.readTreeEntries(request.generationId);

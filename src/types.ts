@@ -18,7 +18,7 @@ export type PackageDiagramNode = {
   path: string;
 };
 
-export type ExplorerStatus = "ready" | "error";
+type ExplorerStatus = "ready" | "error";
 export type DiagramKind = "packages" | "uml";
 
 export type PreprocessPriorityStatus = "queued" | "processing" | "done";
@@ -128,7 +128,7 @@ export type FileResponse = {
 
 export type WatchEventName = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
 
-export type WatchEvent = {
+type WatchEvent = {
   type: "changed";
   version: number;
   paths: string[];

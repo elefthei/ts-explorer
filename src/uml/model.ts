@@ -8,9 +8,9 @@ import type {
   UmlExternalUser,
 } from "../types.ts";
 
-export type UmlGraphNodeKind = "entity" | "boundary" | "local-user" | "external-user";
+type UmlGraphNodeKind = "entity" | "boundary" | "local-user" | "external-user";
 
-export type UmlGraphRelationKind =
+type UmlGraphRelationKind =
   | "heritage"
   | "member-association"
   | "method-return"
@@ -73,6 +73,7 @@ export type ExternalUserNode = {
 
 export type LocalUserNode = {
   navigation: UmlLocalUser;
+  ownerEntityId?: string;
   targets: ExternalUserTarget[];
 };
 
@@ -98,7 +99,7 @@ export type UmlAnalysis = {
   externalUserNodes: ExternalUserNode[];
 };
 
-export type UmlCategory = {
+type UmlCategory = {
   category: string;
   test: boolean;
 };

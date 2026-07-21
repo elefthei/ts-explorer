@@ -18,7 +18,7 @@ import type {
 } from "../types.ts";
 import {
   adjacentTreeRowIndex,
-  createRequestSequence,
+  RequestSequence,
   externalUserIdFromNodeId,
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
@@ -37,15 +37,15 @@ type Diagram={kind:"packages"|"uml";scopePath:string;version:number;status:"read
 type FileResponse={path:string;content:string;definitions:EditorGotoDefinition[];cursorOffset?:number};
 type WatchMessage={type:"changed";version:number;paths:string[];events:string[]}|{type:"cache-ready";version:number}|{type:"watch-error";version:number;error:string};
 const $=<T extends Element = HTMLInputElement>(selector:string)=>document.querySelector<T>(selector)!;
-const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,ws:null as WebSocket|null,retry:250,expandedDirs:new Set<string>()};
+const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
 const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
-const diagramRequests=createRequestSequence();
-const searchRequests=createRequestSequence();
-const priorityRequests=createRequestSequence();
-const definitionRequests=createRequestSequence();
-const editorRequests=createRequestSequence();
+const diagramRequests=new RequestSequence();
+const searchRequests=new RequestSequence();
+const priorityRequests=new RequestSequence();
+const definitionRequests=new RequestSequence();
+const editorRequests=new RequestSequence();
 const emittedUmlScopes=new Set<string>();
 mermaid.initialize({startOnLoad:false,securityLevel:"strict",theme:"dark"});
 async function api<T>(url:string,init?:RequestInit):Promise<T>{const response=await fetch(url,init);const body=await response.json() as T & {error?:string};if(!response.ok)throw new Error(body.error??`Request failed (${response.status})`);return body;}
@@ -58,7 +58,6 @@ async function sendPreprocessControl(request:PreprocessControlRequest):Promise<P
     body:JSON.stringify(request),
   });
 }
-type RequestSequence={next():number;isCurrent(token:number):boolean};
 async function prioritizeScope(
   resource:string,
   sequence:RequestSequence,
@@ -503,7 +502,7 @@ async function selectScope(
   searchRequests.next();
   if(!isCurrent())return false;
   state.mode=requestedMode??(node.path===""||node.name==="packages"?"packages":"uml");
-  state.scope=node.path;
+  state.scope=state.mode==="packages"?"":node.path;
   if(state.mode==="uml")state.umlScope=node.path;
   activateView(state.mode);
   viewport.reset();
@@ -539,7 +538,7 @@ function destroyEditor(invalidate=true):void{
   $("#editor-content").hidden=true;
   $("#editor-empty").hidden=false;
 }
-function revealEditorOffset(offset:number):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});state.view.focus();}
+function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
 function editorDefinitionDecorations(file:FileResponse){
   return Decoration.set(file.definitions.flatMap((definition)=>{
     if(definition.displayFrom<0||definition.displayTo>file.content.length||definition.displayFrom>=definition.displayTo)return[];
@@ -579,6 +578,7 @@ async function openFile(
   path:string,
   position?:UmlSourceLocation,
   context?:DefinitionNavigationContext,
+  activate=true,
 ):Promise<boolean>{
   if(!context){
     definitionRequests.next();
@@ -612,8 +612,8 @@ async function openFile(
       destroyEditor(false);
       return false;
     }
-    activateView("editor");
-    if(file.cursorOffset!==undefined)revealEditorOffset(file.cursorOffset);
+    if(activate)activateView("editor");
+    if(file.cursorOffset!==undefined)revealEditorOffset(file.cursorOffset,activate);
     setStatus("Read-only preprocessed source");
     return true;
   }catch(error){
@@ -658,6 +658,8 @@ async function navigateToDefinition(
     if(view==="editor"){
       await openFile(definition.source.path,definition.source,context);
     }else{
+      const opened=await openFile(definition.source.path,definition.source,context,false);
+      if(!opened||!definitionContextCurrent(context))return;
       await selectScope(
         {
           name:definition.name,
@@ -691,7 +693,7 @@ function handleWatch(message:WatchMessage){
   refreshCachedViews();
   setStatus(`Source changed · v${message.version}`);
 }
-function connect(){const protocol=location.protocol==="https:"?"wss":"ws";const ws=new WebSocket(`${protocol}://${location.host}/ws`);state.ws=ws;ws.onopen=()=>{state.retry=250;setStatus("Watcher connected");};ws.onmessage=(event)=>{try{handleWatch(JSON.parse(event.data) as WatchMessage);}catch(error){setStatus(String(error),true);}};ws.onclose=()=>{setStatus("watcher disconnected",true);setTimeout(connect,state.retry);state.retry=Math.min(2000,state.retry*2);};}
+function connect(){const protocol=location.protocol==="https:"?"wss":"ws";const ws=new WebSocket(`${protocol}://${location.host}/ws`);ws.onopen=()=>{state.retry=250;setStatus("Watcher connected");};ws.onmessage=(event)=>{try{handleWatch(JSON.parse(event.data) as WatchMessage);}catch(error){setStatus(String(error),true);}};ws.onclose=()=>{setStatus("watcher disconnected",true);setTimeout(connect,state.retry);state.retry=Math.min(2000,state.retry*2);};}
 function toggleSidebar(){const sidebar=$("#sidebar");const collapsed=sidebar.classList.toggle("collapsed");$(".workspace").classList.toggle("sidebar-collapsed",collapsed);const button=$("#sidebar-toggle");button.textContent=collapsed?"›":"‹";button.setAttribute("aria-label",collapsed?"Expand file tree":"Collapse file tree");button.setAttribute("aria-expanded",String(!collapsed));}
 const diagramStage=$("#diagram-stage");
 const dragState={pointerId:null as number|null,startX:0,startY:0,lastX:0,lastY:0,moved:false,suppressClick:false};

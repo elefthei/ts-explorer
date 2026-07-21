@@ -1,8 +1,4 @@
-import {
-  UML_METHOD_RETURN_MARKER,
-  type DiagramKind,
-  type UmlSourceLocation,
-} from "../types.ts";
+import { UML_METHOD_RETURN_MARKER, type DiagramKind } from "../types.ts";
 
 export type ViewportState = {
   scale: number;
@@ -15,15 +11,16 @@ export function shouldStackDiagram(kind: DiagramKind): boolean {
   return kind === "uml";
 }
 
-export function createRequestSequence(): {
-  next(): number;
-  isCurrent(token: number): boolean;
-} {
-  let latest = 0;
-  return {
-    next: () => ++latest,
-    isCurrent: (token) => token > 0 && token === latest,
-  };
+export class RequestSequence {
+  #latest = 0;
+
+  next(): number {
+    return ++this.#latest;
+  }
+
+  isCurrent(token: number): boolean {
+    return token > 0 && token === this.#latest;
+  }
 }
 
 export function panViewport(viewport: ViewportState, dx: number, dy: number): void {
@@ -109,19 +106,3 @@ export function zoomViewportAt(
   viewport.y = originY - worldY * nextScale;
 }
 
-
-type TextDocument = {
-  lines: number;
-  line(number: number): { from: number; to: number };
-};
-
-function positiveInteger(value: number): number {
-  return Number.isFinite(value) ? Math.max(1, Math.trunc(value)) : 1;
-}
-
-export function editorOffset(doc: TextDocument, location: UmlSourceLocation): number {
-  const lineNumber = Math.min(positiveInteger(location.line), Math.max(1, doc.lines));
-  const line = doc.line(lineNumber);
-  const columnOffset = positiveInteger(location.column) - 1;
-  return Math.min(line.from + columnOffset, line.to);
-}

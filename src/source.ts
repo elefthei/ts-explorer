@@ -10,7 +10,7 @@ const TRAVERSAL_IGNORED_SEGMENTS = new Set([
 ]);
 const UML_IGNORED_SEGMENTS = new Set([".git", "node_modules", ".explore"]);
 
-export const SOURCE_EXTENSIONS = [
+const SOURCE_EXTENSIONS = [
   ".ts",
   ".tsx",
   ".mts",

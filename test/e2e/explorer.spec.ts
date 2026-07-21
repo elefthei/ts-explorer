@@ -328,6 +328,29 @@ async function cleanupAll(): Promise<void> {
   if (failures.length > 0) throw new AggregateError(failures, "E2E cleanup failed");
 }
 
+async function createNestedPackagesFixture(resource: TestResource): Promise<string> {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-packages-e2e-"));
+  resource.fixtureRoot = fixtureRoot;
+  await mkdir(join(fixtureRoot, "junco-runtime", "packages", "demo"), {
+    recursive: true,
+  });
+  await Promise.all([
+    writeFile(
+      join(fixtureRoot, "package.json"),
+      JSON.stringify({ private: true, workspaces: ["junco-runtime/packages/*"] }),
+    ),
+    writeFile(
+      join(fixtureRoot, "junco-runtime", "packages", "demo", "package.json"),
+      JSON.stringify({ name: "junco-runtime-demo" }),
+    ),
+    writeFile(
+      join(fixtureRoot, "junco-runtime", "packages", "demo", "index.ts"),
+      "export class JuncoRuntimeDemo {}\n",
+    ),
+  ]);
+  return fixtureRoot;
+}
+
 async function createFixture(resource: TestResource): Promise<string> {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-e2e-"));
   resource.fixtureRoot = fixtureRoot;
@@ -381,6 +404,20 @@ async function createFixture(resource: TestResource): Promise<string> {
       mkdir(join(fixtureRoot, `bulk-${directoryIndex.toString().padStart(2, "0")}`)),
     ),
   );
+  const genericFixture = [
+    "export interface SessionStorage<TMetadata> {",
+    "  metadata: TMetadata;",
+    "}",
+    "export class DurableSessionStorage implements SessionStorage<string> {",
+    '  metadata = "";',
+    "}",
+    "export class JuncoAgent<TSkill, TTool, Ctx> {",
+    "  skill!: TSkill;",
+    "  tool!: TTool;",
+    "  context!: Ctx;",
+    "}",
+    "",
+  ].join("\n");
   await Promise.all(
     Array.from({ length: 24 }, (_, directoryIndex) =>
       Array.from({ length: 10 }, (_, fileIndex) => {
@@ -391,7 +428,7 @@ async function createFixture(resource: TestResource): Promise<string> {
           : `bulk-${directory}-generated-${file}`;
         return writeFile(
           join(fixtureRoot, `bulk-${directory}`, `generated-${file}.ts`),
-          `export const generated_${directory}_${file} = ${JSON.stringify(value)};\n`,
+          `${directoryIndex === 0 && fileIndex === 0 ? genericFixture : ""}export const generated_${directory}_${file} = ${JSON.stringify(value)};\n`,
         );
       }),
     ).flat(),
@@ -653,6 +690,67 @@ test.afterEach(async ({}, testInfo) => {
   await cleanupAll();
 });
 
+test("clicking a packages directory selects the root Packages tab", async ({ browser }) => {
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createNestedPackagesFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+
+    const runtimeRow = page.locator(
+      '.tree-row[data-tree-path="junco-runtime"]',
+    );
+    await Promise.all([
+      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
+        timeout: 10_000,
+      }),
+      expect(runtimeRow).toBeVisible({ timeout: 10_000 }),
+      withBound(watch.cacheReady, 45_000, "nested packages cache-ready version 0"),
+    ]);
+    await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo", {
+      timeout: 30_000,
+    });
+
+    await runtimeRow.click();
+    const dsl = page.locator("#dsl-content");
+    await expect(page.locator("#diagram-loading")).toBeHidden({
+      timeout: 30_000,
+    });
+    await expect(dsl).toContainText("classDiagram");
+    const packagesRow = page.locator(
+      '.tree-row[data-tree-path="junco-runtime/packages"]',
+    );
+    await expect(packagesRow).toBeVisible();
+
+    const [diagramRequest] = await Promise.all([
+      page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        return url.pathname === "/api/diagram" &&
+          url.searchParams.get("kind") === "packages";
+      }),
+      packagesRow.click(),
+    ]);
+    const diagramUrl = new URL(diagramRequest.url());
+    expect(diagramUrl.searchParams.get("kind")).toBe("packages");
+    expect(diagramUrl.searchParams.get("path")).toBe("");
+    expect((await diagramRequest.response())?.status()).toBe(200);
+    await expect(dsl).toContainText("flowchart LR");
+    await expect(page.locator("#packages-mode")).toHaveClass(
+      /(?:^|\s)active(?:\s|$)/,
+    );
+    const errorPanel = page.locator("#error-panel");
+    await expect(errorPanel).toBeHidden();
+    await expect(errorPanel).not.toContainText(
+      "packages diagram scope must be the source root",
+    );
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
 test("renders a live tree independently and observes cache completion", async ({ browser }) => {
   const resource = registerResource();
   try {
@@ -705,6 +803,31 @@ test("renders a live tree independently and observes cache completion", async ({
     await expect(
       page.locator('.tree-row[data-tree-path="bulk-00/generated-00.ts"]'),
     ).toBeVisible();
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
+    await expect(page.locator("#status")).not.toHaveText("Mermaid render error");
+    await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+    await expect(page.locator("#svg-holder")).toContainText("SessionStorage⟨TMetadata⟩");
+    await expect(page.locator("#svg-holder")).toContainText("JuncoAgent⟨TSkill,TTool,Ctx⟩");
+
+    const dsl = page.locator("#dsl-content");
+    await expect(dsl).toContainText('class SessionStorage["SessionStorage⟨TMetadata⟩"]');
+    await expect(dsl).toContainText('class JuncoAgent["JuncoAgent⟨TSkill,TTool,Ctx⟩"]');
+    await expect(dsl).not.toContainText("~");
+
+    const juncoAgentLink = page.locator(
+      '.uml-definition-link[data-source-path="bulk-00/generated-00.ts"]' +
+      '[data-source-line="7"][data-source-column="14"]',
+    );
+    await expect(juncoAgentLink).toBeVisible();
+    await expect(juncoAgentLink).toHaveAttribute(
+      "aria-label",
+      "Open JuncoAgent UML definition",
+    );
+    await juncoAgentLink.click();
+    await expect(page.locator("#editor-path")).toHaveText("bulk-00/generated-00.ts");
+    await expect(page.locator(".cm-content")).toContainText(
+      "export class JuncoAgent<TSkill, TTool, Ctx>",
+    );
   } finally {
     await cleanupResource(resource);
   }

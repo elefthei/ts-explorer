@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname, posix } from "node:path";
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import { normalizeRelativePath } from "./paths.ts";
 import { buildSearchScopes } from "./search.ts";
 import type {
@@ -13,7 +13,7 @@ import type {
   TreeNode,
 } from "./types.ts";
 
-export const CACHE_SCHEMA_VERSION = 2;
+const CACHE_SCHEMA_VERSION = 2;
 
 export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
@@ -25,48 +25,15 @@ export type CacheFileWrite = {
   formatError: string | null;
 };
 
-export type CacheFileRecord = CacheFileWrite;
 export type CacheGotoDefinitionWrite = EditorGotoDefinition;
 
-export type CacheScopeWrite = {
+type CacheScopeWrite = {
   entries: readonly TreeNode[];
   diagram: CacheDiagramResponse;
   file?: CacheFileWrite;
   definitions: readonly CacheGotoDefinitionWrite[];
 };
 
-export type ExplorerCacheDatabase = {
-  readonly dbPath: string;
-  recover(): number | null;
-  getActiveGenerationId(): number | null;
-  beginGeneration(cause: "startup" | "watch"): number;
-  writeDiscovery(
-    generationId: number,
-    packages: readonly PackageInfo[],
-    packagesDiagram: CacheDiagramResponse,
-  ): void;
-  writeScope(generationId: number, scope: CacheScopeWrite): void;
-  readTreeEntries(generationId: number): TreeNode[];
-  readPackages(generationId: number): PackageInfo[];
-  readDiagram(
-    generationId: number,
-    kind: CacheDiagramResponse["kind"],
-    scopePath: string,
-  ): CacheDiagramResponse | null;
-  readFile(generationId: number, path: string): CacheFileRecord | null;
-  readDefinition(
-    generationId: number,
-    path: string,
-    line: number,
-    column: number,
-  ): GotoDefinition | null;
-  readDefinitions(generationId: number, path: string): EditorGotoDefinition[];
-  searchFiles(generationId: number, query: string): Omit<SearchResponse, "version">;
-  promoteGeneration(generationId: number): void;
-  discardGeneration(generationId: number): void;
-  failGeneration(generationId: number): void;
-  close(): void;
-};
 
 type ActiveGenerationRow = { id: number };
 type MetaRow = { value: string };
@@ -102,6 +69,73 @@ type GotoDefinitionRow = {
   uml_member_occurrence: number | null;
 };
 type SchemaObjectRow = { name: string };
+type CacheStatements = {
+  selectRawActiveGeneration: Statement<MetaRow, []>;
+  selectActiveGeneration: Statement<ActiveGenerationRow, []>;
+  deleteActivePointer: Statement<never, []>;
+  deleteGotoDefsExceptGeneration: Statement<never, [number]>;
+  deleteAllGotoDefs: Statement<never, []>;
+  deleteFilesExceptGeneration: Statement<never, [number]>;
+  deleteGenerationsExcept: Statement<never, [number]>;
+  deleteAllFiles: Statement<never, []>;
+  deleteAllGenerations: Statement<never, []>;
+  insertGeneration: Statement<never, ["startup" | "watch", number]>;
+  upsertPackages: Statement<never, [number, string]>;
+  upsertTreeEntry: Statement<
+    never,
+    [number, string, string, string, "directory" | "file", number]
+  >;
+  upsertDiagram: Statement<
+    never,
+    [number, CacheDiagramResponse["kind"], string, string]
+  >;
+  upsertFile: Statement<
+    never,
+    [number, string, string | null, string | null, string | null, string | null]
+  >;
+  deleteScopeGotoDefs: Statement<never, [number, string]>;
+  insertGotoDefinition: Statement<
+    never,
+    [
+      number,
+      string,
+      GotoDefinitionKind,
+      string,
+      string,
+      string,
+      number,
+      number,
+      number,
+      number,
+      string,
+      string,
+      string | null,
+      number | null,
+    ]
+  >;
+  selectTreeEntries: Statement<TreeRow, [number]>;
+  selectPackages: Statement<PackageRow, [number]>;
+  selectDiagram: Statement<DiagramRow, [number, CacheDiagramResponse["kind"], string]>;
+  selectFile: Statement<FileRow, [number, string]>;
+  selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
+  selectDefinitions: Statement<GotoDefinitionRow, [number, string]>;
+  selectIndexedSearchCandidates: Statement<SearchCandidateRow, [number, string]>;
+  selectScanSearchCandidates: Statement<SearchCandidateRow, [number]>;
+  selectIndexedDefinitionCandidates: Statement<GotoDefinitionRow, [number, string, string]>;
+  selectScanDefinitionCandidates: Statement<GotoDefinitionRow, [number]>;
+  markGenerationActive: Statement<never, [number, number]>;
+  upsertActivePointer: Statement<never, [string]>;
+  deleteGenerationFiles: Statement<never, [number]>;
+  deleteGenerationGotoDefs: Statement<never, [number]>;
+  deleteInactiveGeneration: Statement<never, [number]>;
+  markGenerationFailed: Statement<never, [number, number]>;
+  optimizeSearch: Statement<never, []>;
+  optimizeGotoDefinitionSearch: Statement<never, []>;
+};
+
+type ImmediateTransaction<Args extends unknown[]> = {
+  immediate(...args: Args): void;
+};
 
 const SCHEMA_OBJECTS = [
   "cache_meta",
@@ -123,7 +157,61 @@ const SCHEMA_OBJECTS = [
   "goto_def_au",
 ] as const;
 
-function createSchema(db: Database): void {
+function parentPath(path: string): string {
+  if (!path) return "";
+  const parent = posix.dirname(path);
+  return parent === "." ? "" : parent;
+}
+
+function parseJson<T>(json: string, description: string): T {
+  try {
+    return JSON.parse(json) as T;
+  } catch (error) {
+    throw new Error(`invalid cached ${description}`, { cause: error });
+  }
+}
+
+function hasAtLeastThreeCodePoints(value: string): boolean {
+  let count = 0;
+  for (const _codePoint of value) {
+    count += 1;
+    if (count === 3) return true;
+  }
+  return false;
+}
+
+function toGotoDefinition(row: GotoDefinitionRow): GotoDefinition {
+  const uml: GotoDefinition["uml"] = {
+    scopePath: row.uml_scope_path,
+    entityName: row.uml_entity_name,
+  };
+  if (row.uml_member_name !== null && row.uml_member_occurrence !== null) {
+    uml.memberName = row.uml_member_name;
+    uml.memberOccurrence = row.uml_member_occurrence;
+  }
+  return {
+    key: row.definition_key,
+    kind: row.kind,
+    name: row.name,
+    qualifiedName: row.qualified_name,
+    source: {
+      path: row.source_path,
+      line: row.source_line,
+      column: row.source_column,
+    },
+    uml,
+  };
+}
+
+function toEditorGotoDefinition(row: GotoDefinitionRow): EditorGotoDefinition {
+  return {
+    ...toGotoDefinition(row),
+    displayFrom: row.display_from,
+    displayTo: row.display_to,
+  };
+}
+export class Cache {
+private static createSchema(db: Database): void {
   db.run(`
     CREATE TABLE cache_meta (
       key TEXT PRIMARY KEY,
@@ -280,7 +368,7 @@ function createSchema(db: Database): void {
   `);
 }
 
-function recreateSchema(db: Database): void {
+private static recreateSchema(db: Database): void {
   db.run("DROP TRIGGER IF EXISTS goto_def_au");
   db.run("DROP TRIGGER IF EXISTS goto_def_bu");
   db.run("DROP TRIGGER IF EXISTS goto_def_bd");
@@ -298,66 +386,61 @@ function recreateSchema(db: Database): void {
   db.run("DROP TABLE IF EXISTS package_snapshots");
   db.run("DROP TABLE IF EXISTS cache_meta");
   db.run("DROP TABLE IF EXISTS generations");
-  createSchema(db);
+  Cache.createSchema(db);
   db.run(`PRAGMA user_version=${CACHE_SCHEMA_VERSION}`);
 }
 
-function parentPath(path: string): string {
-  if (!path) return "";
-  const parent = posix.dirname(path);
-  return parent === "." ? "" : parent;
-}
 
-function parseJson<T>(json: string, description: string): T {
-  try {
-    return JSON.parse(json) as T;
-  } catch (error) {
-    throw new Error(`invalid cached ${description}`, { cause: error });
-  }
-}
+private readonly db!: Database;
+private readonly selectRawActiveGeneration!: CacheStatements["selectRawActiveGeneration"];
+private readonly selectActiveGeneration!: CacheStatements["selectActiveGeneration"];
+private readonly deleteActivePointer!: CacheStatements["deleteActivePointer"];
+private readonly deleteGotoDefsExceptGeneration!: CacheStatements["deleteGotoDefsExceptGeneration"];
+private readonly deleteAllGotoDefs!: CacheStatements["deleteAllGotoDefs"];
+private readonly deleteFilesExceptGeneration!: CacheStatements["deleteFilesExceptGeneration"];
+private readonly deleteGenerationsExcept!: CacheStatements["deleteGenerationsExcept"];
+private readonly deleteAllFiles!: CacheStatements["deleteAllFiles"];
+private readonly deleteAllGenerations!: CacheStatements["deleteAllGenerations"];
+private readonly insertGeneration!: CacheStatements["insertGeneration"];
+private readonly upsertPackages!: CacheStatements["upsertPackages"];
+private readonly upsertTreeEntry!: CacheStatements["upsertTreeEntry"];
+private readonly upsertDiagram!: CacheStatements["upsertDiagram"];
+private readonly upsertFile!: CacheStatements["upsertFile"];
+private readonly deleteScopeGotoDefs!: CacheStatements["deleteScopeGotoDefs"];
+private readonly insertGotoDefinition!: CacheStatements["insertGotoDefinition"];
+private readonly selectTreeEntries!: CacheStatements["selectTreeEntries"];
+private readonly selectPackages!: CacheStatements["selectPackages"];
+private readonly selectDiagram!: CacheStatements["selectDiagram"];
+private readonly selectFile!: CacheStatements["selectFile"];
+private readonly selectDefinition!: CacheStatements["selectDefinition"];
+private readonly selectDefinitions!: CacheStatements["selectDefinitions"];
+private readonly selectIndexedSearchCandidates!: CacheStatements["selectIndexedSearchCandidates"];
+private readonly selectScanSearchCandidates!: CacheStatements["selectScanSearchCandidates"];
+private readonly selectIndexedDefinitionCandidates!: CacheStatements["selectIndexedDefinitionCandidates"];
+private readonly selectScanDefinitionCandidates!: CacheStatements["selectScanDefinitionCandidates"];
+private readonly markGenerationActive!: CacheStatements["markGenerationActive"];
+private readonly upsertActivePointer!: CacheStatements["upsertActivePointer"];
+private readonly deleteGenerationFiles!: CacheStatements["deleteGenerationFiles"];
+private readonly deleteGenerationGotoDefs!: CacheStatements["deleteGenerationGotoDefs"];
+private readonly deleteInactiveGeneration!: CacheStatements["deleteInactiveGeneration"];
+private readonly markGenerationFailed!: CacheStatements["markGenerationFailed"];
+private readonly optimizeSearch!: CacheStatements["optimizeSearch"];
+private readonly optimizeGotoDefinitionSearch!: CacheStatements["optimizeGotoDefinitionSearch"];
+private readonly statements!: Array<{ finalize(): void }>;
+private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
+private readonly discoveryTransaction!: ImmediateTransaction<
+  [number, readonly PackageInfo[], CacheDiagramResponse]
+>;
+private readonly scopeTransaction!: ImmediateTransaction<[number, CacheScopeWrite]>;
+private readonly promotionTransaction!: ImmediateTransaction<[number]>;
+private readonly cleanupTransaction!: ImmediateTransaction<[number]>;
+private readonly discardTransaction!: ImmediateTransaction<[number]>;
+private closed = false;
 
-function hasAtLeastThreeCodePoints(value: string): boolean {
-  let count = 0;
-  for (const _codePoint of value) {
-    count += 1;
-    if (count === 3) return true;
-  }
-  return false;
-}
-function toGotoDefinition(row: GotoDefinitionRow): GotoDefinition {
-  const uml: GotoDefinition["uml"] = {
-    scopePath: row.uml_scope_path,
-    entityName: row.uml_entity_name,
-  };
-  if (row.uml_member_name !== null && row.uml_member_occurrence !== null) {
-    uml.memberName = row.uml_member_name;
-    uml.memberOccurrence = row.uml_member_occurrence;
-  }
-  return {
-    key: row.definition_key,
-    kind: row.kind,
-    name: row.name,
-    qualifiedName: row.qualified_name,
-    source: {
-      path: row.source_path,
-      line: row.source_line,
-      column: row.source_column,
-    },
-    uml,
-  };
-}
-
-function toEditorGotoDefinition(row: GotoDefinitionRow): EditorGotoDefinition {
-  return {
-    ...toGotoDefinition(row),
-    displayFrom: row.display_from,
-    displayTo: row.display_to,
-  };
-}
-
-export function openCache(dbPath: string): ExplorerCacheDatabase {
+constructor(dbPath: string) {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath, { create: true, strict: true });
+  this.db = db;
 
   try {
     db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=WAL").get();
@@ -366,7 +449,7 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
     db.run("PRAGMA busy_timeout=5000");
 
     const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version;
-    if (version !== CACHE_SCHEMA_VERSION) db.transaction(() => recreateSchema(db)).immediate();
+    if (version !== CACHE_SCHEMA_VERSION) db.transaction(() => Cache.recreateSchema(db)).immediate();
 
     const schemaObjects = db.query<SchemaObjectRow, []>(`
       SELECT name
@@ -396,14 +479,6 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
     if (missingObjects.length) {
       throw new Error(`cache schema is incomplete: missing ${missingObjects.join(", ")}`);
     }
-  } catch (error) {
-    try {
-      db.close(true);
-    } catch {
-      db.close();
-    }
-    throw error;
-  }
 
   const selectRawActiveGeneration = db.query<MetaRow, []>(`
     SELECT value
@@ -689,32 +764,67 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
     optimizeSearch,
     optimizeGotoDefinitionSearch,
   ];
+  this.selectRawActiveGeneration = selectRawActiveGeneration;
+  this.selectActiveGeneration = selectActiveGeneration;
+  this.deleteActivePointer = deleteActivePointer;
+  this.deleteGotoDefsExceptGeneration = deleteGotoDefsExceptGeneration;
+  this.deleteAllGotoDefs = deleteAllGotoDefs;
+  this.deleteFilesExceptGeneration = deleteFilesExceptGeneration;
+  this.deleteGenerationsExcept = deleteGenerationsExcept;
+  this.deleteAllFiles = deleteAllFiles;
+  this.deleteAllGenerations = deleteAllGenerations;
+  this.insertGeneration = insertGeneration;
+  this.upsertPackages = upsertPackages;
+  this.upsertTreeEntry = upsertTreeEntry;
+  this.upsertDiagram = upsertDiagram;
+  this.upsertFile = upsertFile;
+  this.deleteScopeGotoDefs = deleteScopeGotoDefs;
+  this.insertGotoDefinition = insertGotoDefinition;
+  this.selectTreeEntries = selectTreeEntries;
+  this.selectPackages = selectPackages;
+  this.selectDiagram = selectDiagram;
+  this.selectFile = selectFile;
+  this.selectDefinition = selectDefinition;
+  this.selectDefinitions = selectDefinitions;
+  this.selectIndexedSearchCandidates = selectIndexedSearchCandidates;
+  this.selectScanSearchCandidates = selectScanSearchCandidates;
+  this.selectIndexedDefinitionCandidates = selectIndexedDefinitionCandidates;
+  this.selectScanDefinitionCandidates = selectScanDefinitionCandidates;
+  this.markGenerationActive = markGenerationActive;
+  this.upsertActivePointer = upsertActivePointer;
+  this.deleteGenerationFiles = deleteGenerationFiles;
+  this.deleteGenerationGotoDefs = deleteGenerationGotoDefs;
+  this.deleteInactiveGeneration = deleteInactiveGeneration;
+  this.markGenerationFailed = markGenerationFailed;
+  this.optimizeSearch = optimizeSearch;
+  this.optimizeGotoDefinitionSearch = optimizeGotoDefinitionSearch;
+  this.statements = statements;
 
 
-  const recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
+  this.recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
     if (activeGenerationId === null) {
-      deleteActivePointer.run();
-      deleteAllGotoDefs.run();
-      deleteAllFiles.run();
-      deleteAllGenerations.run();
+      this.deleteActivePointer.run();
+      this.deleteAllGotoDefs.run();
+      this.deleteAllFiles.run();
+      this.deleteAllGenerations.run();
       return;
     }
-    deleteGotoDefsExceptGeneration.run(activeGenerationId);
-    deleteFilesExceptGeneration.run(activeGenerationId);
-    deleteGenerationsExcept.run(activeGenerationId);
+    this.deleteGotoDefsExceptGeneration.run(activeGenerationId);
+    this.deleteFilesExceptGeneration.run(activeGenerationId);
+    this.deleteGenerationsExcept.run(activeGenerationId);
   });
-  const discoveryTransaction = db.transaction((
+  this.discoveryTransaction = db.transaction((
     generationId: number,
     packages: readonly PackageInfo[],
     diagram: CacheDiagramResponse,
   ) => {
-    upsertPackages.run(generationId, JSON.stringify(packages));
-    upsertDiagram.run(generationId, diagram.kind, diagram.scopePath, JSON.stringify(diagram));
+    this.upsertPackages.run(generationId, JSON.stringify(packages));
+    this.upsertDiagram.run(generationId, diagram.kind, diagram.scopePath, JSON.stringify(diagram));
   });
-  const scopeTransaction = db.transaction((generationId: number, scope: CacheScopeWrite) => {
+  this.scopeTransaction = db.transaction((generationId: number, scope: CacheScopeWrite) => {
     for (const entry of scope.entries) {
       const viewable = (entry as TreeNode & { viewable?: boolean }).viewable === true ? 1 : 0;
-      upsertTreeEntry.run(
+      this.upsertTreeEntry.run(
         generationId,
         entry.path,
         parentPath(entry.path),
@@ -724,11 +834,11 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
       );
     }
     const diagram = scope.diagram;
-    upsertDiagram.run(generationId, diagram.kind, diagram.scopePath, JSON.stringify(diagram));
+    this.upsertDiagram.run(generationId, diagram.kind, diagram.scopePath, JSON.stringify(diagram));
     if (scope.file) {
       const file = scope.file;
-      deleteScopeGotoDefs.run(generationId, file.path);
-      upsertFile.run(
+      this.deleteScopeGotoDefs.run(generationId, file.path);
+      this.upsertFile.run(
         generationId,
         file.path,
         file.rawContent,
@@ -737,7 +847,7 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
         file.formatError,
       );
       for (const definition of scope.definitions) {
-        insertGotoDefinition.run(
+        this.insertGotoDefinition.run(
           generationId,
           definition.key,
           definition.kind,
@@ -756,149 +866,188 @@ export function openCache(dbPath: string): ExplorerCacheDatabase {
       }
     }
   });
-  const promotionTransaction = db.transaction((generationId: number) => {
-    const result = markGenerationActive.run(Date.now(), generationId);
+  this.promotionTransaction = db.transaction((generationId: number) => {
+    const result = this.markGenerationActive.run(Date.now(), generationId);
     if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
-    upsertActivePointer.run(String(generationId));
+    this.upsertActivePointer.run(String(generationId));
   });
-  const cleanupTransaction = db.transaction((generationId: number) => {
-    deleteGotoDefsExceptGeneration.run(generationId);
-    deleteFilesExceptGeneration.run(generationId);
-    deleteGenerationsExcept.run(generationId);
+  this.cleanupTransaction = db.transaction((generationId: number) => {
+    this.deleteGotoDefsExceptGeneration.run(generationId);
+    this.deleteFilesExceptGeneration.run(generationId);
+    this.deleteGenerationsExcept.run(generationId);
   });
-  const discardTransaction = db.transaction((generationId: number) => {
-    deleteGenerationGotoDefs.run(generationId);
-    deleteGenerationFiles.run(generationId);
-    deleteInactiveGeneration.run(generationId);
+  this.discardTransaction = db.transaction((generationId: number) => {
+    this.deleteGenerationGotoDefs.run(generationId);
+    this.deleteGenerationFiles.run(generationId);
+    this.deleteInactiveGeneration.run(generationId);
   });
 
-  let closed = false;
-
-  const readPackages = (generationId: number): PackageInfo[] => {
-    const row = selectPackages.get(generationId);
-    if (!row) throw new Error(`cache package snapshot not found for generation ${generationId}`);
-    return parseJson<PackageInfo[]>(row.packages_json, "package snapshot");
-  };
-
-  return {
-    dbPath,
-    recover() {
-      const hasPointer = selectRawActiveGeneration.get() !== null;
-      const activeGenerationId = selectActiveGeneration.get()?.id ?? null;
-      recoveryTransaction.immediate(activeGenerationId);
-      return hasPointer ? activeGenerationId : null;
-    },
-    getActiveGenerationId() {
-      return selectActiveGeneration.get()?.id ?? null;
-    },
-    beginGeneration(cause) {
-      return Number(insertGeneration.run(cause, Date.now()).lastInsertRowid);
-    },
-    writeDiscovery(generationId, packages, packagesDiagram) {
-      discoveryTransaction.immediate(generationId, packages, packagesDiagram);
-    },
-    writeScope(generationId, scope) {
-      scopeTransaction.immediate(generationId, scope);
-    },
-    readTreeEntries(generationId) {
-      return selectTreeEntries.all(generationId).map((row): TreeNode => {
-        const base = { name: row.name, path: row.path, kind: row.kind };
-        if (row.kind === "file") {
-          return { ...base, viewable: row.viewable !== 0 } as TreeNode;
-        }
-        return base;
-      });
-    },
-    readPackages,
-    readDiagram(generationId, kind, scopePath) {
-      const row = selectDiagram.get(generationId, kind, scopePath);
-      return row ? parseJson<CacheDiagramResponse>(row.response_json, "diagram") : null;
-    },
-    readFile(generationId, path) {
-      const row = selectFile.get(generationId, path);
-      if (!row) return null;
-      return {
-        path: row.path,
-        rawContent: row.raw_content,
-        displayContent: row.display_content,
-        sourceError: row.source_error,
-        formatError: row.format_error,
-      };
-    },
-    readDefinition(generationId, path, line, column) {
-      const row = selectDefinition.get(
-        generationId,
-        normalizeRelativePath(path),
-        line,
-        column,
-      );
-      return row ? toGotoDefinition(row) : null;
-    },
-    readDefinitions(generationId, path) {
-      return selectDefinitions
-        .all(generationId, normalizeRelativePath(path))
-        .map(toEditorGotoDefinition);
-    },
-    searchFiles(generationId, query) {
-      const indexed = hasAtLeastThreeCodePoints(query) && !query.includes("%") && !query.includes("_");
-      const likeQuery = `%${query}%`;
-      const fileCandidates = indexed
-        ? selectIndexedSearchCandidates.all(generationId, likeQuery)
-        : selectScanSearchCandidates.all(generationId);
-      const definitionCandidates = indexed
-        ? selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
-        : selectScanDefinitionCandidates.all(generationId);
-      const foldedQuery = query.toLowerCase();
-      const paths = new Set<string>();
-      for (const candidate of fileCandidates) {
-        if (candidate.raw_content.toLowerCase().includes(foldedQuery)) paths.add(candidate.path);
-      }
-      const retainedDefinitions = new Map<string, GotoDefinitionRow>();
-      for (const candidate of definitionCandidates) {
-        if (
-          !candidate.name.toLowerCase().includes(foldedQuery)
-          && !candidate.qualified_name.toLowerCase().includes(foldedQuery)
-        ) {
-          continue;
-        }
-        retainedDefinitions.set(`${candidate.source_path}\0${candidate.definition_key}`, candidate);
-        paths.add(candidate.source_path);
-      }
-      const definitionRows = [...retainedDefinitions.values()].sort((left, right) =>
-        left.source_path.localeCompare(right.source_path)
-        || left.source_line - right.source_line
-        || left.source_column - right.source_column
-        || left.definition_key.localeCompare(right.definition_key)
-      );
-      const definitions = definitionRows.map(toGotoDefinition);
-      const files = [...paths].sort((left, right) => left.localeCompare(right));
-      return {
-        query,
-        files,
-        definitions,
-        ...buildSearchScopes(files, readPackages(generationId)),
-      };
-    },
-    promoteGeneration(generationId) {
-      promotionTransaction.immediate(generationId);
-      cleanupTransaction.immediate(generationId);
-      optimizeSearch.run();
-      optimizeGotoDefinitionSearch.run();
-    },
-    discardGeneration(generationId) {
-      if (selectActiveGeneration.get()?.id === generationId) {
-        throw new Error(`cannot discard active generation ${generationId}`);
-      }
-      discardTransaction.immediate(generationId);
-    },
-    failGeneration(generationId) {
-      markGenerationFailed.run(Date.now(), generationId);
-    },
-    close() {
-      if (closed) return;
-      for (const statement of statements) statement.finalize();
+  } catch (error) {
+    try {
       db.close(true);
-      closed = true;
-    },
+    } catch {
+      db.close();
+    }
+    throw error;
+  }
+}
+
+recover(): number | null {
+  const hasPointer = this.selectRawActiveGeneration.get() !== null;
+  const activeGenerationId = this.selectActiveGeneration.get()?.id ?? null;
+  this.recoveryTransaction.immediate(activeGenerationId);
+  return hasPointer ? activeGenerationId : null;
+}
+
+getActiveGenerationId(): number | null {
+  return this.selectActiveGeneration.get()?.id ?? null;
+}
+
+beginGeneration(cause: "startup" | "watch"): number {
+  return Number(this.insertGeneration.run(cause, Date.now()).lastInsertRowid);
+}
+
+writeDiscovery(
+  generationId: number,
+  packages: readonly PackageInfo[],
+  packagesDiagram: CacheDiagramResponse,
+): void {
+  this.discoveryTransaction.immediate(generationId, packages, packagesDiagram);
+}
+
+writeScope(generationId: number, scope: CacheScopeWrite): void {
+  this.scopeTransaction.immediate(generationId, scope);
+}
+
+readTreeEntries(generationId: number): TreeNode[] {
+  return this.selectTreeEntries.all(generationId).map((row): TreeNode => {
+    if (row.kind === "file") {
+      return {
+        name: row.name,
+        path: row.path,
+        kind: "file",
+        viewable: row.viewable !== 0,
+      };
+    }
+    return {
+      name: row.name,
+      path: row.path,
+      kind: "directory",
+    };
+  });
+}
+
+readPackages(generationId: number): PackageInfo[] {
+  const row = this.selectPackages.get(generationId);
+  if (!row) throw new Error(`cache package snapshot not found for generation ${generationId}`);
+  return parseJson<PackageInfo[]>(row.packages_json, "package snapshot");
+}
+
+readDiagram(
+  generationId: number,
+  kind: CacheDiagramResponse["kind"],
+  scopePath: string,
+): CacheDiagramResponse | null {
+  const row = this.selectDiagram.get(generationId, kind, scopePath);
+  return row ? parseJson<CacheDiagramResponse>(row.response_json, "diagram") : null;
+}
+
+readFile(generationId: number, path: string): CacheFileWrite | null {
+  const row = this.selectFile.get(generationId, path);
+  if (!row) return null;
+  return {
+    path: row.path,
+    rawContent: row.raw_content,
+    displayContent: row.display_content,
+    sourceError: row.source_error,
+    formatError: row.format_error,
   };
+}
+
+readDefinition(
+  generationId: number,
+  path: string,
+  line: number,
+  column: number,
+): GotoDefinition | null {
+  const row = this.selectDefinition.get(
+    generationId,
+    normalizeRelativePath(path),
+    line,
+    column,
+  );
+  return row ? toGotoDefinition(row) : null;
+}
+
+readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
+  return this.selectDefinitions
+    .all(generationId, normalizeRelativePath(path))
+    .map(toEditorGotoDefinition);
+}
+
+searchFiles(generationId: number, query: string): Omit<SearchResponse, "version"> {
+  const indexed = hasAtLeastThreeCodePoints(query) && !query.includes("%") && !query.includes("_");
+  const likeQuery = `%${query}%`;
+  const fileCandidates = indexed
+    ? this.selectIndexedSearchCandidates.all(generationId, likeQuery)
+    : this.selectScanSearchCandidates.all(generationId);
+  const definitionCandidates = indexed
+    ? this.selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
+    : this.selectScanDefinitionCandidates.all(generationId);
+  const foldedQuery = query.toLowerCase();
+  const paths = new Set<string>();
+  for (const candidate of fileCandidates) {
+    if (candidate.raw_content.toLowerCase().includes(foldedQuery)) paths.add(candidate.path);
+  }
+  const retainedDefinitions = new Map<string, GotoDefinitionRow>();
+  for (const candidate of definitionCandidates) {
+    if (
+      !candidate.name.toLowerCase().includes(foldedQuery)
+      && !candidate.qualified_name.toLowerCase().includes(foldedQuery)
+    ) {
+      continue;
+    }
+    retainedDefinitions.set(`${candidate.source_path}\0${candidate.definition_key}`, candidate);
+    paths.add(candidate.source_path);
+  }
+  const definitionRows = [...retainedDefinitions.values()].sort((left, right) =>
+    left.source_path.localeCompare(right.source_path)
+    || left.source_line - right.source_line
+    || left.source_column - right.source_column
+    || left.definition_key.localeCompare(right.definition_key)
+  );
+  const definitions = definitionRows.map(toGotoDefinition);
+  const files = [...paths].sort((left, right) => left.localeCompare(right));
+  return {
+    query,
+    files,
+    definitions,
+    ...buildSearchScopes(files, this.readPackages(generationId)),
+  };
+}
+
+promoteGeneration(generationId: number): void {
+  this.promotionTransaction.immediate(generationId);
+  this.cleanupTransaction.immediate(generationId);
+  this.optimizeSearch.run();
+  this.optimizeGotoDefinitionSearch.run();
+}
+
+discardGeneration(generationId: number): void {
+  if (this.selectActiveGeneration.get()?.id === generationId) {
+    throw new Error(`cannot discard active generation ${generationId}`);
+  }
+  this.discardTransaction.immediate(generationId);
+}
+
+failGeneration(generationId: number): void {
+  this.markGenerationFailed.run(Date.now(), generationId);
+}
+
+close(): void {
+  if (this.closed) return;
+  for (const statement of this.statements) statement.finalize();
+  this.db.close(true);
+  this.closed = true;
+}
 }

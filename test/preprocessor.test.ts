@@ -4,9 +4,10 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { openCache } from "../src/cache.ts";
-import { createPreprocessor, type Preprocessor } from "../src/preprocessor.ts";
+import { Cache } from "../src/cache.ts";
+import { Preprocessor } from "../src/preprocessor.ts";
 import {
+  isPreprocessProgressEvent,
   isPreprocessResponse,
   type PreprocessProgressEvent,
   type PreprocessResponse,
@@ -173,7 +174,7 @@ function trackedPreprocessor(
   processCount = 1,
   onProgress: (event: PreprocessProgressEvent) => void = () => undefined,
 ): Preprocessor {
-  const preprocessor = createPreprocessor(root, onReady, onError, processCount, onProgress);
+  const preprocessor = new Preprocessor(root, onReady, onError, processCount, onProgress);
   preprocessors.add(preprocessor);
   return preprocessor;
 }
@@ -181,6 +182,35 @@ function trackedPreprocessor(
 async function closePreprocessor(preprocessor: Preprocessor): Promise<void> {
   await preprocessor.close();
   preprocessors.delete(preprocessor);
+}
+
+function groupProgressEvents(events: readonly PreprocessProgressEvent[]): Array<{
+  generationId: number;
+  component: PreprocessProgressEvent["component"];
+  resource: string;
+  events: PreprocessProgressEvent["event"][];
+}> {
+  const groups = new Map<string, {
+    generationId: number;
+    component: PreprocessProgressEvent["component"];
+    resource: string;
+    events: PreprocessProgressEvent["event"][];
+  }>();
+  for (const event of events) {
+    const key = JSON.stringify([event.generationId, event.component, event.resource]);
+    const group = groups.get(key);
+    if (group) {
+      group.events.push(event.event);
+    } else {
+      groups.set(key, {
+        generationId: event.generationId,
+        component: event.component,
+        resource: event.resource,
+        events: [event.event],
+      });
+    }
+  }
+  return [...groups.values()];
 }
 
 test("validates preprocessing response envelopes", () => {
@@ -207,6 +237,119 @@ test("validates preprocessing response envelopes", () => {
 
   for (const { name, value, expected } of cases) {
     expect(isPreprocessResponse(value), name).toBe(expected);
+  }
+});
+
+test("validates preprocessing progress envelopes", () => {
+  const cases: Array<{ name: string; value: unknown; expected: boolean }> = [
+    {
+      name: "exact startup envelope",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: 1,
+        cause: "startup",
+      },
+      expected: true,
+    },
+    {
+      name: "exact watch envelope",
+      value: {
+        event: "done",
+        component: "code",
+        resource: "./index.ts",
+        generationId: Number.MAX_SAFE_INTEGER,
+        cause: "watch",
+      },
+      expected: true,
+    },
+    {
+      name: "legacy three-field envelope",
+      value: { event: "start", component: "uml", resource: "." },
+      expected: false,
+    },
+    {
+      name: "missing generation ID",
+      value: { event: "start", component: "uml", resource: ".", cause: "startup" },
+      expected: false,
+    },
+    {
+      name: "missing cause",
+      value: { event: "start", component: "uml", resource: ".", generationId: 1 },
+      expected: false,
+    },
+    {
+      name: "unknown cause",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: 1,
+        cause: "manual",
+      },
+      expected: false,
+    },
+    {
+      name: "zero generation ID",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: 0,
+        cause: "startup",
+      },
+      expected: false,
+    },
+    {
+      name: "negative generation ID",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: -1,
+        cause: "startup",
+      },
+      expected: false,
+    },
+    {
+      name: "fractional generation ID",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: 1.5,
+        cause: "startup",
+      },
+      expected: false,
+    },
+    {
+      name: "unsafe generation ID",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: Number.MAX_SAFE_INTEGER + 1,
+        cause: "startup",
+      },
+      expected: false,
+    },
+    {
+      name: "extra field",
+      value: {
+        event: "start",
+        component: "uml",
+        resource: ".",
+        generationId: 1,
+        cause: "startup",
+        requestId: 7,
+      },
+      expected: false,
+    },
+  ];
+
+  for (const { name, value, expected } of cases) {
+    expect(isPreprocessProgressEvent(value), name).toBe(expected);
   }
 });
 
@@ -245,9 +388,23 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
     error: { code: "BAD_REQUEST" },
   });
 
-  const shutdownResponse = waitForResponse(4);
-  subprocess.send({ id: 4, type: "shutdown" });
-  expect(await shutdownResponse).toEqual({ id: 4, ok: true, value: null });
+  const missingCauseResponse = waitForResponse(4);
+  subprocess.send({
+    id: 4,
+    type: "preprocess-scope",
+    generationId: 1,
+    scope: { path: "", kind: "directory" },
+    packages: [],
+  });
+  expect(await missingCauseResponse).toEqual({
+    id: 4,
+    ok: false,
+    error: { code: "BAD_REQUEST", message: "cause must be startup or watch" },
+  });
+
+  const shutdownResponse = waitForResponse(5);
+  subprocess.send({ id: 5, type: "shutdown" });
+  expect(await shutdownResponse).toEqual({ id: 5, ok: true, value: null });
   expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
 }, 30_000);
 
@@ -398,11 +555,13 @@ test("preprocesses each visible scope once and serves formatted files and litera
 
   const promotions: string[] = [];
   const errors: Error[] = [];
+  const progressEvents: PreprocessProgressEvent[] = [];
   const preprocessor = trackedPreprocessor(
     root,
     () => promotions.push("promoted"),
     (error) => errors.push(error),
     4,
+    (event) => progressEvents.push(event),
   );
   let idleResolved = false;
   const idle = preprocessor.whenIdle().then(() => {
@@ -422,6 +581,14 @@ test("preprocesses each visible scope once and serves formatted files and litera
   await idle;
   expect(promotions).toEqual(["promoted"]);
   expect(errors).toEqual([]);
+  expect(progressEvents.length).toBeGreaterThan(0);
+  const progressGenerationIds = [...new Set(progressEvents.map((event) => event.generationId))];
+  expect(progressGenerationIds).toHaveLength(1);
+  expect(Number.isSafeInteger(progressGenerationIds[0]) && progressGenerationIds[0]! > 0).toBe(true);
+  expect([...new Set(progressEvents.map((event) => event.cause))]).toEqual(["startup"]);
+  for (const group of groupProgressEvents(progressEvents)) {
+    expect(group.events, `${group.component} ${group.resource}`).toEqual(["start", "done"]);
+  }
 
   const expectedPaths = [
     "",
@@ -769,7 +936,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     expect(queryPlan.some(({ detail }) => detail.includes("VIRTUAL TABLE INDEX") && detail.includes("L0"))).toBe(true);
   });
 
-  const cache = openCache(dbPath);
+  const cache = new Cache(dbPath);
   try {
     const originalFile = cache.readFile(generationId, "root.ts");
     const invalidDefinition: EditorGotoDefinition = {
@@ -842,6 +1009,67 @@ test("preprocesses each visible scope once and serves formatted files and litera
     });
   } finally {
     cache.close();
+  }
+}, 30_000);
+
+test("labels repeated scope work across startup and watch generations", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-generations-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "generation-labels" }));
+  await writeFixtureFile(root, "index.ts", "export const generationLabel = 1;\n");
+
+  const errors: Error[] = [];
+  const progressEvents: PreprocessProgressEvent[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+    1,
+    (event) => progressEvents.push(event),
+  );
+
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+
+  expect(errors).toEqual([]);
+  const generationIds = [...new Set(progressEvents.map((event) => event.generationId))];
+  expect(generationIds).toHaveLength(2);
+  const [startupGenerationId, watchGenerationId] = generationIds;
+  expect(startupGenerationId).not.toBe(watchGenerationId);
+  expect(
+    Number.isSafeInteger(startupGenerationId) &&
+      startupGenerationId! > 0 &&
+      Number.isSafeInteger(watchGenerationId) &&
+      watchGenerationId! > 0,
+  ).toBe(true);
+
+  for (const [generationId, cause] of [
+    [startupGenerationId!, "startup"],
+    [watchGenerationId!, "watch"],
+  ] as const) {
+    const generationEvents = progressEvents.filter((event) => event.generationId === generationId);
+    expect([...new Set(generationEvents.map((event) => event.cause))]).toEqual([cause]);
+    expect(
+      [...new Set(
+        generationEvents
+          .filter((event) => event.component === "uml")
+          .map((event) => event.resource),
+      )].sort(),
+    ).toEqual([".", "./index.ts"]);
+    expect(
+      [...new Set(
+        generationEvents
+          .filter((event) => event.component === "code")
+          .map((event) => event.resource),
+      )].sort(),
+    ).toEqual(["./index.ts"]);
+    for (const group of groupProgressEvents(generationEvents)) {
+      expect(group.events, `${cause} ${group.component} ${group.resource}`).toEqual([
+        "start",
+        "done",
+      ]);
+    }
   }
 }, 30_000);
 

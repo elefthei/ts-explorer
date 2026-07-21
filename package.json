@@ -22,7 +22,6 @@
     "graphology-communities-louvain": "2.0.2",
     "mermaid": "11.16.0",
     "prettier": "3.9.5",
-    "simple-git": "3.36.0",
     "ts-morph": "22.0.0",
     "tsuml2": "0.17.1",
     "yargs": "17.7.3"

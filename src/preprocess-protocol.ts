@@ -15,11 +15,12 @@ export type PreprocessErrorCode =
   | "INVALID_INPUT"
   | "INTERNAL";
 
-export type PreprocessScopeKind = "package" | "directory" | "file";
+export type PreprocessCause = "startup" | "watch";
+
 
 export type PreprocessScope = {
   path: string;
-  kind: PreprocessScopeKind;
+  kind: "package" | "directory" | "file";
 };
 
 export type SourceLocation = {
@@ -35,12 +36,13 @@ export type PreprocessRequest =
     dbPath: string;
     recover: boolean;
   }
-  | { id: number; type: "begin-generation"; cause: "startup" | "watch" }
+  | { id: number; type: "begin-generation"; cause: PreprocessCause }
   | { id: number; type: "discover-packages"; generationId: number }
   | {
     id: number;
     type: "preprocess-scope";
     generationId: number;
+    cause: PreprocessCause;
     scope: PreprocessScope;
     packages: PackageInfo[];
   }
@@ -119,6 +121,8 @@ export type PreprocessProgressEvent = {
   event: "start" | "done";
   component: "uml" | "code";
   resource: string;
+  generationId: number;
+  cause: PreprocessCause;
 };
 
 const PREPROCESS_ERROR_CODES = new Set<PreprocessErrorCode>([
@@ -136,10 +140,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isPreprocessProgressEvent(value: unknown): value is PreprocessProgressEvent {
   return (
     isRecord(value) &&
-    Object.keys(value).length === 3 &&
+    Object.keys(value).length === 5 &&
     (value.event === "start" || value.event === "done") &&
     (value.component === "uml" || value.component === "code") &&
-    typeof value.resource === "string"
+    typeof value.resource === "string" &&
+    typeof value.generationId === "number" &&
+    Number.isSafeInteger(value.generationId) &&
+    value.generationId > 0 &&
+    (value.cause === "startup" || value.cause === "watch")
   );
 }
 

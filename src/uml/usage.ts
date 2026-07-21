@@ -316,6 +316,7 @@ function collectUsageGraph(
 
   const usageEdges: UmlUsageEdge[] = [];
   const localGroups = new Map<string, ReferenceOwner & {
+    ownerEntityId?: string;
     targets: Map<string, ExternalUserTarget>;
   }>();
   const externalGroups = new Map<string, {
@@ -338,11 +339,13 @@ function collectUsageGraph(
       if (!user) continue;
       const ownerDeclaration = enclosingEntityDeclaration(reference);
       const userEntity = user.ownerEntityKey ? entities.get(user.ownerEntityKey) : undefined;
+      const isLocalTypeAlias = Node.isTypeAliasDeclaration(ownerDeclaration)
+        && ownerDeclaration.getTypeParameters().length === 0;
       if (ownerDeclaration === declaration.declarationNode || userEntity?.id === declaration.target.id) continue;
 
       const referenceFileKey = umlFileKey(reference.getSourceFile().getFilePath());
       if (inScopeFiles.has(referenceFileKey)) {
-        if (userEntity) {
+        if (userEntity && !isLocalTypeAlias) {
           const key = `${userEntity.id}\0${declaration.target.id}`;
           if (directedKeys.has(key)) continue;
           directedKeys.add(key);
@@ -357,7 +360,11 @@ function collectUsageGraph(
         const key = `${user.scopePath}\0${user.signature}\0${user.kind}`;
         let group = localGroups.get(key);
         if (!group) {
-          group = { ...user, targets: new Map<string, ExternalUserTarget>() };
+          group = {
+            ...user,
+            ...(userEntity ? { ownerEntityId: userEntity.id } : {}),
+            targets: new Map<string, ExternalUserTarget>(),
+          };
           localGroups.set(key, group);
         }
         group.targets.set(declaration.target.id, declaration.target);
@@ -402,6 +409,7 @@ function collectUsageGraph(
           kind: group.kind,
           ...group.source,
         },
+        ...(group.ownerEntityId ? { ownerEntityId: group.ownerEntityId } : {}),
         targets: [...group.targets.values()].sort((left, right) =>
           left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
         ),

@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test";
 import { join, resolve } from "node:path";
-import { parseCliOptions } from "../src/cli.ts";
+import {
+  formatSyncProgress,
+  formatWatchInvalidation,
+  parseCliOptions,
+} from "../src/cli.ts";
 
 test("parses explicit directory, host, and port options", () => {
   const directory = join("fixtures", "project");
@@ -36,4 +40,26 @@ test.each(["0", "65536", "1.5"])("rejects invalid port %s", (port) => {
 
 test.each(["--help", "-h"])("returns null for %s without requiring --dir", (helpFlag) => {
   expect(parseCliOptions([helpFlag])).toBeNull();
+});
+
+test("formats generation-aware phase progress exactly", () => {
+  expect(formatSyncProgress({
+    event: "done",
+    component: "code",
+    resource: "./packages/dataflow-values",
+    generationId: 42,
+    cause: "watch",
+  })).toBe(
+    "[sync] done code ./packages/dataflow-values generation=42 cause=watch",
+  );
+});
+
+test("formats path-sorted watch invalidation arrays exactly without losing JSON escaping", () => {
+  expect(formatWatchInvalidation(
+    ["packages/a file.ts", 'packages/b"quoted".ts'],
+    ["change", "unlink"],
+    17,
+  )).toBe(
+    '[sync] invalidate watch version=17 paths=["packages/a file.ts","packages/b\\"quoted\\".ts"] events=["change","unlink"]',
+  );
 });

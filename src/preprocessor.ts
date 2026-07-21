@@ -5,6 +5,7 @@ import { normalizeRelativePath } from "./paths.ts";
 import {
   isPreprocessProgressEvent,
   isPreprocessResponse,
+  type PreprocessCause,
   type PreprocessErrorCode,
   type PreprocessProgressEvent,
   type PreprocessRequest,
@@ -22,24 +23,6 @@ import type {
   SearchResponse,
   TreeNode,
 } from "./types.ts";
-
-export type Preprocessor = {
-  ready(): Promise<void>;
-  whenIdle(): Promise<void>;
-  getTree(): Promise<TreeNode>;
-  getPackages(): Promise<readonly PackageInfo[]>;
-  search(query: string): Promise<Omit<SearchResponse, "version">>;
-  getDiagram(kind: DiagramKind, scopePath: string): Promise<Omit<DiagramResponse, "version">>;
-  readFile(relativePath: string, location?: { line: number; column: number }): Promise<FileResponse>;
-  getDefinition(
-    path: string,
-    location: { line: number; column: number },
-  ): Promise<GotoDefinition | null>;
-  prioritize(resource: string): Promise<PreprocessPriorityResponse>;
-  poll(requestId: number): Promise<PreprocessPriorityResponse>;
-  rebuild(cause: "watch"): void;
-  close(): Promise<void>;
-};
 
 type RequestType = PreprocessRequest["type"];
 type RequestMap = {
@@ -81,21 +64,19 @@ interface SubprocessSlot {
   token: number;
   state: SlotState;
   current?: QueueJob;
-  exitSignal: Deferred<void>;
   retirement?: Promise<void>;
   recovery?: Promise<void>;
   expectedShutdown: boolean;
 }
 
 interface ScopeRecord {
-  readonly scope: PreprocessScope;
   readonly job: QueueJob;
   readonly promise: Promise<PreprocessResultMap["preprocess-scope"]>;
 }
 
 interface GenerationState {
   readonly id: number;
-  readonly cause: "startup" | "watch";
+  readonly cause: PreprocessCause;
   readonly promoted: Deferred<void>;
   readonly discovered: Deferred<readonly PackageInfo[]>;
   readonly scopes: Map<string, ScopeRecord>;
@@ -187,88 +168,183 @@ function processCountOrDefault(value: number | undefined): number {
   return Math.max(1, Math.min(4, Math.floor(value)));
 }
 
-export function createPreprocessor(
-  sourceDir: string,
-  onReady: () => void,
-  onError: (error: Error) => void,
-  processCount?: number,
-  onProgress: (event: PreprocessProgressEvent) => void = () => undefined,
-): Preprocessor {
-  const poolSize = processCountOrDefault(processCount);
-  const dbPath = join(sourceDir, ".explore", "explore.db");
-  const slots: SubprocessSlot[] = [];
-  const pendingCalls = new Map<number, PendingCall>();
-  const interactiveQueue: QueueJob[] = [];
-  const backgroundQueue: QueueJob[] = [];
-  const queryDedupe = new Map<string, Promise<unknown>>();
-  const generations = new Map<number, GenerationState>();
-  const priorityRequests = new Map<number, PriorityRequest>();
-  const priorityRequestByResource = new Map<string, PriorityRequest>();
-  const priorityControllers = new Set<Promise<void>>();
-  const readyDeferred = createDeferred<void>();
-  let idleDeferred = createDeferred<void>();
-  let buildingSignal = createDeferred<void>();
-  let nextRequestId = 1;
-  let nextPriorityRequestId = 1;
-  let activeGenerationId: number | null = null;
-  let building: GenerationState | undefined;
-  let latestBuildError: Error | undefined;
-  let poolReady = false;
-  let closed = false;
-  let closePromise: Promise<void> | undefined;
-  let watchRebuilding = false;
-  let watchRequested = false;
-  let watchLoop: Promise<void> | undefined;
+export class Preprocessor {
+  private readonly sourceDir: string;
+  private readonly onReady: () => void;
+  private readonly onError: (error: Error) => void;
+  private readonly poolSize: number;
+  private readonly dbPath: string;
+  private readonly onProgress: (event: PreprocessProgressEvent) => void;
+  private readonly slots: SubprocessSlot[] = [];
+  private readonly pendingCalls = new Map<number, PendingCall>();
+  private readonly interactiveQueue: QueueJob[] = [];
+  private readonly backgroundQueue: QueueJob[] = [];
+  private readonly queryDedupe = new Map<string, Promise<unknown>>();
+  private readonly generations = new Map<number, GenerationState>();
+  private readonly priorityRequests = new Map<number, PriorityRequest>();
+  private readonly priorityRequestByResource = new Map<string, PriorityRequest>();
+  private readonly priorityControllers = new Set<Promise<void>>();
+  private readonly readyDeferred = createDeferred<void>();
+  private idleDeferred = createDeferred<void>();
+  private buildingSignal = createDeferred<void>();
+  private nextRequestId = 1;
+  private nextPriorityRequestId = 1;
+  private activeGenerationId: number | null = null;
+  private building: GenerationState | undefined;
+  private latestBuildError: Error | undefined;
+  private poolReady = false;
+  private closed = false;
+  private closePromise: Promise<void> | undefined;
+  private watchRebuilding = false;
+  private watchRequested = false;
+  private watchLoop: Promise<void> | undefined;
 
-  const closedError = (): PreprocessorError => new PreprocessorError("INTERNAL", "preprocessor is closed");
+  constructor(
+    sourceDir: string,
+    onReady: () => void,
+    onError: (error: Error) => void,
+    processCount?: number,
+    onProgress: (event: PreprocessProgressEvent) => void = () => undefined,
+  ) {
+    this.sourceDir = sourceDir;
+    this.onReady = onReady;
+    this.onError = onError;
+    this.poolSize = processCountOrDefault(processCount);
+    this.dbPath = join(sourceDir, ".explore", "explore.db");
+    this.onProgress = onProgress;
+    void this.bootstrap();
+  }
 
-  function prioritySnapshot(request: PriorityRequest): PreprocessPriorityResponse {
+  public ready(): Promise<void> {
+    return this.readyDeferred.promise;
+  }
+  
+  public whenIdle(): Promise<void> {
+    return this.idleDeferred.promise;
+  }
+  
+  public getTree(): Promise<TreeNode> {
+    return this.dedupe("read-tree", () => this.readStable<"read-tree">({ type: "read-tree" }));
+  }
+  
+  public getPackages(): Promise<readonly PackageInfo[]> {
+    return this.dedupe("read-packages", () => this.readPackagesAcrossGenerations());
+  }
+  
+  public search(query: string): Promise<Omit<SearchResponse, "version">> {
+    return this.dedupe(`search:${query}`, () => this.readStable<"search">({ type: "search", query }));
+  }
+  
+  public getDiagram(
+    kind: DiagramKind,
+    scopePath: string,
+  ): Promise<Omit<DiagramResponse, "version">> {
+    let normalizedScopePath: string;
+    try {
+      normalizedScopePath = normalizeRelativePath(scopePath);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.dedupe(
+      `read-diagram:${kind}:${normalizedScopePath}`,
+      () => this.readDiagramAcrossGenerations(kind, normalizedScopePath),
+    );
+  }
+  
+  public readFile(
+    relativePath: string,
+    location?: { line: number; column: number },
+  ): Promise<FileResponse> {
+    let path: string;
+    try {
+      path = normalizeRelativePath(relativePath);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const locationKey = location ? `${location.line}:${location.column}` : "";
+    return this.dedupe(
+      `read-file:${path}:${locationKey}`,
+      () => this.readFileAcrossGenerations(path, location),
+    );
+  }
+  
+  public getDefinition(
+    path: string,
+    location: { line: number; column: number },
+  ): Promise<GotoDefinition | null> {
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRelativePath(path);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (
+      !Number.isSafeInteger(location.line) ||
+      location.line <= 0 ||
+      !Number.isSafeInteger(location.column) ||
+      location.column <= 0
+    ) {
+      return Promise.reject(
+        new PreprocessorError("INVALID_INPUT", "line and column must be positive safe integers"),
+      );
+    }
+    return this.dedupe(
+      `read-definition:${normalizedPath}:${location.line}:${location.column}`,
+      () => this.readDefinitionAcrossGenerations(normalizedPath, location),
+    );
+  }
+
+  private closedError(): PreprocessorError {
+    return new PreprocessorError("INTERNAL", "preprocessor is closed");
+  }
+
+  private prioritySnapshot(request: PriorityRequest): PreprocessPriorityResponse {
     return {
       status: request.status,
       resource: request.resource,
       requestId: request.requestId,
     };
   }
-
-  function isTerminalPriorityRequest(request: PriorityRequest): boolean {
+  
+  private isTerminalPriorityRequest(request: PriorityRequest): boolean {
     return request.status === "done" || request.error !== undefined;
   }
-
-  function releasePriorityResource(request: PriorityRequest): void {
-    if (priorityRequestByResource.get(request.resource) === request) {
-      priorityRequestByResource.delete(request.resource);
+  
+  private releasePriorityResource(request: PriorityRequest): void {
+    if (this.priorityRequestByResource.get(request.resource) === request) {
+      this.priorityRequestByResource.delete(request.resource);
     }
   }
-
-  function completePriorityRequest(request: PriorityRequest): void {
+  
+  private completePriorityRequest(request: PriorityRequest): void {
     if (request.error || request.status === "done") return;
     request.status = "done";
     request.job = undefined;
-    releasePriorityResource(request);
+    this.releasePriorityResource(request);
   }
-
-  function failPriorityRequest(request: PriorityRequest, error: unknown): void {
+  
+  private failPriorityRequest(request: PriorityRequest, error: unknown): void {
     if (request.error || request.status === "done") return;
     request.error = asError(error);
     request.job = undefined;
-    releasePriorityResource(request);
+    this.releasePriorityResource(request);
   }
-
-  function resetPriorityBinding(request: PriorityRequest): number {
+  
+  private resetPriorityBinding(request: PriorityRequest): number {
     request.bindingToken += 1;
     request.generationId = undefined;
     request.job = undefined;
     request.status = "queued";
     return request.bindingToken;
   }
-
-  function bindPriorityJob(
+  
+  private bindPriorityJob(
     request: PriorityRequest,
     bindingToken: number,
     generationId: number,
     job: QueueJob,
   ): boolean {
-    if (request.bindingToken !== bindingToken || isTerminalPriorityRequest(request)) return false;
+    if (request.bindingToken !== bindingToken || this.isTerminalPriorityRequest(request)) return false;
     request.generationId = generationId;
     request.job = job;
     if (!job.cancelled && (job.state === "queued" || job.state === "processing")) {
@@ -276,70 +352,70 @@ export function createPreprocessor(
     }
     return true;
   }
-
-  function resetPriorityRequestsForJob(job: QueueJob): void {
-    for (const request of priorityRequests.values()) {
-      if (request.job === job && !isTerminalPriorityRequest(request)) {
+  
+  private resetPriorityRequestsForJob(job: QueueJob): void {
+    for (const request of this.priorityRequests.values()) {
+      if (request.job === job && !this.isTerminalPriorityRequest(request)) {
         request.status = "queued";
       }
     }
   }
-
-  function evictTerminalPriorityRequests(): void {
-    if (priorityRequests.size < 256) return;
-    for (const [requestId, request] of priorityRequests) {
-      if (!isTerminalPriorityRequest(request)) continue;
-      priorityRequests.delete(requestId);
-      if (priorityRequests.size < 256) return;
+  
+  private evictTerminalPriorityRequests(): void {
+    if (this.priorityRequests.size < 256) return;
+    for (const [requestId, request] of this.priorityRequests) {
+      if (!this.isTerminalPriorityRequest(request)) continue;
+      this.priorityRequests.delete(requestId);
+      if (this.priorityRequests.size < 256) return;
     }
   }
-
-  function allocatePriorityRequestId(): number {
-    while (priorityRequests.has(nextPriorityRequestId)) {
-      nextPriorityRequestId = nextPriorityRequestId === Number.MAX_SAFE_INTEGER
+  
+  private allocatePriorityRequestId(): number {
+    while (this.priorityRequests.has(this.nextPriorityRequestId)) {
+      this.nextPriorityRequestId = this.nextPriorityRequestId === Number.MAX_SAFE_INTEGER
         ? 1
-        : nextPriorityRequestId + 1;
+        : this.nextPriorityRequestId + 1;
     }
-    const requestId = nextPriorityRequestId;
-    nextPriorityRequestId = nextPriorityRequestId === Number.MAX_SAFE_INTEGER
+    const requestId = this.nextPriorityRequestId;
+    this.nextPriorityRequestId = this.nextPriorityRequestId === Number.MAX_SAFE_INTEGER
       ? 1
-      : nextPriorityRequestId + 1;
+      : this.nextPriorityRequestId + 1;
     return requestId;
   }
-
-  function notifyError(error: unknown): void {
+  
+  private notifyError(error: unknown): void {
     try {
-      onError(asError(error));
+      this.onError(asError(error));
     } catch {
       // A reporting callback must not break queue or subprocess lifecycle handling.
     }
   }
-
-  function notifyProgress(event: PreprocessProgressEvent): void {
+  
+  private notifyProgress(event: PreprocessProgressEvent): void {
     try {
-      onProgress(event);
+      this.onProgress(event);
     } catch {
       // A progress callback must not break queue or subprocess lifecycle handling.
     }
   }
-
-  function resolveReadyCallback(): void {
+  
+  private resolveReadyCallback(): void {
     try {
-      onReady();
+      this.onReady();
     } catch (error) {
-      notifyError(error);
+      this.notifyError(error);
     }
   }
-
-  function rejectCallsForSlot(slot: SubprocessSlot, error: Error): void {
-    for (const [id, pending] of pendingCalls) {
+  
+  private rejectCallsForSlot(slot: SubprocessSlot, error: Error): void {
+    for (const [id, pending] of this.pendingCalls) {
       if (pending.slot !== slot) continue;
-      pendingCalls.delete(id);
+      this.pendingCalls.delete(id);
       pending.reject(error);
     }
   }
-
-  function subprocessFailureMessage(
+  
+  private subprocessFailureMessage(
     subprocess: Bun.Subprocess | undefined,
     exitCode?: number,
     disconnected = false,
@@ -351,21 +427,21 @@ export function createPreprocessor(
     if (exitCode !== undefined) return `preprocess child exited with code ${exitCode}`;
     return "preprocess child exited unexpectedly";
   }
-
-  function markSubprocessDead(
+  
+  private markSubprocessDead(
     slot: SubprocessSlot,
     token: number,
     subprocess: Bun.Subprocess | undefined,
     error: Error,
   ): void {
     if (slot.token !== token || slot.state === "closed" || slot.state === "dead") return;
-    if (slot.expectedShutdown || closed) return;
-
+    if (slot.expectedShutdown || this.closed) return;
+  
     const wasIdle = slot.state === "idle";
     slot.state = "dead";
     if (slot.subprocess === subprocess) slot.subprocess = undefined;
     slot.token += 1;
-    rejectCallsForSlot(slot, error);
+    this.rejectCallsForSlot(slot, error);
     if (subprocess) {
       if (subprocess.exitCode === null && !subprocess.killed) {
         try {
@@ -379,15 +455,13 @@ export function createPreprocessor(
         () => undefined,
       );
     }
-    if (wasIdle) void recoverIdleSlot(slot, error);
+    if (wasIdle) void this.recoverIdleSlot(slot, error);
   }
-
-  function attachSubprocess(
+  
+  private attachSubprocess(
     slot: SubprocessSlot,
   ): { subprocess: Bun.Subprocess; token: number } {
     const token = ++slot.token;
-    const exitSignal = createDeferred<void>();
-    slot.exitSignal = exitSignal;
     slot.expectedShutdown = false;
     let spawned: Bun.Subprocess | undefined;
     const subprocess = Bun.spawn(
@@ -400,14 +474,14 @@ export function createPreprocessor(
         stdout: "ignore",
         stderr: "inherit",
         windowsHide: true,
-        ipc(message, source) {
+        ipc: (message, source) => {
           if (slot.token !== token) return;
           if (isPreprocessProgressEvent(message)) {
-            notifyProgress(message);
+            this.notifyProgress(message);
             return;
           }
           if (!isPreprocessResponse(message)) {
-            markSubprocessDead(
+            this.markSubprocessDead(
               slot,
               token,
               source,
@@ -415,20 +489,20 @@ export function createPreprocessor(
             );
             return;
           }
-          const pending = pendingCalls.get(message.id);
+          const pending = this.pendingCalls.get(message.id);
           if (!pending || pending.slot !== slot) return;
-          pendingCalls.delete(message.id);
+          this.pendingCalls.delete(message.id);
           if (message.ok) pending.resolve(message.value);
           else pending.reject(new PreprocessorError(message.error.code, message.error.message));
         },
-        onDisconnect() {
-          if (slot.expectedShutdown || closed) return;
-          markSubprocessDead(
+        onDisconnect: () => {
+          if (slot.expectedShutdown || this.closed) return;
+          this.markSubprocessDead(
             slot,
             token,
             spawned,
             new SubprocessExitedError(
-              subprocessFailureMessage(spawned, undefined, true),
+              this.subprocessFailureMessage(spawned, undefined, true),
             ),
           );
         },
@@ -438,26 +512,24 @@ export function createPreprocessor(
     if (slot.token === token) slot.subprocess = subprocess;
     void subprocess.exited.then(
       (exitCode) => {
-        exitSignal.resolve(undefined);
         if (slot.token !== token) return;
-        if (slot.expectedShutdown || closed) {
+        if (slot.expectedShutdown || this.closed) {
           slot.state = "closed";
           if (slot.subprocess === subprocess) slot.subprocess = undefined;
-          rejectCallsForSlot(slot, closedError());
+          this.rejectCallsForSlot(slot, this.closedError());
           return;
         }
-        markSubprocessDead(
+        this.markSubprocessDead(
           slot,
           token,
           subprocess,
           new SubprocessExitedError(
-            subprocessFailureMessage(subprocess, exitCode),
+            this.subprocessFailureMessage(subprocess, exitCode),
           ),
         );
       },
       (error) => {
-        exitSignal.resolve(undefined);
-        markSubprocessDead(
+        this.markSubprocessDead(
           slot,
           token,
           subprocess,
@@ -467,8 +539,8 @@ export function createPreprocessor(
     );
     return { subprocess, token };
   }
-
-  function sendToSlot<Type extends RequestType>(
+  
+  private sendToSlot<Type extends RequestType>(
     slot: SubprocessSlot,
     request: RequestFor<Type>,
   ): Promise<PreprocessResultMap[Type]> {
@@ -479,10 +551,10 @@ export function createPreprocessor(
         new SubprocessExitedError("preprocess child is not available"),
       );
     }
-    const id = nextRequestId++;
+    const id = this.nextRequestId++;
     const message = { ...request, id } as PreprocessRequest;
     return new Promise<PreprocessResultMap[Type]>((resolve, reject) => {
-      pendingCalls.set(id, {
+      this.pendingCalls.set(id, {
         slot,
         resolve(value) {
           resolve(value as PreprocessResultMap[Type]);
@@ -493,22 +565,22 @@ export function createPreprocessor(
         subprocess.send(message);
       } catch (error) {
         const failure = new SubprocessExitedError(asError(error).message);
-        markSubprocessDead(slot, token, subprocess, failure);
-        if (pendingCalls.delete(id)) reject(failure);
+        this.markSubprocessDead(slot, token, subprocess, failure);
+        if (this.pendingCalls.delete(id)) reject(failure);
       }
     });
   }
-
-  async function initializeSlot(
+  
+  private async initializeSlot(
     slot: SubprocessSlot,
     recover: boolean,
   ): Promise<number | null> {
     if (slot.retirement) await slot.retirement;
-    if (closed) throw closedError();
+    if (this.closed) throw this.closedError();
     slot.state = "initializing";
     let attached: { subprocess: Bun.Subprocess; token: number };
     try {
-      attached = attachSubprocess(slot);
+      attached = this.attachSubprocess(slot);
     } catch (error) {
       slot.state = "dead";
       throw asError(error);
@@ -521,13 +593,13 @@ export function createPreprocessor(
       throw new SubprocessExitedError("preprocess child exited during spawn");
     }
     try {
-      const result = await sendToSlot<"init">(slot, {
+      const result = await this.sendToSlot<"init">(slot, {
         type: "init",
-        sourceDir,
-        dbPath,
+        sourceDir: this.sourceDir,
+        dbPath: this.dbPath,
         recover,
       });
-      if (closed) throw closedError();
+      if (this.closed) throw this.closedError();
       slot.state = "idle";
       slot.retirement = undefined;
       return result.activeGenerationId;
@@ -545,57 +617,56 @@ export function createPreprocessor(
         }
       }
       await subprocess.exited;
-      slot.exitSignal.resolve(undefined);
       throw error;
     }
   }
-
-  async function initializeSlotWithRetry(
+  
+  private async initializeSlotWithRetry(
     slot: SubprocessSlot,
     recover: boolean,
   ): Promise<number | null> {
     try {
-      return await initializeSlot(slot, recover);
+      return await this.initializeSlot(slot, recover);
     } catch (firstError) {
-      if (closed) throw firstError;
-      return initializeSlot(slot, recover);
+      if (this.closed) throw firstError;
+      return this.initializeSlot(slot, recover);
     }
   }
-
-  function ensureSlotRecovery(slot: SubprocessSlot): Promise<void> {
+  
+  private ensureSlotRecovery(slot: SubprocessSlot): Promise<void> {
     if (slot.recovery) return slot.recovery;
     const recovery = (async () => {
       if (slot.retirement) await slot.retirement;
-      await initializeSlot(slot, false);
+      await this.initializeSlot(slot, false);
     })();
     slot.recovery = recovery.finally(() => {
       slot.recovery = undefined;
     });
     return slot.recovery;
   }
-
-  async function recoverIdleSlot(
+  
+  private async recoverIdleSlot(
     slot: SubprocessSlot,
     failure: Error,
   ): Promise<void> {
     try {
-      await ensureSlotRecovery(slot);
-      dispatch();
+      await this.ensureSlotRecovery(slot);
+      this.dispatch();
     } catch (error) {
       const terminal = new PreprocessorError(
         "INTERNAL",
         `preprocess child ${slot.index} failed to respawn: ${asError(error).message || failure.message}`,
       );
-      if (building) failGeneration(building, terminal, true);
-      else notifyError(terminal);
+      if (this.building) this.failGeneration(this.building, terminal, true);
+      else this.notifyError(terminal);
     }
   }
-
-  function queueFor(priority: QueuePriority): QueueJob[] {
-    return priority === "interactive" ? interactiveQueue : backgroundQueue;
+  
+  private queueFor(priority: QueuePriority): QueueJob[] {
+    return priority === "interactive" ? this.interactiveQueue : this.backgroundQueue;
   }
-
-  function enqueueRequest<Type extends RequestType>(
+  
+  private enqueueRequest<Type extends RequestType>(
     request: RequestFor<Type>,
     priority: QueuePriority,
     generationId?: number,
@@ -612,107 +683,107 @@ export function createPreprocessor(
       crashRetries: 0,
       cancelled: false,
     };
-    if (closed) {
+    if (this.closed) {
       job.cancelled = true;
-      deferred.reject(closedError());
+      deferred.reject(this.closedError());
       finished.resolve(undefined);
     } else {
-      queueFor(priority).push(job);
-      dispatch();
+      this.queueFor(priority).push(job);
+      this.dispatch();
     }
     return {
       job,
       promise: deferred.promise as Promise<PreprocessResultMap[Type]>,
     };
   }
-
-  function repositionQueuedJob(job: QueueJob): void {
+  
+  private repositionQueuedJob(job: QueueJob): void {
     if (job.cancelled || job.state !== "queued") return;
-    let index = backgroundQueue.indexOf(job);
+    let index = this.backgroundQueue.indexOf(job);
     if (index >= 0) {
-      backgroundQueue.splice(index, 1);
+      this.backgroundQueue.splice(index, 1);
     } else {
-      index = interactiveQueue.indexOf(job);
+      index = this.interactiveQueue.indexOf(job);
       if (index < 0) return;
-      interactiveQueue.splice(index, 1);
+      this.interactiveQueue.splice(index, 1);
     }
     job.priority = "interactive";
-    interactiveQueue.unshift(job);
-    dispatch();
+    this.interactiveQueue.unshift(job);
+    this.dispatch();
   }
-
-  function nextJob(): QueueJob | undefined {
-    while (interactiveQueue.length) {
-      const job = interactiveQueue.shift()!;
+  
+  private nextJob(): QueueJob | undefined {
+    while (this.interactiveQueue.length) {
+      const job = this.interactiveQueue.shift()!;
       if (!job.cancelled) return job;
     }
-    while (backgroundQueue.length) {
-      const job = backgroundQueue.shift()!;
+    while (this.backgroundQueue.length) {
+      const job = this.backgroundQueue.shift()!;
       if (!job.cancelled) return job;
     }
     return undefined;
   }
-
-  function dispatch(): void {
-    if (!poolReady || closed) return;
-    for (const slot of slots) {
+  
+  private dispatch(): void {
+    if (!this.poolReady || this.closed) return;
+    for (const slot of this.slots) {
       if (slot.state !== "idle") continue;
-      const job = nextJob();
+      const job = this.nextJob();
       if (!job) return;
-      runJob(slot, job);
+      this.runJob(slot, job);
     }
   }
-
-  function finishSlotJob(
+  
+  private finishSlotJob(
     slot: SubprocessSlot,
     job: QueueJob,
     completed = true,
   ): void {
     if (slot.current === job) slot.current = undefined;
     if (
-      !closed &&
+      !this.closed &&
       slot.subprocess &&
       slot.state !== "initializing" &&
       slot.state !== "dead"
     ) {
       slot.state = "idle";
-    } else if (closed) {
+    } else if (this.closed) {
       slot.state = "closing";
     }
     if (completed) job.finished.resolve(undefined);
   }
-
-  function runJob(slot: SubprocessSlot, job: QueueJob): void {
+  
+  private runJob(slot: SubprocessSlot, job: QueueJob): void {
     job.state = "processing";
     slot.state = "busy";
     slot.current = job;
-    void sendToSlot(slot, job.request).then((value) => {
+    void this.sendToSlot(slot, job.request).then((value) => {
       job.state = "done";
-      finishSlotJob(slot, job);
+      this.finishSlotJob(slot, job);
       if (!job.cancelled) job.deferred.resolve(value);
-      dispatch();
+      this.dispatch();
     }).catch(async (error) => {
       if (error instanceof SubprocessExitedError) {
-        if (job.cancelled || closed) {
+        if (job.cancelled || this.closed) {
           if (slot.retirement) await slot.retirement;
-          finishSlotJob(slot, job);
-          if (!job.cancelled) job.deferred.reject(closedError());
-          if (!closed) {
-            void ensureSlotRecovery(slot)
-              .then(dispatch)
-              .catch((recoveryError) => notifyError(recoveryError));
+          this.finishSlotJob(slot, job);
+          if (!job.cancelled) job.deferred.reject(this.closedError());
+          if (!this.closed) {
+            void this.ensureSlotRecovery(slot)
+              .then(() => this.dispatch())
+              .catch((recoveryError) => this.notifyError(recoveryError));
           }
           return;
         }
         if (job.crashRetries === 0) {
           job.crashRetries = 1;
           try {
-            await ensureSlotRecovery(slot);
-            finishSlotJob(slot, job, false);
+            await this.ensureSlotRecovery(slot);
+            this.finishSlotJob(slot, job, false);
             job.state = "queued";
-            resetPriorityRequestsForJob(job);
-            queueFor(job.priority).unshift(job);
-            dispatch();
+            this.resetPriorityRequestsForJob(job);
+            this.queueFor(job.priority).unshift(job);
+            this.dispatch();
             return;
           } catch (recoveryError) {
             error = new SubprocessExitedError(
@@ -720,37 +791,37 @@ export function createPreprocessor(
             );
           }
         } else {
-          void ensureSlotRecovery(slot)
-            .then(dispatch)
-            .catch((recoveryError) => notifyError(recoveryError));
+          void this.ensureSlotRecovery(slot)
+            .then(() => this.dispatch())
+            .catch((recoveryError) => this.notifyError(recoveryError));
         }
         if (slot.retirement) await slot.retirement;
-        finishSlotJob(slot, job);
+        this.finishSlotJob(slot, job);
         job.deferred.reject(error);
         const generation =
           job.generationId === undefined
             ? undefined
-            : generations.get(job.generationId);
+            : this.generations.get(job.generationId);
         if (generation && !generation.superseded && !generation.failed) {
-          failGeneration(generation, asError(error), true);
+          this.failGeneration(generation, asError(error), true);
         } else {
-          notifyError(error);
+          this.notifyError(error);
         }
-        dispatch();
+        this.dispatch();
         return;
       }
-
-      finishSlotJob(slot, job);
+  
+      this.finishSlotJob(slot, job);
       if (!job.cancelled) job.deferred.reject(error);
-      dispatch();
+      this.dispatch();
     });
   }
-
-  function removeQueuedGenerationJobs(
+  
+  private removeQueuedGenerationJobs(
     generationId: number,
     error: Error,
   ): void {
-    for (const queue of [interactiveQueue, backgroundQueue]) {
+    for (const queue of [this.interactiveQueue, this.backgroundQueue]) {
       for (let index = queue.length - 1; index >= 0; index -= 1) {
         const job = queue[index]!;
         if (job.generationId !== generationId) continue;
@@ -760,23 +831,23 @@ export function createPreprocessor(
         job.finished.resolve(undefined);
       }
     }
-    for (const slot of slots) {
+    for (const slot of this.slots) {
       const job = slot.current;
       if (!job || job.generationId !== generationId) continue;
       job.cancelled = true;
       job.deferred.reject(error);
     }
   }
-
-  function drainGenerationJobs(generationId: number): Promise<void> {
-    const active = slots.flatMap((slot) => {
+  
+  private drainGenerationJobs(generationId: number): Promise<void> {
+    const active = this.slots.flatMap((slot) => {
       const job = slot.current;
       return job?.generationId === generationId ? [job.finished.promise] : [];
     });
     return Promise.all(active).then(() => undefined);
   }
-
-  function rejectScopeWaiters(
+  
+  private rejectScopeWaiters(
     generation: GenerationState,
     error: Error,
   ): void {
@@ -785,8 +856,8 @@ export function createPreprocessor(
     }
     generation.scopeWaiters.clear();
   }
-
-  function failGeneration(
+  
+  private failGeneration(
     generation: GenerationState,
     cause: Error,
     processFailure: boolean,
@@ -794,19 +865,19 @@ export function createPreprocessor(
     if (generation.failed || generation.superseded) return;
     generation.failed = true;
     generation.failure = cause;
-    latestBuildError = cause;
-    removeQueuedGenerationJobs(generation.id, cause);
-    rejectScopeWaiters(generation, cause);
+    this.latestBuildError = cause;
+    this.removeQueuedGenerationJobs(generation.id, cause);
+    this.rejectScopeWaiters(generation, cause);
     generation.discovered.reject(cause);
     generation.promoted.reject(cause);
-    if (building === generation) {
-      building = undefined;
-      buildingSignal = createDeferred<void>();
-      watchRebuilding = false;
+    if (this.building === generation) {
+      this.building = undefined;
+      this.buildingSignal = createDeferred<void>();
+      this.watchRebuilding = false;
     }
-    idleDeferred.reject(cause);
-    void drainGenerationJobs(generation.id).then(() => {
-      const discard = enqueueRequest<"discard-generation">(
+    this.idleDeferred.reject(cause);
+    void this.drainGenerationJobs(generation.id).then(() => {
+      const discard = this.enqueueRequest<"discard-generation">(
         {
           type: "discard-generation",
           generationId: generation.id,
@@ -816,22 +887,22 @@ export function createPreprocessor(
       ).promise;
       void discard.catch(() => undefined);
     });
-    notifyError(cause);
+    this.notifyError(cause);
   }
-
-  function mutationFinished(generation: GenerationState): void {
+  
+  private mutationFinished(generation: GenerationState): void {
     generation.pendingMutations = Math.max(0, generation.pendingMutations - 1);
-    maybeSchedulePromotion(generation);
+    this.maybeSchedulePromotion(generation);
   }
-
-  function wakeScopeWaiters(generation: GenerationState, path: string, record: ScopeRecord): void {
+  
+  private wakeScopeWaiters(generation: GenerationState, path: string, record: ScopeRecord): void {
     const waiters = generation.scopeWaiters.get(path);
     if (!waiters) return;
     generation.scopeWaiters.delete(path);
     for (const waiter of waiters) waiter.resolve(record);
   }
-
-  function enqueueScope(
+  
+  private enqueueScope(
     generation: GenerationState,
     rawScope: PreprocessScope,
     priority: QueuePriority,
@@ -843,44 +914,45 @@ export function createPreprocessor(
     };
     const existing = generation.scopes.get(scope.path);
     if (existing) {
-      if (priority === "interactive") repositionQueuedJob(existing.job);
+      if (priority === "interactive") this.repositionQueuedJob(existing.job);
       return existing;
     }
-
+  
     generation.pendingMutations += 1;
-    const queued = enqueueRequest<"preprocess-scope">(
+    const queued = this.enqueueRequest<"preprocess-scope">(
       {
         type: "preprocess-scope",
         generationId: generation.id,
+        cause: generation.cause,
         scope,
         packages: generation.packages,
       },
       priority,
       generation.id,
     );
-    const record: ScopeRecord = { scope, job: queued.job, promise: queued.promise };
+    const record: ScopeRecord = { job: queued.job, promise: queued.promise };
     generation.scopes.set(scope.path, record);
-    wakeScopeWaiters(generation, scope.path, record);
+    this.wakeScopeWaiters(generation, scope.path, record);
     void record.promise.then((result) => {
       if (generation.superseded || generation.failed) return;
-      for (const child of result.children) enqueueScope(generation, child, "background", true);
+      for (const child of result.children) this.enqueueScope(generation, child, "background", true);
     }).catch((error) => {
       if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
-      if (requiredTraversal) failGeneration(generation, asError(error), false);
-    }).finally(() => mutationFinished(generation));
+      if (requiredTraversal) this.failGeneration(generation, asError(error), false);
+    }).finally(() => this.mutationFinished(generation));
     return record;
   }
-
-  function seedTraversal(generation: GenerationState, packages: readonly PackageInfo[]): void {
+  
+  private seedTraversal(generation: GenerationState, packages: readonly PackageInfo[]): void {
     for (const pkg of packages) {
-      enqueueScope(generation, { path: pkg.path, kind: "package" }, "background", true);
+      this.enqueueScope(generation, { path: pkg.path, kind: "package" }, "background", true);
     }
-    enqueueScope(generation, { path: "", kind: "directory" }, "background", true);
+    this.enqueueScope(generation, { path: "", kind: "directory" }, "background", true);
   }
-
-  function enqueueDiscovery(generation: GenerationState): void {
+  
+  private enqueueDiscovery(generation: GenerationState): void {
     generation.pendingMutations += 1;
-    const discovery = enqueueRequest<"discover-packages">(
+    const discovery = this.enqueueRequest<"discover-packages">(
       { type: "discover-packages", generationId: generation.id },
       "background",
       generation.id,
@@ -891,14 +963,14 @@ export function createPreprocessor(
       generation.packages = packages;
       generation.discoveryComplete = true;
       generation.discovered.resolve(packages);
-      seedTraversal(generation, packages);
+      this.seedTraversal(generation, packages);
     }).catch((error) => {
       if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
-      failGeneration(generation, asError(error), false);
-    }).finally(() => mutationFinished(generation));
+      this.failGeneration(generation, asError(error), false);
+    }).finally(() => this.mutationFinished(generation));
   }
-
-  function maybeSchedulePromotion(generation: GenerationState): void {
+  
+  private maybeSchedulePromotion(generation: GenerationState): void {
     if (
       generation.superseded ||
       generation.failed ||
@@ -906,32 +978,32 @@ export function createPreprocessor(
       !generation.discoveryComplete ||
       generation.pendingMutations !== 0
     ) return;
-
+  
     generation.promotionScheduled = true;
-    const promotion = enqueueRequest<"promote-generation">(
+    const promotion = this.enqueueRequest<"promote-generation">(
       { type: "promote-generation", generationId: generation.id },
       "background",
       generation.id,
     ).promise;
     void promotion.then(() => {
       if (generation.superseded || generation.failed) return;
-      activeGenerationId = generation.id;
-      latestBuildError = undefined;
-      if (building === generation) building = undefined;
+      this.activeGenerationId = generation.id;
+      this.latestBuildError = undefined;
+      if (this.building === generation) this.building = undefined;
       generation.promoted.resolve(undefined);
-      idleDeferred.resolve(undefined);
-      watchRebuilding = false;
-      queryDedupe.clear();
-      resolveReadyCallback();
+      this.idleDeferred.resolve(undefined);
+      this.watchRebuilding = false;
+      this.queryDedupe.clear();
+      this.resolveReadyCallback();
     }).catch((error) => {
       if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
-      failGeneration(generation, asError(error), false);
+      this.failGeneration(generation, asError(error), false);
     });
   }
-
-  async function beginGeneration(cause: "startup" | "watch"): Promise<GenerationState> {
-    const result = await enqueueRequest<"begin-generation">({ type: "begin-generation", cause }, "interactive").promise;
-    if (closed) throw closedError();
+  
+  private async beginGeneration(cause: PreprocessCause): Promise<GenerationState> {
+    const result = await this.enqueueRequest<"begin-generation">({ type: "begin-generation", cause }, "interactive").promise;
+    if (this.closed) throw this.closedError();
     const generation: GenerationState = {
       id: result.generationId,
       cause,
@@ -946,30 +1018,30 @@ export function createPreprocessor(
       superseded: false,
       failed: false,
     };
-    generations.set(generation.id, generation);
-    building = generation;
-    latestBuildError = undefined;
-    buildingSignal.resolve(undefined);
-    enqueueDiscovery(generation);
+    this.generations.set(generation.id, generation);
+    this.building = generation;
+    this.latestBuildError = undefined;
+    this.buildingSignal.resolve(undefined);
+    this.enqueueDiscovery(generation);
     return generation;
   }
-
-  async function supersedeGeneration(
+  
+  private async supersedeGeneration(
     generation: GenerationState,
   ): Promise<void> {
     if (generation.superseded || generation.failed) return;
     generation.superseded = true;
     const error = new SupersededGenerationError();
-    removeQueuedGenerationJobs(generation.id, error);
-    rejectScopeWaiters(generation, error);
+    this.removeQueuedGenerationJobs(generation.id, error);
+    this.rejectScopeWaiters(generation, error);
     generation.discovered.reject(error);
     generation.promoted.reject(error);
-    if (building === generation) {
-      building = undefined;
-      buildingSignal = createDeferred<void>();
+    if (this.building === generation) {
+      this.building = undefined;
+      this.buildingSignal = createDeferred<void>();
     }
-    await drainGenerationJobs(generation.id);
-    await enqueueRequest<"discard-generation">(
+    await this.drainGenerationJobs(generation.id);
+    await this.enqueueRequest<"discard-generation">(
       {
         type: "discard-generation",
         generationId: generation.id,
@@ -978,83 +1050,81 @@ export function createPreprocessor(
       "interactive",
     ).promise;
   }
-
-  async function awaitBuildingGeneration(): Promise<GenerationState> {
-    while (!closed) {
-      if (building && !building.superseded && !building.failed) return building;
-      if (latestBuildError) throw latestBuildError;
-      await buildingSignal.promise;
+  
+  private async awaitBuildingGeneration(): Promise<GenerationState> {
+    while (!this.closed) {
+      if (this.building && !this.building.superseded && !this.building.failed) return this.building;
+      if (this.latestBuildError) throw this.latestBuildError;
+      await this.buildingSignal.promise;
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  async function runWatchLoop(): Promise<void> {
+  
+  private async runWatchLoop(): Promise<void> {
     try {
-      await readyDeferred.promise;
-      while (watchRequested && !closed) {
-        watchRequested = false;
-        if (idleDeferred.settled) idleDeferred = createDeferred<void>();
-        const previous = building;
-        if (previous) await supersedeGeneration(previous);
-        if (closed) return;
-        await beginGeneration("watch");
+      await this.readyDeferred.promise;
+      while (this.watchRequested && !this.closed) {
+        this.watchRequested = false;
+        if (this.idleDeferred.settled) this.idleDeferred = createDeferred<void>();
+        const previous = this.building;
+        if (previous) await this.supersedeGeneration(previous);
+        if (this.closed) return;
+        await this.beginGeneration("watch");
       }
     } catch (error) {
-      if (!closed && !(error instanceof SupersededGenerationError)) {
-        watchRebuilding = false;
-        latestBuildError = asError(error);
-        idleDeferred.reject(error);
-        notifyError(error);
+      if (!this.closed && !(error instanceof SupersededGenerationError)) {
+        this.watchRebuilding = false;
+        this.latestBuildError = asError(error);
+        this.idleDeferred.reject(error);
+        this.notifyError(error);
       }
     } finally {
-      watchLoop = undefined;
-      if (watchRequested && !closed) {
-        watchLoop = runWatchLoop();
-        void watchLoop.catch(() => undefined);
+      this.watchLoop = undefined;
+      if (this.watchRequested && !this.closed) {
+        this.watchLoop = this.runWatchLoop();
+        void this.watchLoop.catch(() => undefined);
       }
     }
   }
-
-  async function bootstrap(): Promise<void> {
+  
+  private async bootstrap(): Promise<void> {
     try {
       const initializer: SubprocessSlot = {
         index: 0,
         token: 0,
         state: "new",
-        exitSignal: createDeferred<void>(),
         expectedShutdown: false,
       };
-      slots.push(initializer);
-      activeGenerationId = await initializeSlotWithRetry(initializer, true);
-
+      this.slots.push(initializer);
+      this.activeGenerationId = await this.initializeSlotWithRetry(initializer, true);
+  
       const additional: SubprocessSlot[] = [];
-      for (let index = 1; index < poolSize; index += 1) {
+      for (let index = 1; index < this.poolSize; index += 1) {
         const slot: SubprocessSlot = {
           index,
           token: 0,
           state: "new",
-          exitSignal: createDeferred<void>(),
           expectedShutdown: false,
         };
-        slots.push(slot);
+        this.slots.push(slot);
         additional.push(slot);
       }
-      await Promise.all(additional.map((slot) => initializeSlotWithRetry(slot, false)));
-      if (closed) throw closedError();
-      poolReady = true;
-      dispatch();
-      await beginGeneration("startup");
-      readyDeferred.resolve(undefined);
+      await Promise.all(additional.map((slot) => this.initializeSlotWithRetry(slot, false)));
+      if (this.closed) throw this.closedError();
+      this.poolReady = true;
+      this.dispatch();
+      await this.beginGeneration("startup");
+      this.readyDeferred.resolve(undefined);
     } catch (error) {
       const failure = asError(error);
-      readyDeferred.reject(failure);
-      idleDeferred.reject(failure);
-      notifyError(failure);
+      this.readyDeferred.reject(failure);
+      this.idleDeferred.reject(failure);
+      this.notifyError(failure);
     }
   }
-
-  function dedupe<Value>(key: string, operation: () => Promise<Value>): Promise<Value> {
-    const existing = queryDedupe.get(key);
+  
+  private dedupe<Value>(key: string, operation: () => Promise<Value>): Promise<Value> {
+    const existing = this.queryDedupe.get(key);
     if (existing) return existing as Promise<Value>;
     let promise: Promise<Value>;
     try {
@@ -1062,20 +1132,20 @@ export function createPreprocessor(
     } catch (error) {
       promise = Promise.reject(error);
     }
-    queryDedupe.set(key, promise);
+    this.queryDedupe.set(key, promise);
     void promise.finally(() => {
-      if (queryDedupe.get(key) === promise) queryDedupe.delete(key);
+      if (this.queryDedupe.get(key) === promise) this.queryDedupe.delete(key);
     }).catch(() => undefined);
     return promise;
   }
-
-  async function readStable<Type extends "read-tree" | "read-packages" | "search">(
+  
+  private async readStable<Type extends "read-tree" | "read-packages" | "search">(
     request: Omit<RequestFor<Type>, "generationId">,
   ): Promise<PreprocessResultMap[Type]> {
-    await readyDeferred.promise;
-    while (!closed) {
-      if (watchRebuilding) {
-        const generation = await awaitBuildingGeneration();
+    await this.readyDeferred.promise;
+    while (!this.closed) {
+      if (this.watchRebuilding) {
+        const generation = await this.awaitBuildingGeneration();
         try {
           await generation.promoted.promise;
         } catch (error) {
@@ -1084,13 +1154,13 @@ export function createPreprocessor(
         }
         continue;
       }
-      if (activeGenerationId !== null) {
-        return enqueueRequest<Type>(
-          { ...request, generationId: activeGenerationId } as RequestFor<Type>,
+      if (this.activeGenerationId !== null) {
+        return this.enqueueRequest<Type>(
+          { ...request, generationId: this.activeGenerationId } as RequestFor<Type>,
           "interactive",
         ).promise;
       }
-      const generation = await awaitBuildingGeneration();
+      const generation = await this.awaitBuildingGeneration();
       try {
         await generation.promoted.promise;
       } catch (error) {
@@ -1098,14 +1168,14 @@ export function createPreprocessor(
         throw error;
       }
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  async function readPackages(): Promise<readonly PackageInfo[]> {
-    await readyDeferred.promise;
-    while (!closed) {
-      if (watchRebuilding) {
-        const generation = await awaitBuildingGeneration();
+  
+  private async readPackagesAcrossGenerations(): Promise<readonly PackageInfo[]> {
+    await this.readyDeferred.promise;
+    while (!this.closed) {
+      if (this.watchRebuilding) {
+        const generation = await this.awaitBuildingGeneration();
         try {
           await generation.promoted.promise;
         } catch (error) {
@@ -1114,16 +1184,16 @@ export function createPreprocessor(
         }
         continue;
       }
-      if (activeGenerationId !== null) {
-        return enqueueRequest<"read-packages">(
-          { type: "read-packages", generationId: activeGenerationId },
+      if (this.activeGenerationId !== null) {
+        return this.enqueueRequest<"read-packages">(
+          { type: "read-packages", generationId: this.activeGenerationId },
           "interactive",
         ).promise;
       }
-      const generation = await awaitBuildingGeneration();
+      const generation = await this.awaitBuildingGeneration();
       try {
         await generation.discovered.promise;
-        return await enqueueRequest<"read-packages">(
+        return await this.enqueueRequest<"read-packages">(
           { type: "read-packages", generationId: generation.id },
           "interactive",
           generation.id,
@@ -1133,15 +1203,15 @@ export function createPreprocessor(
         throw error;
       }
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  async function inferBuildingScopeKind(path: string): Promise<"directory" | "file" | undefined> {
+  
+  private async inferBuildingScopeKind(path: string): Promise<"directory" | "file" | undefined> {
     if (path === "") return "directory";
-    if (activeGenerationId === null) return undefined;
+    if (this.activeGenerationId === null) return undefined;
     try {
-      const tree = await enqueueRequest<"read-tree">(
-        { type: "read-tree", generationId: activeGenerationId },
+      const tree = await this.enqueueRequest<"read-tree">(
+        { type: "read-tree", generationId: this.activeGenerationId },
         "interactive",
       ).promise;
       return findTreeKind(tree, path);
@@ -1149,8 +1219,8 @@ export function createPreprocessor(
       return undefined;
     }
   }
-
-  async function prioritizeScope(
+  
+  private async prioritizeScope(
     generation: GenerationState,
     path: string,
     knownKind?: "directory" | "file",
@@ -1158,24 +1228,24 @@ export function createPreprocessor(
     await generation.discovered.promise;
     if (generation.superseded) throw new SupersededGenerationError();
     if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
-
+  
     const existing = generation.scopes.get(path);
     if (existing) {
-      repositionQueuedJob(existing.job);
+      this.repositionQueuedJob(existing.job);
       return existing;
     }
-
+  
     if (generation.promotionScheduled) {
       await generation.promoted.promise;
       return undefined;
     }
-
-    const inferred = knownKind ?? await inferBuildingScopeKind(path);
+  
+    const inferred = knownKind ?? await this.inferBuildingScopeKind(path);
     if (generation.superseded) throw new SupersededGenerationError();
     if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
     const discoveredWhileInferring = generation.scopes.get(path);
     if (discoveredWhileInferring) {
-      repositionQueuedJob(discoveredWhileInferring.job);
+      this.repositionQueuedJob(discoveredWhileInferring.job);
       return discoveredWhileInferring;
     }
     if (generation.promotionScheduled) {
@@ -1183,9 +1253,9 @@ export function createPreprocessor(
       return undefined;
     }
     if (inferred) {
-      return enqueueScope(generation, { path, kind: inferred }, "interactive", false);
+      return this.enqueueScope(generation, { path, kind: inferred }, "interactive", false);
     }
-
+  
     const waiter = createDeferred<ScopeRecord>();
     const waiters = generation.scopeWaiters.get(path) ?? [];
     waiters.push(waiter);
@@ -1197,8 +1267,8 @@ export function createPreprocessor(
     }, (error) => waiter.reject(error));
     return waiter.promise;
   }
-
-  async function readPriorityDiagram(
+  
+  private async readPriorityDiagram(
     generation: GenerationState,
     kind: DiagramKind,
     scopePath: string,
@@ -1206,63 +1276,63 @@ export function createPreprocessor(
     if (kind === "packages") {
       await generation.discovered.promise;
     } else {
-      const record = await prioritizeScope(generation, scopePath);
+      const record = await this.prioritizeScope(generation, scopePath);
       if (record) await record.promise;
     }
-    return enqueueRequest<"read-diagram">(
+    return this.enqueueRequest<"read-diagram">(
       { type: "read-diagram", generationId: generation.id, kind, scopePath },
       "interactive",
       generation.id,
     ).promise;
   }
-
-  async function getDiagram(
+  
+  private async readDiagramAcrossGenerations(
     kind: DiagramKind,
     scopePath: string,
   ): Promise<Omit<DiagramResponse, "version">> {
-    await readyDeferred.promise;
-    while (!closed) {
-      if (watchRebuilding) {
-        const generation = await awaitBuildingGeneration();
+    await this.readyDeferred.promise;
+    while (!this.closed) {
+      if (this.watchRebuilding) {
+        const generation = await this.awaitBuildingGeneration();
         try {
-          return await readPriorityDiagram(generation, kind, scopePath);
+          return await this.readPriorityDiagram(generation, kind, scopePath);
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
         }
       }
-
-      const selectedGenerationId = activeGenerationId;
+  
+      const selectedGenerationId = this.activeGenerationId;
       if (selectedGenerationId !== null) {
         try {
-          return await enqueueRequest<"read-diagram">(
+          return await this.enqueueRequest<"read-diagram">(
             { type: "read-diagram", generationId: selectedGenerationId, kind, scopePath },
             "interactive",
           ).promise;
         } catch (error) {
           if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
-          if (activeGenerationId !== selectedGenerationId) continue;
-          if (!building) throw error;
+          if (this.activeGenerationId !== selectedGenerationId) continue;
+          if (!this.building) throw error;
         }
       }
-
-      const generation = await awaitBuildingGeneration();
+  
+      const generation = await this.awaitBuildingGeneration();
       try {
-        return await readPriorityDiagram(generation, kind, scopePath);
+        return await this.readPriorityDiagram(generation, kind, scopePath);
       } catch (error) {
         if (error instanceof SupersededGenerationError) continue;
         throw error;
       }
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  async function getDefinition(
+  
+  private async readDefinitionAcrossGenerations(
     path: string,
     location: { line: number; column: number },
   ): Promise<GotoDefinition | null> {
     const read = (generationId: number, generation?: GenerationState) =>
-      enqueueRequest<"read-definition">(
+      this.enqueueRequest<"read-definition">(
         {
           type: "read-definition",
           generationId,
@@ -1273,37 +1343,37 @@ export function createPreprocessor(
         "interactive",
         generation?.id,
       ).promise;
-
-    await readyDeferred.promise;
-    while (!closed) {
+  
+    await this.readyDeferred.promise;
+    while (!this.closed) {
       try {
-        if (watchRebuilding) {
-          const generation = await awaitBuildingGeneration();
+        if (this.watchRebuilding) {
+          const generation = await this.awaitBuildingGeneration();
           const definition = await read(generation.id, generation);
           if (generation.superseded || generation.failed) continue;
-          if (watchRebuilding && building === generation) return definition;
-          if (!watchRebuilding && activeGenerationId === generation.id) return definition;
+          if (this.watchRebuilding && this.building === generation) return definition;
+          if (!this.watchRebuilding && this.activeGenerationId === generation.id) return definition;
           continue;
         }
-
-        const selectedGenerationId = activeGenerationId;
+  
+        const selectedGenerationId = this.activeGenerationId;
         if (selectedGenerationId !== null) {
           const definition = await read(selectedGenerationId);
-          if (watchRebuilding || activeGenerationId !== selectedGenerationId) continue;
-          const selectedGeneration = generations.get(selectedGenerationId);
+          if (this.watchRebuilding || this.activeGenerationId !== selectedGenerationId) continue;
+          const selectedGeneration = this.generations.get(selectedGenerationId);
           if (selectedGeneration?.superseded || selectedGeneration?.failed) continue;
-          if (definition || !building) return definition;
+          if (definition || !this.building) return definition;
         }
-
-        const generation = await awaitBuildingGeneration();
+  
+        const generation = await this.awaitBuildingGeneration();
         const definition = await read(generation.id, generation);
         if (generation.superseded || generation.failed) continue;
-        if (watchRebuilding) {
-          if (building === generation) return definition;
+        if (this.watchRebuilding) {
+          if (this.building === generation) return definition;
           continue;
         }
-        if (activeGenerationId === generation.id) return definition;
-        if (activeGenerationId === selectedGenerationId && building === generation) {
+        if (this.activeGenerationId === generation.id) return definition;
+        if (this.activeGenerationId === selectedGenerationId && this.building === generation) {
           return definition;
         }
       } catch (error) {
@@ -1311,24 +1381,24 @@ export function createPreprocessor(
         throw error;
       }
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  function activePrioritySelectionIsCurrent(
+  
+  private activePrioritySelectionIsCurrent(
     request: PriorityRequest,
     bindingToken: number,
     generationId: number,
   ): boolean {
     if (
       request.bindingToken !== bindingToken ||
-      watchRebuilding ||
-      activeGenerationId !== generationId
+      this.watchRebuilding ||
+      this.activeGenerationId !== generationId
     ) return false;
-    const generation = generations.get(generationId);
+    const generation = this.generations.get(generationId);
     return !generation || (!generation.superseded && !generation.failed);
   }
-
-  function buildingPrioritySelectionIsCurrent(
+  
+  private buildingPrioritySelectionIsCurrent(
     request: PriorityRequest,
     bindingToken: number,
     generation: GenerationState,
@@ -1339,12 +1409,12 @@ export function createPreprocessor(
       generation.superseded ||
       generation.failed
     ) return false;
-    if (watchRebuilding) return building === generation;
-    if (activeGenerationId === generation.id) return true;
-    return activeGenerationId === fallbackActiveGenerationId && building === generation;
+    if (this.watchRebuilding) return this.building === generation;
+    if (this.activeGenerationId === generation.id) return true;
+    return this.activeGenerationId === fallbackActiveGenerationId && this.building === generation;
   }
-
-  async function processPriorityGeneration(
+  
+  private async processPriorityGeneration(
     request: PriorityRequest,
     bindingToken: number,
     generation: GenerationState,
@@ -1353,9 +1423,9 @@ export function createPreprocessor(
     request.generationId = generation.id;
     request.job = undefined;
     request.status = "queued";
-    const scope = await prioritizeScope(generation, request.resource);
+    const scope = await this.prioritizeScope(generation, request.resource);
     if (
-      !buildingPrioritySelectionIsCurrent(
+      !this.buildingPrioritySelectionIsCurrent(
         request,
         bindingToken,
         generation,
@@ -1363,18 +1433,18 @@ export function createPreprocessor(
       )
     ) return false;
     if (!scope) return false;
-    if (!bindPriorityJob(request, bindingToken, generation.id, scope.job)) return false;
+    if (!this.bindPriorityJob(request, bindingToken, generation.id, scope.job)) return false;
     await scope.promise;
     if (
-      !buildingPrioritySelectionIsCurrent(
+      !this.buildingPrioritySelectionIsCurrent(
         request,
         bindingToken,
         generation,
         fallbackActiveGenerationId,
       )
     ) return false;
-
-    const read = enqueueRequest<"read-diagram">(
+  
+    const read = this.enqueueRequest<"read-diagram">(
       {
         type: "read-diagram",
         generationId: generation.id,
@@ -1384,48 +1454,48 @@ export function createPreprocessor(
       "interactive",
       generation.id,
     );
-    if (!bindPriorityJob(request, bindingToken, generation.id, read.job)) return false;
+    if (!this.bindPriorityJob(request, bindingToken, generation.id, read.job)) return false;
     await read.promise;
     if (
-      !buildingPrioritySelectionIsCurrent(
+      !this.buildingPrioritySelectionIsCurrent(
         request,
         bindingToken,
         generation,
         fallbackActiveGenerationId,
       )
     ) return false;
-    completePriorityRequest(request);
+    this.completePriorityRequest(request);
     return true;
   }
-
-  async function controlPriorityRequest(request: PriorityRequest): Promise<void> {
+  
+  private async controlPriorityRequest(request: PriorityRequest): Promise<void> {
     try {
-      await readyDeferred.promise;
-      while (!closed && !isTerminalPriorityRequest(request)) {
-        let bindingToken = resetPriorityBinding(request);
-
-        if (watchRebuilding) {
-          const generation = await awaitBuildingGeneration();
+      await this.readyDeferred.promise;
+      while (!this.closed && !this.isTerminalPriorityRequest(request)) {
+        let bindingToken = this.resetPriorityBinding(request);
+  
+        if (this.watchRebuilding) {
+          const generation = await this.awaitBuildingGeneration();
           if (
-            !watchRebuilding ||
-            building !== generation ||
+            !this.watchRebuilding ||
+            this.building !== generation ||
             generation.superseded ||
             generation.failed ||
             request.bindingToken !== bindingToken
           ) continue;
           try {
-            if (await processPriorityGeneration(request, bindingToken, generation, activeGenerationId)) return;
+            if (await this.processPriorityGeneration(request, bindingToken, generation, this.activeGenerationId)) return;
           } catch (error) {
             if (error instanceof SupersededGenerationError) continue;
             throw error;
           }
           continue;
         }
-
-        const selectedGenerationId = activeGenerationId;
+  
+        const selectedGenerationId = this.activeGenerationId;
         if (selectedGenerationId !== null) {
           request.generationId = selectedGenerationId;
-          const read = enqueueRequest<"read-diagram">(
+          const read = this.enqueueRequest<"read-diagram">(
             {
               type: "read-diagram",
               generationId: selectedGenerationId,
@@ -1434,21 +1504,21 @@ export function createPreprocessor(
             },
             "interactive",
           );
-          if (!bindPriorityJob(request, bindingToken, selectedGenerationId, read.job)) continue;
+          if (!this.bindPriorityJob(request, bindingToken, selectedGenerationId, read.job)) continue;
           try {
             await read.promise;
-            if (!activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
-            completePriorityRequest(request);
+            if (!this.activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
+            this.completePriorityRequest(request);
             return;
           } catch (error) {
             if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
-            if (!activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
-            const fallback = building;
+            if (!this.activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
+            const fallback = this.building;
             if (!fallback) throw error;
-            bindingToken = resetPriorityBinding(request);
+            bindingToken = this.resetPriorityBinding(request);
             try {
               if (
-                await processPriorityGeneration(
+                await this.processPriorityGeneration(
                   request,
                   bindingToken,
                   fallback,
@@ -1462,38 +1532,38 @@ export function createPreprocessor(
             continue;
           }
         }
-
-        const generation = await awaitBuildingGeneration();
+  
+        const generation = await this.awaitBuildingGeneration();
         if (
-          !watchRebuilding &&
-          activeGenerationId !== null &&
-          activeGenerationId !== generation.id
+          !this.watchRebuilding &&
+          this.activeGenerationId !== null &&
+          this.activeGenerationId !== generation.id
         ) continue;
         try {
-          if (await processPriorityGeneration(request, bindingToken, generation, null)) return;
+          if (await this.processPriorityGeneration(request, bindingToken, generation, null)) return;
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
         }
       }
-      if (closed && !isTerminalPriorityRequest(request)) throw closedError();
+      if (this.closed && !this.isTerminalPriorityRequest(request)) throw this.closedError();
     } catch (error) {
-      failPriorityRequest(request, error);
+      this.failPriorityRequest(request, error);
     }
   }
-
-  function prioritizeResource(rawResource: string): Promise<PreprocessPriorityResponse> {
-    let resource: string;
+  
+  public prioritize(resource: string): Promise<PreprocessPriorityResponse> {
+    let normalizedResource: string;
     try {
-      resource = normalizeRelativePath(rawResource);
+      normalizedResource = normalizeRelativePath(resource);
     } catch (error) {
       return Promise.reject(error);
     }
-
-    const existing = priorityRequestByResource.get(resource);
+  
+    const existing = this.priorityRequestByResource.get(normalizedResource);
     if (existing) {
       if (existing.job) {
-        repositionQueuedJob(existing.job);
+        this.repositionQueuedJob(existing.job);
         if (
           !existing.job.cancelled &&
           (existing.job.state === "queued" || existing.job.state === "processing")
@@ -1501,36 +1571,36 @@ export function createPreprocessor(
           existing.status = existing.job.state;
         }
       }
-      return Promise.resolve(prioritySnapshot(existing));
+      return Promise.resolve(this.prioritySnapshot(existing));
     }
-
-    evictTerminalPriorityRequests();
-    if (priorityRequests.size >= 256) {
+  
+    this.evictTerminalPriorityRequests();
+    if (this.priorityRequests.size >= 256) {
       return Promise.reject(
         new PreprocessorError("INVALID_INPUT", "too many pending priority requests"),
       );
     }
     const request: PriorityRequest = {
-      requestId: allocatePriorityRequestId(),
-      resource,
+      requestId: this.allocatePriorityRequestId(),
+      resource: normalizedResource,
       status: "queued",
       bindingToken: 0,
     };
-    priorityRequests.set(request.requestId, request);
-    priorityRequestByResource.set(resource, request);
-    const controller = controlPriorityRequest(request);
-    priorityControllers.add(controller);
-    void controller.finally(() => priorityControllers.delete(controller)).catch(() => undefined);
-    return Promise.resolve(prioritySnapshot(request));
+    this.priorityRequests.set(request.requestId, request);
+    this.priorityRequestByResource.set(normalizedResource, request);
+    const controller = this.controlPriorityRequest(request);
+    this.priorityControllers.add(controller);
+    void controller.finally(() => this.priorityControllers.delete(controller)).catch(() => undefined);
+    return Promise.resolve(this.prioritySnapshot(request));
   }
-
-  function pollPriorityRequest(requestId: number): Promise<PreprocessPriorityResponse> {
+  
+  public poll(requestId: number): Promise<PreprocessPriorityResponse> {
     if (!Number.isSafeInteger(requestId) || requestId <= 0) {
       return Promise.reject(
         new PreprocessorError("INVALID_INPUT", "requestId must be a positive safe integer"),
       );
     }
-    const request = priorityRequests.get(requestId);
+    const request = this.priorityRequests.get(requestId);
     if (!request) {
       return Promise.reject(
         new PreprocessorError("NOT_FOUND", `priority request not found: ${requestId}`),
@@ -1544,92 +1614,92 @@ export function createPreprocessor(
     ) {
       request.status = request.job.state;
     }
-    return Promise.resolve(prioritySnapshot(request));
+    return Promise.resolve(this.prioritySnapshot(request));
   }
-
-  async function readPriorityFile(
+  
+  private async readPriorityFile(
     generation: GenerationState,
     path: string,
     location?: { line: number; column: number },
   ): Promise<FileResponse> {
-    const record = await prioritizeScope(generation, path, "file");
+    const record = await this.prioritizeScope(generation, path, "file");
     if (record) await record.promise;
-    return enqueueRequest<"read-file">(
+    return this.enqueueRequest<"read-file">(
       { type: "read-file", generationId: generation.id, path, ...(location ? { location } : {}) },
       "interactive",
       generation.id,
     ).promise;
   }
-
-  async function readFile(
+  
+  private async readFileAcrossGenerations(
     path: string,
     location?: { line: number; column: number },
   ): Promise<FileResponse> {
-    await readyDeferred.promise;
-    while (!closed) {
-      if (watchRebuilding) {
-        const generation = await awaitBuildingGeneration();
+    await this.readyDeferred.promise;
+    while (!this.closed) {
+      if (this.watchRebuilding) {
+        const generation = await this.awaitBuildingGeneration();
         try {
-          return await readPriorityFile(generation, path, location);
+          return await this.readPriorityFile(generation, path, location);
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
         }
       }
-
-      const selectedGenerationId = activeGenerationId;
+  
+      const selectedGenerationId = this.activeGenerationId;
       if (selectedGenerationId !== null) {
         try {
-          return await enqueueRequest<"read-file">(
+          return await this.enqueueRequest<"read-file">(
             { type: "read-file", generationId: selectedGenerationId, path, ...(location ? { location } : {}) },
             "interactive",
           ).promise;
         } catch (error) {
           if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
-          if (activeGenerationId !== selectedGenerationId) continue;
-          if (!building) throw error;
+          if (this.activeGenerationId !== selectedGenerationId) continue;
+          if (!this.building) throw error;
         }
       }
-
-      const generation = await awaitBuildingGeneration();
+  
+      const generation = await this.awaitBuildingGeneration();
       try {
-        return await readPriorityFile(generation, path, location);
+        return await this.readPriorityFile(generation, path, location);
       } catch (error) {
         if (error instanceof SupersededGenerationError) continue;
         throw error;
       }
     }
-    throw closedError();
+    throw this.closedError();
   }
-
-  async function closeSubprocesses(): Promise<void> {
-    const error = closedError();
-    readyDeferred.reject(error);
-    idleDeferred.reject(error);
-    buildingSignal.reject(error);
-    if (building) {
-      building.discovered.reject(error);
-      building.promoted.reject(error);
-      rejectScopeWaiters(building, error);
+  
+  private async closeSubprocesses(): Promise<void> {
+    const error = this.closedError();
+    this.readyDeferred.reject(error);
+    this.idleDeferred.reject(error);
+    this.buildingSignal.reject(error);
+    if (this.building) {
+      this.building.discovered.reject(error);
+      this.building.promoted.reject(error);
+      this.rejectScopeWaiters(this.building, error);
     }
-    for (const promise of queryDedupe.values()) {
+    for (const promise of this.queryDedupe.values()) {
       void promise.catch(() => undefined);
     }
-    for (const queue of [interactiveQueue, backgroundQueue]) {
+    for (const queue of [this.interactiveQueue, this.backgroundQueue]) {
       for (const job of queue.splice(0)) {
         job.cancelled = true;
         job.deferred.reject(error);
         job.finished.resolve(undefined);
       }
     }
-    for (const slot of slots) {
+    for (const slot of this.slots) {
       if (slot.current) {
         slot.current.cancelled = true;
         slot.current.deferred.reject(error);
       }
     }
-
-    const live = slots.flatMap((slot) =>
+  
+    const live = this.slots.flatMap((slot) =>
       slot.subprocess && slot.state !== "closed"
         ? [{ slot, subprocess: slot.subprocess }]
         : [],
@@ -1640,12 +1710,12 @@ export function createPreprocessor(
     for (const { slot } of live) {
       slot.expectedShutdown = true;
       slot.state = "closing";
-      void sendToSlot<"shutdown">(slot, { type: "shutdown" }).catch(
+      void this.sendToSlot<"shutdown">(slot, { type: "shutdown" }).catch(
         () => undefined,
       );
     }
     if (!live.length) return;
-
+  
     let timer: NodeJS.Timeout | undefined;
     const graceful = await Promise.race([
       Promise.all(exitPromises).then(() => true),
@@ -1667,95 +1737,29 @@ export function createPreprocessor(
     await Promise.all(exitPromises);
   }
 
-  const preprocessor: Preprocessor = {
-    ready() {
-      return readyDeferred.promise;
-    },
-    whenIdle() {
-      return idleDeferred.promise;
-    },
-    getTree() {
-      return dedupe("read-tree", () => readStable<"read-tree">({ type: "read-tree" }));
-    },
-    getPackages() {
-      return dedupe("read-packages", readPackages);
-    },
-    search(query) {
-      return dedupe(`search:${query}`, () => readStable<"search">({ type: "search", query }));
-    },
-    getDiagram(kind, rawScopePath) {
-      let scopePath: string;
-      try {
-        scopePath = normalizeRelativePath(rawScopePath);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      return dedupe(`read-diagram:${kind}:${scopePath}`, () => getDiagram(kind, scopePath));
-    },
-    readFile(rawPath, location) {
-      let path: string;
-      try {
-        path = normalizeRelativePath(rawPath);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      const locationKey = location ? `${location.line}:${location.column}` : "";
-      return dedupe(`read-file:${path}:${locationKey}`, () => readFile(path, location));
-    },
-    getDefinition(rawPath, location) {
-      let path: string;
-      try {
-        path = normalizeRelativePath(rawPath);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      if (
-        !Number.isSafeInteger(location.line) ||
-        location.line <= 0 ||
-        !Number.isSafeInteger(location.column) ||
-        location.column <= 0
-      ) {
-        return Promise.reject(
-          new PreprocessorError("INVALID_INPUT", "line and column must be positive safe integers"),
-        );
-      }
-      return dedupe(
-        `read-definition:${path}:${location.line}:${location.column}`,
-        () => getDefinition(path, location),
-      );
-    },
-    prioritize(resource) {
-      return prioritizeResource(resource);
-    },
-    poll(requestId) {
-      return pollPriorityRequest(requestId);
-    },
-    rebuild(cause) {
-      if (cause !== "watch" || closed) return;
-      watchRebuilding = true;
-      watchRequested = true;
-      latestBuildError = undefined;
-      queryDedupe.clear();
-      if (idleDeferred.settled) idleDeferred = createDeferred<void>();
-      if (!watchLoop) {
-        watchLoop = runWatchLoop();
-        void watchLoop.catch(() => undefined);
-      }
-    },
-    close() {
-      if (closePromise) return closePromise;
-      closed = true;
-      watchRequested = false;
-      closePromise = closeSubprocesses()
-        .then(() => Promise.all([...priorityControllers]).then(() => undefined))
-        .finally(() => {
-          for (const pending of pendingCalls.values()) pending.reject(closedError());
-          pendingCalls.clear();
-        });
-      return closePromise;
-    },
-  };
-
-  void bootstrap();
-  return preprocessor;
+  public rebuild(cause: "watch"): void {
+    if (cause !== "watch" || this.closed) return;
+    this.watchRebuilding = true;
+    this.watchRequested = true;
+    this.latestBuildError = undefined;
+    this.queryDedupe.clear();
+    if (this.idleDeferred.settled) this.idleDeferred = createDeferred<void>();
+    if (!this.watchLoop) {
+      this.watchLoop = this.runWatchLoop();
+      void this.watchLoop.catch(() => undefined);
+    }
+  }
+  
+  public close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    this.watchRequested = false;
+    this.closePromise = this.closeSubprocesses()
+      .then(() => Promise.all([...this.priorityControllers]).then(() => undefined))
+      .finally(() => {
+        for (const pending of this.pendingCalls.values()) pending.reject(this.closedError());
+        this.pendingCalls.clear();
+      });
+    return this.closePromise;
+  }
 }

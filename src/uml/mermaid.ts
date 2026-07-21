@@ -1,5 +1,6 @@
 import type { FileDeclaration } from "tsuml2/dist/core/model";
 import { UML_METHOD_RETURN_MARKER } from "../types.ts";
+import { bareUmlName } from "./keys.ts";
 
 export const STYLE_DEFS = [
   ["interface", "fill:#183a66,stroke:#69d2ff,color:#f4f7fb"],
@@ -16,8 +17,12 @@ export const STYLE_DEFS = [
   ["external", "fill:#3a2b52,stroke:#b58bff,color:#f4f7fb,stroke-dasharray: 4 3"],
 ] as const;
 
-export function escapeMermaidName(name: string): string {
-  return name.replace(/[<>]/g, "~").replace("{", "#123;").replace("}", "#125;");
+export function mermaidEntityId(name: string): string {
+  return bareUmlName(name).replace("{", "#123;").replace("}", "#125;");
+}
+
+export function mermaidEntityLabel(name: string): string {
+  return escapeMermaidLabel(name.replaceAll("<", "⟨").replaceAll(">", "⟩"));
 }
 
 export function escapeMermaidLabel(label: string): string {

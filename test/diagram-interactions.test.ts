@@ -1,8 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   adjacentTreeRowIndex,
-  createRequestSequence,
-  editorOffset,
+  RequestSequence,
   externalUserIdFromNodeId,
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
@@ -169,8 +168,8 @@ test("treeScrollTopForRow minimally reveals clipped rows and clamps to scroll bo
   }
 });
 
-test("createRequestSequence rejects tokens before any request is issued", () => {
-  const sequence = createRequestSequence();
+test("RequestSequence rejects tokens before any request is issued", () => {
+  const sequence = new RequestSequence();
   const cases = [
     { name: "negative token", token: -1 },
     { name: "zero token", token: 0 },
@@ -183,8 +182,8 @@ test("createRequestSequence rejects tokens before any request is issued", () => 
   }
 });
 
-test("createRequestSequence transfers ownership to each monotonically issued token", () => {
-  const sequence = createRequestSequence();
+test("RequestSequence transfers ownership to each monotonically issued token", () => {
+  const sequence = new RequestSequence();
 
   const first = sequence.next();
   expect(first).toBe(1);
@@ -202,9 +201,9 @@ test("createRequestSequence transfers ownership to each monotonically issued tok
   expect(sequence.isCurrent(third)).toBe(true);
 });
 
-test("createRequestSequence instances issue tokens independently", () => {
-  const firstSequence = createRequestSequence();
-  const secondSequence = createRequestSequence();
+test("RequestSequence instances issue tokens independently", () => {
+  const firstSequence = new RequestSequence();
+  const secondSequence = new RequestSequence();
 
   expect(firstSequence.next()).toBe(1);
   expect(firstSequence.next()).toBe(2);
@@ -392,33 +391,3 @@ test("zoomViewportAt preserves the world point under a nonzero pointer origin", 
   expect((origin.y - viewport.y) / viewport.scale).toBe(worldBefore.y);
 });
 
-
-test("editorOffset clamps invalid, low, and high lines and columns", () => {
-  const documentLines = [
-    { from: 0, to: 3 },
-    { from: 4, to: 8 },
-    { from: 9, to: 10 },
-  ];
-  const doc = {
-    lines: documentLines.length,
-    line(number: number) {
-      const line = documentLines[number - 1];
-      if (!line) throw new RangeError(`Invalid line ${number}`);
-      return line;
-    },
-  };
-  const cases = [
-    { name: "invalid line", line: Number.NaN, column: 2, expected: 1 },
-    { name: "line below one", line: -3, column: 2, expected: 1 },
-    { name: "line past the document", line: 99, column: 2, expected: 10 },
-    { name: "invalid column", line: 2, column: Number.NaN, expected: 4 },
-    { name: "column below one", line: 2, column: -3, expected: 4 },
-    { name: "middle position", line: 2, column: 3, expected: 6 },
-    { name: "column past line end", line: 2, column: 99, expected: 8 },
-  ];
-
-  for (const { name, line, column, expected } of cases) {
-    const location = { path: "src/example.ts", line, column };
-    expect(editorOffset(doc, location), name).toBe(expected);
-  }
-});

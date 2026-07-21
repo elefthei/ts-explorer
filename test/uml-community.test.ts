@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildUmlDiagram, buildUmlDiagrams } from "../src/uml.ts";
+import { buildUmlDiagrams } from "../src/uml.ts";
 
 const roots: string[] = [];
 
@@ -75,7 +75,6 @@ test("partitions UML into ordered self-contained communities", async () => {
   const testAssignment = cssAssignments(bundle.dsls[4]).find(({ name }) => name === "ExampleTest");
   expect(testAssignment?.style).toBe("testConcrete");
 
-  expect(bundle.dsl).toBe(await buildUmlDiagram(root, "", []));
 });
 
 test("keeps method-return-connected entities in one community frame", async () => {
@@ -279,25 +278,23 @@ test("keeps a weak bridge visible across deterministic dense Louvain communities
   expect(new Set(clusterA.map(communityOf))).toEqual(new Set([communityA]));
   expect(new Set(clusterB.map(communityOf))).toEqual(new Set([communityB]));
   expect(communityA).not.toBe(communityB);
-  expect(
-    bundle.dsls.map((dsl) =>
-      classNames(dsl).map((name) => name.replace(/~.*$/, "")).sort()
-    ),
-  ).toEqual([
+  expect(bundle.dsls.map((dsl) => classNames(dsl).sort())).toEqual([
     ["A1", "A2", "A3", "B1"],
     ["A1", "B1", "B2", "B3"],
   ]);
 
-  const bridge = /^[ \t]*(?:A1(?:~[^~\r\n]+~)?[ \t]*--[ \t]*B1|B1[ \t]*--[ \t]*A1(?:~[^~\r\n]+~)?)[ \t]*\r?$/m;
-  const genericInheritance = /^[ \t]*A1(?:~[^~\r\n]+~)?<\|--A2[ \t]*\r?$/m;
+  const genericAlias = 'class A1["A1⟨T⟩"]';
+  const bridge = /^[ \t]*(?:A1[ \t]*--[ \t]*B1|B1[ \t]*--[ \t]*A1)[ \t]*\r?$/m;
+  const genericInheritance = /^[ \t]*A1<\|--A2[ \t]*\r?$/m;
   for (const dsl of bundle.dsls) {
     expect(dsl).toMatch(/^\s*classDiagram(?:\r?\n|$)/);
     expect(dsl.match(/^[ \t]*classDiagram[ \t]*$/gm) ?? []).toHaveLength(1);
+    expect(dsl).toContain(genericAlias);
     expect(dsl).toMatch(bridge);
+    expect(dsl).not.toContain("~");
   }
-  expect(classNames(bundle.dsl).map((name) => name.replace(/~.*$/, "")).sort()).toEqual(
-    [...clusterA, ...clusterB].sort(),
-  );
+  expect(classNames(bundle.dsl).sort()).toEqual([...clusterA, ...clusterB].sort());
+  expect(bundle.dsl).toContain(genericAlias);
   expect(bundle.dsl).toMatch(bridge);
   expect(bundle.dsl).toMatch(genericInheritance);
   expect(bundle.dsls.filter((dsl) => genericInheritance.test(dsl))).toHaveLength(1);

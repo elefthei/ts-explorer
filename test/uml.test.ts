@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { buildUmlDiagram, buildUmlDiagrams } from "../src/uml.ts";
+import { buildUmlDiagrams } from "../src/uml.ts";
 
 const roots: string[] = [];
 
@@ -35,7 +35,7 @@ test("renders generic and semantic UML styles including tests", async () => {
   `);
   await writeFile(join(root, "tests", "example.test.ts"), `export class ExampleTest {}`);
 
-  const dsl = await buildUmlDiagram(root, "", []);
+  const dsl = (await buildUmlDiagrams(root, "", [])).dsl;
   const lines = dsl.split(/\r?\n/);
   const resultIndex = lines.findIndex((line) => line.includes("result:"));
   const executeIndex = lines.findIndex((line) => line.includes("execute()"));
@@ -63,14 +63,61 @@ test("renders generic and semantic UML styles including tests", async () => {
   expect(dsl).toContain('cssClass "Base" abstract');
   expect(dsl).toContain('cssClass "ResultService" concrete');
   expect(dsl).toContain("classDiagram");
-  expect(dsl).toMatch(/Box.*T|T.*Box/);
+  expect(dsl).toContain('class Box["Box⟨T⟩"]');
   expect(dsl).toContain("Base<|--Concrete");
-  expect(dsl).toContain("Box~T~<|..Concrete");
+  expect(dsl).toContain("Box<|..Concrete");
   expect(dsl).toContain("classDef interface");
   expect(dsl).toContain("classDef abstract");
   expect(dsl).toContain("classDef concrete");
   expect(dsl).toContain("stroke:#ff5c5c");
   expect(dsl).toContain("stroke-dasharray: 6 4");
+});
+
+test("keeps generic labels Unicode while Mermaid identifiers remain parser-safe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-generic-identifiers-"));
+  roots.push(root);
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(
+    join(root, "src", "model.ts"),
+    `export interface SessionStorage<TMetadata> {
+  metadata: TMetadata;
+}
+export class DurableSessionStorage implements SessionStorage<string> {
+  metadata = "";
+}
+export class JuncoAgent<TSkill, TTool, Ctx> {
+  skill!: TSkill;
+  tool!: TTool;
+  context!: Ctx;
+}
+`,
+  );
+
+  const dsl = (await buildUmlDiagrams(root, "", [])).dsl;
+  const lines = dsl.split(/\r?\n/);
+
+  expect(dsl).toContain('class SessionStorage["SessionStorage⟨TMetadata⟩"]');
+  expect(dsl).toContain('class JuncoAgent["JuncoAgent⟨TSkill,TTool,Ctx⟩"]');
+  expect(dsl).toContain("SessionStorage<|..DurableSessionStorage");
+  for (const line of lines.filter(
+    (line) => /^class\s+/.test(line) || /(?:--|<\|\.\.|\.\.>)/.test(line),
+  )) {
+    expect(line.replace(/\["[^"]*"\]/g, "")).not.toMatch(/[⟨⟩]/);
+  }
+  expect(dsl).not.toContain("~");
+});
+
+test("renders const-only scopes without the tsuml2 no-entity sentinel", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-const-only-"));
+  roots.push(root);
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "src", "value.ts"), "export const value = 1;\n");
+
+  const bundle = await buildUmlDiagrams(root, "", []);
+
+  expect(bundle.dsl.startsWith("classDiagram")).toBe(true);
+  expect(bundle.dsl).not.toContain("[Could not process any class / interface / enum / type]");
+  expect(bundle.dsls).toEqual([bundle.dsl]);
 });
 
 test("renders directed method-return edges for project-local types", async () => {
@@ -122,7 +169,7 @@ test("renders directed method-return edges for project-local types", async () =>
     `,
   );
 
-  const dsl = await buildUmlDiagram(root, "", []);
+  const dsl = (await buildUmlDiagrams(root, "", [])).dsl;
 
   expect(
     [...dsl.matchAll(/^[ \t]*DataflowRuntime[ \t]*-->[ \t]*AbstractStateMachine[ \t]*\r?$/gm)],
@@ -154,7 +201,7 @@ test("encodes nested generic member return types without Mermaid tildes", async 
   `);
   await writeFile(join(root, "src", "sentinel.ts"), "export class Sentinel {}\n");
 
-  const dsl = await buildUmlDiagram(root, "", []);
+  const dsl = (await buildUmlDiagrams(root, "", [])).dsl;
   const lines = dsl.split(/\r?\n/);
   const checkIndex = lines.findIndex((line) => line.includes("check()"));
   if (checkIndex === -1) {
@@ -167,7 +214,7 @@ test("encodes nested generic member return types without Mermaid tildes", async 
   expect(genericTypeLine).toBe(
     "§() CapsResponse⟨C, Readonly⟨Record⟨string, Readonly⟨Record⟨string, GitCell⟩⟩⟩⟩⟩",
   );
-  expect(genericTypeLine).not.toContain("CapsResponse~");
+  expect(dsl).not.toContain("~");
   expect(genericTypeLine).not.toMatch(/[<>]/);
   expect(genericTypeLine).not.toMatch(/&(?:lt|gt);/);
 });
@@ -205,7 +252,7 @@ test("removes import qualifiers from nested generic property and method labels",
     ].join("\n"),
   );
 
-  const dsl = await buildUmlDiagram(root, "", []);
+  const dsl = (await buildUmlDiagrams(root, "", [])).dsl;
   const lines = dsl.split(/\r?\n/).map((line) => line.trim());
   const registryLine = lines.find((line) => line.includes("registry:"));
   const resolveIndex = lines.findIndex((line) => line.includes("resolve()"));
@@ -1020,17 +1067,17 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
   expect(
     bundle.dsl
       .split(/\r?\n/)
-      .filter((line) => / --> RetEdge~T~$/.test(line))
+      .filter((line) => / --> RetEdge$/.test(line))
       .sort(),
   ).toEqual([
-    "DataflowEdge~N,T,ES~ --> RetEdge~T~",
-    "local0 --> RetEdge~T~",
-    "local1 --> RetEdge~T~",
-    "local2 --> RetEdge~T~",
+    "DataflowEdge --> RetEdge",
+    "local0 --> RetEdge",
+    "local1 --> RetEdge",
+    "local2 --> RetEdge",
   ]);
   expect(
-    bundle.dsl.split(/\r?\n/).filter((line) => / --> MsgEdge~N,ES~$/.test(line)),
-  ).toEqual(["DataflowEdge~N,T,ES~ --> MsgEdge~N,ES~"]);
+    bundle.dsl.split(/\r?\n/).filter((line) => / --> MsgEdge$/.test(line)),
+  ).toEqual(["DataflowEdge --> MsgEdge"]);
   expect(bundle.definitions).toEqual([
     {
       key: '["type","MsgEdge",0,null,null]',
@@ -1073,7 +1120,11 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
       uml: { scopePath: "src/edges.ts", entityName: "RecursiveEdge" },
     },
   ]);
-  expect(bundle.dsl).toMatch(/^class DataflowEdge~N,T,ES~\s*\{$/m);
+  expect(bundle.dsl).toMatch(/^class DataflowEdge\s*\{$/m);
+  expect(bundle.dsl).toContain('class MsgEdge["MsgEdge⟨N,ES⟩"]');
+  expect(bundle.dsl).toContain('class RetEdge["RetEdge⟨T⟩"]');
+  expect(bundle.dsl).toContain('class DataflowEdge["DataflowEdge⟨N,T,ES⟩"]');
+  expect(bundle.dsl).not.toContain("~");
   const dataflowNode = bundle.graph.nodes().find(
     (node) => bundle.graph.getNodeAttribute(node, "name") === "DataflowEdge<N,T,ES>",
   );

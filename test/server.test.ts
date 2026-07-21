@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startServer } from "../src/server.ts";
-import { createExplorerStore } from "../src/store.ts";
+import { ExplorerServer } from "../src/server.ts";
+import { ExplorerStore } from "../src/store.ts";
 import type {
   DiagramResponse,
   FileResponse,
@@ -257,9 +257,67 @@ async function createServerFixture(): Promise<{ outerRoot: string; root: string;
   return { outerRoot, root, sourceFile };
 }
 
+test("failed startup on an occupied port cleans up before the port is reused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-occupied-port-"));
+  await writeFile(join(root, "index.ts"), "export const value=1\n");
+  const blocker = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response("blocked"),
+  });
+  let blockerStopped = false;
+  let replacement: ExplorerServer | undefined;
+  try {
+    const port = blocker.port;
+    if (port === undefined) throw new Error("Bun.serve did not assign a port");
+    await expect(
+      ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port }),
+    ).rejects.toThrow();
+    blocker.stop(true);
+    blockerStopped = true;
+    replacement = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port });
+    await replacement.stop();
+    replacement = undefined;
+  } finally {
+    if (!blockerStopped) blocker.stop(true);
+    try {
+      await replacement?.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
+test("concurrent stop calls share one promise and release the port", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-idempotent-stop-"));
+  await writeFile(join(root, "index.ts"), "export const value=1\n");
+  let server: ExplorerServer | undefined;
+  let replacement: ExplorerServer | undefined;
+  try {
+    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const port = server.port;
+    const firstStop = server.stop();
+    const secondStop = server.stop();
+    expect(secondStop).toBe(firstStop);
+    await Promise.all([firstStop, secondStop]);
+    server = undefined;
+
+    replacement = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port });
+    await replacement.stop();
+    replacement = undefined;
+  } finally {
+    try {
+      await replacement?.stop();
+      await server?.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
 test("serves the subprocess-backed read-only API and non-Git literal search", async () => {
   const { outerRoot, root, sourceFile } = await createServerFixture();
-  const server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+  const server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
   try {
     const base = `http://127.0.0.1:${server.port}`;
 
@@ -660,7 +718,16 @@ test("serves live add and remove trees before separately promoted APIs", async (
   await mkdir(watchedDir);
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "live-watch" }));
   await writeFile(join(root, "index.ts"), "export const initial=1\n");
-  const server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+  const watchBatches: Array<{ paths: string[]; events: string[]; version: number }> = [];
+  const server = await ExplorerServer.start({
+    sourceDir: root,
+    host: "127.0.0.1",
+    port: 0,
+    onWatchBatch(paths, events, version) {
+      watchBatches.push({ paths: [...paths], events: [...events], version });
+      throw new Error("watch diagnostic failed");
+    },
+  });
   let watch: WatchClient | undefined;
   let replay: WatchClient | undefined;
   try {
@@ -679,6 +746,11 @@ test("serves live add and remove trees before separately promoted APIs", async (
     await writeFile(addedFile, 'export const watchedToken="WATCHED_LIVE_TOKEN"\n');
     const addedMessage = await addedChanged;
     if (addedMessage.type !== "changed") throw new Error("expected added change");
+    expect(watchBatches.filter(({ version }) => version === addedMessage.version)).toEqual([{
+      paths: addedMessage.paths,
+      events: addedMessage.events,
+      version: addedMessage.version,
+    }]);
     const addedTree = await withTimeout(
       fetch(`${base}/api/tree`).then(
         (response) => response.json() as Promise<{ root: TreeNode }>,
@@ -716,6 +788,11 @@ test("serves live add and remove trees before separately promoted APIs", async (
     await rm(addedFile);
     const removedMessage = await removedChanged;
     if (removedMessage.type !== "changed") throw new Error("expected removed change");
+    expect(watchBatches.filter(({ version }) => version === removedMessage.version)).toEqual([{
+      paths: removedMessage.paths,
+      events: removedMessage.events,
+      version: removedMessage.version,
+    }]);
     const removedTree = await withTimeout(
       fetch(`${base}/api/tree`).then(
         (response) => response.json() as Promise<{ root: TreeNode }>,
@@ -785,7 +862,7 @@ test("package diagram errors retain the last promoted snapshot", async () => {
   let resolveSecondPromotion!: () => void;
   const firstPromotion = new Promise<void>((resolve) => { resolveFirstPromotion = resolve; });
   const secondPromotion = new Promise<void>((resolve) => { resolveSecondPromotion = resolve; });
-  const store = createExplorerStore(
+  const store = new ExplorerStore(
     root,
     () => undefined,
     () => {
@@ -821,7 +898,7 @@ test("package diagram errors retain the last promoted snapshot", async () => {
 test("a malformed root manifest produces the stable empty package error", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-malformed-root-"));
   await writeFile(join(root, "package.json"), "{ malformed");
-  const store = createExplorerStore(root);
+  const store = new ExplorerStore(root);
   try {
     await store.ready();
     const response = await store.getDiagram("packages", "");
@@ -854,7 +931,7 @@ test("warm restart serves the old active package graph until cache-ready promote
   let secondServer: RunningServer | undefined;
   let watch: WatchClient | undefined;
   try {
-    firstServer = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    firstServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const firstBase = `http://127.0.0.1:${firstServer.port}`;
     const firstWatch = await openWatch(firstBase);
     try {
@@ -880,7 +957,7 @@ test("warm restart serves the old active package graph until cache-ready promote
       JSON.stringify({ name: "a", dependencies: { b: "*" } }),
     );
 
-    secondServer = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    secondServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const secondBase = `http://127.0.0.1:${secondServer.port}`;
     const watchPromise = openWatch(secondBase);
     const stalePromise = fetch(`${secondBase}/api/diagram?kind=packages&path=`).then(
