@@ -1,23 +1,56 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startSourceWatcher } from "../src/watcher.ts";
 
-const closers: Array<() => Promise<void>> = [];
-afterEach(async () => { await Promise.all(closers.splice(0).map((close) => close())); });
+const roots: string[] = [];
 
-test("batches external TypeScript changes", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-watch-"));
-  await mkdir(join(root, "src"));
-  const file = join(root, "src", "index.ts");
-  await writeFile(file, "export const value = 1;\n");
-  const batch = new Promise<{ paths: string[]; events: string[] }>((resolve) => {
-    void startSourceWatcher(root, (paths, events) => resolve({ paths, events }), (error) => { throw error; }).then((watcher) => closers.push(watcher.close));
-  });
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  await writeFile(file, "export const value = 2;\n");
-  const result = await Promise.race([batch, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("watch timeout")), 3000))]);
-  expect(result.paths).toEqual(["src/index.ts"]);
-  expect(result.events).toContain("change");
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+test("batches visible changes while suppressing cache changes under .explore", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-watch-"));
+  roots.push(root);
+  await Promise.all([
+    mkdir(join(root, "src"), { recursive: true }),
+    mkdir(join(root, ".explore"), { recursive: true }),
+  ]);
+  const firstFile = join(root, "src", "first.ts");
+  const secondFile = join(root, "src", "second.js");
+  const cacheFile = join(root, ".explore", "explore.db");
+  await Promise.all([
+    writeFile(firstFile, "export const first = 1;\n"),
+    writeFile(secondFile, "export const second = 1;\n"),
+    writeFile(cacheFile, "generation 1\n"),
+  ]);
+
+  let resolveBatch!: (batch: { paths: string[]; events: string[] }) => void;
+  let rejectBatch!: (error: Error) => void;
+  const batch = new Promise<{ paths: string[]; events: string[] }>((resolve, reject) => {
+    resolveBatch = resolve;
+    rejectBatch = reject;
+  });
+  const watcher = await startSourceWatcher(
+    root,
+    (paths, events) => resolveBatch({ paths, events }),
+    rejectBatch,
+  );
+
+  try {
+    await Promise.all([
+      writeFile(firstFile, "export const first = 2;\n"),
+      writeFile(secondFile, "export const second = 2;\n"),
+      writeFile(cacheFile, "generation 2\n"),
+    ]);
+
+    const result = await batch;
+    expect(result).toEqual({
+      paths: ["src/first.ts", "src/second.js"],
+      events: ["change", "change"],
+    });
+  } finally {
+    await watcher.close();
+  }
+}, 5_000);

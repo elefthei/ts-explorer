@@ -3,7 +3,7 @@ export type TreeNode = {
   path: string;
   kind: "directory" | "file";
   children?: TreeNode[];
-  editable?: boolean;
+  viewable?: boolean;
 };
 
 export type PackageInfo = {
@@ -12,8 +12,26 @@ export type PackageInfo = {
   dependencies: string[];
 };
 
+export type PackageDiagramNode = {
+  nodeId: string;
+  name: string;
+  path: string;
+};
+
 export type ExplorerStatus = "ready" | "error";
 export type DiagramKind = "packages" | "uml";
+
+export type PreprocessPriorityStatus = "queued" | "processing" | "done";
+
+export type PreprocessPriorityResponse = {
+  status: PreprocessPriorityStatus;
+  resource: string;
+  requestId: number;
+};
+
+export type PreprocessControlRequest =
+  | { action: "prioritize"; resource: string }
+  | { action: "poll"; requestId: number };
 
 export type UmlSourceLocation = {
   path: string;
@@ -21,14 +39,37 @@ export type UmlSourceLocation = {
   column: number;
 };
 
-export type UmlMethodSource = UmlSourceLocation & {
+export type GotoDefinitionKind =
+  | "class"
+  | "interface"
+  | "enum"
+  | "type"
+  | "method";
+
+export type GotoDefinition = {
+  key: string;
+  kind: GotoDefinitionKind;
   name: string;
+  qualifiedName: string;
+  source: UmlSourceLocation;
+  uml: {
+    scopePath: string;
+    entityName: string;
+    memberName?: string;
+    memberOccurrence?: number;
+  };
 };
 
-export type UmlEntitySource = UmlSourceLocation & {
-  name: string;
-  methods: UmlMethodSource[];
+export type EditorGotoDefinition = GotoDefinition & {
+  displayFrom: number;
+  displayTo: number;
 };
+
+export type GotoDefinitionLookupResponse = {
+  version: number;
+  definition: GotoDefinition | null;
+};
+
 
 export type UmlExternalUserKind =
   | "method"
@@ -55,6 +96,15 @@ export type UmlLocalUser = UmlSourceLocation & {
   kind: UmlExternalUserKind;
 };
 
+export type SearchResponse = {
+  version: number;
+  query: string;
+  files: string[];
+  definitions: GotoDefinition[];
+  directories: string[];
+  renderDirs: string[];
+};
+
 export type DiagramResponse = {
   kind: DiagramKind;
   scopePath: string;
@@ -62,7 +112,8 @@ export type DiagramResponse = {
   status: ExplorerStatus;
   dsl: string;
   dsls: string[];
-  sources: UmlEntitySource[];
+  packageNodes: PackageDiagramNode[];
+  definitions: GotoDefinition[];
   externalUsers: UmlExternalUser[];
   localUsers: UmlLocalUser[];
   error?: string;
@@ -71,8 +122,8 @@ export type DiagramResponse = {
 export type FileResponse = {
   path: string;
   content: string;
-  hash: string;
-  editable: boolean;
+  definitions: EditorGotoDefinition[];
+  cursorOffset?: number;
 };
 
 export type WatchEventName = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
@@ -84,22 +135,15 @@ export type WatchEvent = {
   events: WatchEventName[];
 };
 
-export type WatchMessage = WatchEvent | {
-  type: "watch-error";
-  version: number;
-  error: string;
-};
+export type WatchMessage =
+  | WatchEvent
+  | {
+    type: "watch-error";
+    version: number;
+    error: string;
+  }
+  | {
+    type: "cache-ready";
+    version: number;
+  };
 
-export const TS_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
-
-export function isTypeScriptPath(path: string): boolean {
-  return TS_EXTENSIONS.some((extension) => path.endsWith(extension));
-}
-
-export function isDeclarationPath(path: string): boolean {
-  return /\.d\.(?:ts|tsx|mts|cts)$/.test(path);
-}
-
-export function isEditablePath(path: string): boolean {
-  return isTypeScriptPath(path) && !isDeclarationPath(path);
-}

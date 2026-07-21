@@ -26,7 +26,21 @@ test("discovers workspace packages and only workspace dependency edges", async (
   const canonicalPackages = await discoverPackages(await realpath(root));
   expect(packages).toEqual(expected);
   expect(canonicalPackages).toEqual(expected);
-  expect(buildPackageDiagram(packages)).toContain("p0 --> p1");
+  expect(buildPackageDiagram(packages)).toEqual({
+    dsl: [
+      "flowchart LR",
+      '  p0["a"]',
+      '  p1["b"]',
+      "  p0 --> p1",
+      "  classDef package fill:#17324d,stroke:#69d2ff,color:#f4f7fb",
+      "  class p0 package",
+      "  class p1 package",
+    ].join("\n"),
+    packageNodes: [
+      { nodeId: "p0", name: "a", path: "packages/a" },
+      { nodeId: "p1", name: "b", path: "packages/b" },
+    ],
+  });
 });
 
 test("omits malformed child manifests without crashing", async () => {
@@ -35,5 +49,14 @@ test("omits malformed child manifests without crashing", async () => {
   await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   await mkdir(join(root, "packages", "broken"), { recursive: true });
   await writeFile(join(root, "packages", "broken", "package.json"), "{");
-  expect(await discoverPackages(root)).toEqual([]);
+  const packages = await discoverPackages(root);
+  expect(packages).toEqual([]);
+  expect(buildPackageDiagram(packages)).toEqual({
+    dsl: [
+      "flowchart LR",
+      '  source["No workspace packages"]',
+      "  classDef package fill:#17324d,stroke:#69d2ff,color:#f4f7fb",
+    ].join("\n"),
+    packageNodes: [],
+  });
 });

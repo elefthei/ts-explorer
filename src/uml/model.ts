@@ -1,11 +1,11 @@
 import type { UndirectedGraph } from "graphology";
 import type { Node } from "ts-morph";
 import type {
-  UmlEntitySource,
-  UmlExternalUser,
+  GotoDefinition,
   UmlExternalUserKind,
   UmlLocalUser,
   UmlSourceLocation,
+  UmlExternalUser,
 } from "../types.ts";
 
 export type UmlGraphNodeKind = "entity" | "boundary" | "local-user" | "external-user";
@@ -41,7 +41,7 @@ export type UmlGraph = UndirectedGraph<UmlGraphNodeAttributes, UmlGraphEdgeAttri
 export type UmlDiagramBundle = {
   dsl: string;
   dsls: string[];
-  sources: UmlEntitySource[];
+  definitions: GotoDefinition[];
   externalUsers: UmlExternalUser[];
   localUsers: UmlLocalUser[];
   graph: UmlGraph;
@@ -93,7 +93,7 @@ export type ReferenceDeclaration = {
 export type UmlAnalysis = {
   methodReturnDependencies: MethodReturnDependency[];
   usageEdges: UmlUsageEdge[];
-  sources: UmlEntitySource[];
+  definitions: GotoDefinition[];
   localUserNodes: LocalUserNode[];
   externalUserNodes: ExternalUserNode[];
 };

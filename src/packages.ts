@@ -1,6 +1,6 @@
 import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
-import type { PackageInfo } from "./types.ts";
+import type { PackageDiagramNode, PackageInfo } from "./types.ts";
 
 function toPosix(path: string): string {
   return path.split(sep).join("/");
@@ -72,11 +72,19 @@ export async function discoverPackages(sourceDir: string): Promise<readonly Pack
   return packages.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-export function buildPackageDiagram(packages: readonly PackageInfo[]): string {
+export function buildPackageDiagram(
+  packages: readonly PackageInfo[],
+): { dsl: string; packageNodes: PackageDiagramNode[] } {
   const lines = ["flowchart LR"];
-  const ids = new Map(packages.map((pkg, index) => [pkg.name, `p${index}`]));
+  const ids = new Map<string, string>();
+  const packageNodes: PackageDiagramNode[] = [];
   if (!packages.length) lines.push('  source["No workspace packages"]');
-  for (const [index, pkg] of packages.entries()) lines.push(`  p${index}["${escapeLabel(pkg.name)}"]`);
+  for (const [index, pkg] of packages.entries()) {
+    const nodeId = `p${index}`;
+    ids.set(pkg.name, nodeId);
+    packageNodes.push({ nodeId, name: pkg.name, path: pkg.path });
+    lines.push(`  ${nodeId}["${escapeLabel(pkg.name)}"]`);
+  }
   for (const pkg of packages) {
     for (const dependency of pkg.dependencies) {
       const target = ids.get(dependency);
@@ -85,7 +93,7 @@ export function buildPackageDiagram(packages: readonly PackageInfo[]): string {
   }
   lines.push("  classDef package fill:#17324d,stroke:#69d2ff,color:#f4f7fb");
   for (const [, id] of ids) lines.push(`  class ${id} package`);
-  return lines.join("\n");
+  return { dsl: lines.join("\n"), packageNodes };
 }
 
 function escapeLabel(value: string): string {

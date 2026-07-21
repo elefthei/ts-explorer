@@ -64,7 +64,12 @@ if (import.meta.main) {
     const options = parseCliOptions(process.argv.slice(2));
     if (options) {
       await validateSourceDir(options.sourceDir);
-      const server = await startServer(options);
+      const server = await startServer({
+        ...options,
+        onSyncProgress(event) {
+          console.log(`[sync] ${event.event} ${event.component} ${event.resource}`);
+        },
+      });
       console.log(`TS explorer listening at http://${options.host}:${server.port}`);
       const shutdown = async () => {
         await server.stop();

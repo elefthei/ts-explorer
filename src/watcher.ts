@@ -1,8 +1,9 @@
 import { watch, type FSWatcher } from "chokidar";
-import { relative, sep } from "node:path";
+import { relative, resolve } from "node:path";
+import { normalizeRelativePath } from "./paths.ts";
+import { isTraversalIgnoredPath } from "./source.ts";
 import type { WatchEventName } from "./types.ts";
 
-const IGNORED = /(^|[\\/])(?:\.git|node_modules|dist|coverage|\.cache|build|out)(?:[\\/]|$)/;
 const EVENTS: WatchEventName[] = ["add", "change", "unlink", "addDir", "unlinkDir"];
 
 export async function startSourceWatcher(
@@ -10,11 +11,12 @@ export async function startSourceWatcher(
   onBatch: (paths: string[], events: WatchEventName[]) => void,
   onError: (error: Error) => void,
 ): Promise<{ close(): Promise<void> }> {
-  const watcher: FSWatcher = watch(sourceDir, {
+  const watcherRoot = resolve(sourceDir);
+  const watcher: FSWatcher = watch(watcherRoot, {
     followSymlinks: false,
     ignoreInitial: true,
     awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
-    ignored: (path) => IGNORED.test(path),
+    ignored: (path) => isTraversalIgnoredPath(relative(watcherRoot, resolve(path))),
     persistent: true,
   });
   const pending = new Map<string, WatchEventName>();
@@ -27,7 +29,7 @@ export async function startSourceWatcher(
     onBatch(entries.map(([path]) => path), entries.map(([, event]) => event));
   };
   const handleEvent = (event: WatchEventName, path: string) => {
-    const relativePath = relative(sourceDir, path).split(sep).join("/");
+    const relativePath = normalizeRelativePath(relative(watcherRoot, resolve(path)));
     pending.set(relativePath, event);
     if (timer) clearTimeout(timer);
     timer = setTimeout(flush, 150);

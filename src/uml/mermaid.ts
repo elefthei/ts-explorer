@@ -13,7 +13,7 @@ export const STYLE_DEFS = [
   ["testType", "fill:#654b1a,stroke:#ff5c5c,color:#f4f7fb,stroke-dasharray: 6 4"],
   ["testEnum", "fill:#3f4652,stroke:#ff5c5c,color:#f4f7fb,stroke-dasharray: 6 4"],
   ["local", "fill:#3a2b52,stroke:#b58bff,color:#f4f7fb,stroke-dasharray: 2 3"],
-  ["external", "fill:#2b3340,stroke:#8ba3bd,color:#f4f7fb,stroke-dasharray: 4 3"],
+  ["external", "fill:#3a2b52,stroke:#b58bff,color:#f4f7fb,stroke-dasharray: 4 3"],
 ] as const;
 
 export function escapeMermaidName(name: string): string {
@@ -24,9 +24,15 @@ export function escapeMermaidLabel(label: string): string {
   return label.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 }
 
+export function stripImportTypeQualifiers(type: string): string {
+  return type.replace(/import\((?:"[^"]*"|'[^']*')\)\./g, "");
+}
+
 export function escapeStructuredType(type: string | undefined): string | undefined {
-  return type
-    ?.replace(/\s*\r?\n\s*/g, " ")
+  return type === undefined
+    ? undefined
+    : stripImportTypeQualifiers(type)
+    .replace(/\s*\r?\n\s*/g, " ")
     .trim()
     .replaceAll("&", "&amp;")
     .replaceAll("<", "⟨")
@@ -58,7 +64,8 @@ export function removeSelfMemberAssociations(declarations: FileDeclaration[]): v
 }
 
 export function formatSignatureType(type: string | undefined): string {
-  return (type?.replace(/\s*\r?\n\s*/g, " ").trim() || "unknown")
+  return stripImportTypeQualifiers(type ?? "").replace(/\s*\r?\n\s*/g, " ").trim()
+    .replace(/^$/, "unknown")
     .replaceAll("<", "⟨")
     .replace(/(?<!=)>/g, "⟩")
     .replaceAll("{", "｛")

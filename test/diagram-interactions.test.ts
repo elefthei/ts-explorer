@@ -1,29 +1,172 @@
 import { expect, test } from "bun:test";
 import {
+  adjacentTreeRowIndex,
   createRequestSequence,
   editorOffset,
   externalUserIdFromNodeId,
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
+  packageNodeIdFromNodeId,
   hasPassedDragThreshold,
+  matchesSearchQuery,
   panViewport,
-  resolveUmlSource,
   shouldStackDiagram,
+  treeScrollTopForRow,
   zoomViewportAt,
 } from "../src/web/diagram-interactions.ts";
-import type { UmlEntitySource, UmlSourceLocation } from "../src/types.ts";
-
-function sourceLocation(location: UmlSourceLocation | undefined): UmlSourceLocation | undefined {
-  return location && {
-    path: location.path,
-    line: location.line,
-    column: location.column,
-  };
-}
+import type { UmlSourceLocation } from "../src/types.ts";
 
 test("shouldStackDiagram stacks UML diagrams but not package diagrams", () => {
   expect(shouldStackDiagram("uml")).toBe(true);
   expect(shouldStackDiagram("packages")).toBe(false);
+});
+
+test("matchesSearchQuery applies non-empty case-insensitive substring matching", () => {
+  const cases = [
+    { name: "empty query", candidate: "DataflowRuntime", query: "", expected: false },
+    { name: "whitespace-only query", candidate: "DataflowRuntime", query: " \t\n ", expected: false },
+    {
+      name: "surrounding query whitespace",
+      candidate: "DataflowRuntime",
+      query: " DataflowRuntime ",
+      expected: true,
+    },
+    {
+      name: "mixed case",
+      candidate: "DataflowRuntime",
+      query: "dataFLOWruntime",
+      expected: true,
+    },
+    {
+      name: "partial class name",
+      candidate: "DataflowRuntime",
+      query: "flowRun",
+      expected: true,
+    },
+    {
+      name: "partial method name",
+      candidate: "getVersion",
+      query: "version",
+      expected: true,
+    },
+    {
+      name: "file name within a full relative path",
+      candidate: "src/dataflow.ts",
+      query: "Dataflow",
+      expected: true,
+    },
+    {
+      name: "directory segment within a full relative path",
+      candidate: "packages/runtime/src/dataflow.ts",
+      query: "runtime/src",
+      expected: true,
+    },
+    {
+      name: "nonmatch",
+      candidate: "DataflowRuntime",
+      query: "version",
+      expected: false,
+    },
+  ];
+
+  for (const { name, candidate, query, expected } of cases) {
+    expect(matchesSearchQuery(candidate, query), name).toBe(expected);
+  }
+});
+
+test("adjacentTreeRowIndex moves one row without wrapping and rejects invalid positions", () => {
+  const cases = [
+    { name: "forward from the middle", currentIndex: 2, direction: 1, rowCount: 5, expected: 3 },
+    { name: "backward from the middle", currentIndex: 2, direction: -1, rowCount: 5, expected: 1 },
+    { name: "forward at the last row", currentIndex: 4, direction: 1, rowCount: 5, expected: 4 },
+    { name: "backward at the first row", currentIndex: 0, direction: -1, rowCount: 5, expected: 0 },
+    { name: "index before the first row", currentIndex: -1, direction: 1, rowCount: 5, expected: -1 },
+    { name: "index after the last row", currentIndex: 5, direction: -1, rowCount: 5, expected: -1 },
+    { name: "empty row list", currentIndex: 0, direction: 1, rowCount: 0, expected: -1 },
+  ] as const;
+
+  for (const { name, currentIndex, direction, rowCount, expected } of cases) {
+    expect(adjacentTreeRowIndex(currentIndex, direction, rowCount), name).toBe(expected);
+  }
+});
+
+test("treeScrollTopForRow minimally reveals clipped rows and clamps to scroll bounds", () => {
+  const cases = [
+    {
+      name: "fully visible row",
+      currentScrollTop: 40,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 125,
+      rowBottom: 150,
+      expected: 40,
+    },
+    {
+      name: "row aligned with both viewport edges",
+      currentScrollTop: 40,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 100,
+      rowBottom: 200,
+      expected: 40,
+    },
+    {
+      name: "row clipped above",
+      currentScrollTop: 80,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 75,
+      rowBottom: 125,
+      expected: 55,
+    },
+    {
+      name: "row clipped below",
+      currentScrollTop: 80,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 175,
+      rowBottom: 230,
+      expected: 110,
+    },
+    {
+      name: "upward adjustment reaches the zero bound",
+      currentScrollTop: 15,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 70,
+      rowBottom: 110,
+      expected: 0,
+    },
+    {
+      name: "downward adjustment reaches the maximum bound",
+      currentScrollTop: 190,
+      maxScrollTop: 200,
+      viewportTop: 100,
+      viewportBottom: 200,
+      rowTop: 190,
+      rowBottom: 225,
+      expected: 200,
+    },
+  ];
+
+  for (const { name, expected, ...dimensions } of cases) {
+    expect(
+      treeScrollTopForRow(
+        dimensions.currentScrollTop,
+        dimensions.maxScrollTop,
+        dimensions.viewportTop,
+        dimensions.viewportBottom,
+        dimensions.rowTop,
+        dimensions.rowBottom,
+      ),
+      name,
+    ).toBe(expected);
+  }
 });
 
 test("createRequestSequence rejects tokens before any request is issued", () => {
@@ -109,6 +252,34 @@ test("localUserIdFromNodeId resolves only installed Mermaid synthetic local-node
 
   for (const { name, id, expected } of cases) {
     expect(localUserIdFromNodeId(id), name).toBe(expected);
+  }
+});
+
+test("packageNodeIdFromNodeId resolves only Mermaid flowchart package-node IDs", () => {
+  const cases = [
+    { name: "unprefixed first package", id: "flowchart-p0-0", expected: "p0" },
+    {
+      name: "render-prefixed multi-digit package and counter",
+      id: "diagram-1-flowchart-p12-7",
+      expected: "p12",
+    },
+    {
+      name: "arbitrary Mermaid render prefix",
+      id: "diagram-314-flowchart-p27-42",
+      expected: "p27",
+    },
+    { name: "UML class ID", id: "classId-p0-0", expected: undefined },
+    { name: "missing package index", id: "flowchart-p-0", expected: undefined },
+    { name: "negative package index", id: "flowchart-p-1-0", expected: undefined },
+    { name: "package index with trailing text", id: "flowchart-p12x-7", expected: undefined },
+    { name: "missing Mermaid counter", id: "flowchart-p12", expected: undefined },
+    { name: "non-numeric Mermaid counter", id: "flowchart-p12-last", expected: undefined },
+    { name: "suffix after Mermaid counter", id: "flowchart-p12-7-extra", expected: undefined },
+    { name: "raw logical package ID", id: "p12", expected: undefined },
+  ];
+
+  for (const { name, id, expected } of cases) {
+    expect(packageNodeIdFromNodeId(id), name).toBe(expected);
   }
 });
 
@@ -221,84 +392,6 @@ test("zoomViewportAt preserves the world point under a nonzero pointer origin", 
   expect((origin.y - viewport.y) / viewport.scale).toBe(worldBefore.y);
 });
 
-test("resolveUmlSource chooses the earliest duplicate bare or generic entity independent of input order", () => {
-  const earliest: UmlEntitySource = {
-    name: "Widget<T>",
-    path: "a/widget.ts",
-    line: 4,
-    column: 7,
-    methods: [],
-  };
-  const laterInFile: UmlEntitySource = {
-    name: "Widget",
-    path: "a/widget.ts",
-    line: 18,
-    column: 2,
-    methods: [],
-  };
-  const laterPath: UmlEntitySource = {
-    name: "Widget<U>",
-    path: "z/widget.ts",
-    line: 1,
-    column: 1,
-    methods: [],
-  };
-  const expected = { path: "a/widget.ts", line: 4, column: 7 };
-
-  expect(sourceLocation(resolveUmlSource([laterPath, laterInFile, earliest], "Widget"))).toEqual(
-    expected,
-  );
-  expect(sourceLocation(resolveUmlSource([earliest, laterInFile, laterPath], "Widget"))).toEqual(
-    expected,
-  );
-});
-
-test("resolveUmlSource selects the requested same-name method occurrence", () => {
-  const sources: UmlEntitySource[] = [{
-    name: "Service<T>",
-    path: "src/service.ts",
-    line: 3,
-    column: 14,
-    methods: [
-      { name: "run", path: "src/service.ts", line: 6, column: 3 },
-      { name: "stop", path: "src/service.ts", line: 9, column: 3 },
-      { name: "run", path: "src/service.ts", line: 12, column: 3 },
-      { name: "run", path: "src/service.ts", line: 16, column: 3 },
-    ],
-  }];
-
-  expect(sourceLocation(resolveUmlSource(sources, "Service", "run", 0))).toEqual({
-    path: "src/service.ts",
-    line: 6,
-    column: 3,
-  });
-  expect(sourceLocation(resolveUmlSource(sources, "Service", "run", 1))).toEqual({
-    path: "src/service.ts",
-    line: 12,
-    column: 3,
-  });
-  expect(sourceLocation(resolveUmlSource(sources, "Service", "run", 2))).toEqual({
-    path: "src/service.ts",
-    line: 16,
-    column: 3,
-  });
-});
-
-test("resolveUmlSource returns undefined for absent entities, methods, and occurrences", () => {
-  const sources: UmlEntitySource[] = [{
-    name: "Service",
-    path: "src/service.ts",
-    line: 3,
-    column: 14,
-    methods: [{ name: "run", path: "src/service.ts", line: 6, column: 3 }],
-  }];
-
-  expect(resolveUmlSource(sources, "Missing")).toBeUndefined();
-  expect(resolveUmlSource(sources, "extern0")).toBeUndefined();
-  expect(resolveUmlSource(sources, "local0")).toBeUndefined();
-  expect(resolveUmlSource(sources, "Service", "missing")).toBeUndefined();
-  expect(resolveUmlSource(sources, "Service", "run", 1)).toBeUndefined();
-});
 
 test("editorOffset clamps invalid, low, and high lines and columns", () => {
   const documentLines = [

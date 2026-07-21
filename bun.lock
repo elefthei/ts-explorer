@@ -15,11 +15,13 @@
         "graphology-communities-louvain": "2.0.2",
         "mermaid": "11.16.0",
         "prettier": "3.9.5",
+        "simple-git": "3.36.0",
         "ts-morph": "22.0.0",
         "tsuml2": "0.17.1",
         "yargs": "17.7.3",
       },
       "devDependencies": {
+        "@playwright/test": "1.61.1",
         "@types/bun": "1.3.14",
         "@types/node": "22.20.1",
         "@types/yargs": "17.0.35",
@@ -110,6 +112,10 @@
 
     "@iconify/utils": ["@iconify/utils@3.1.4", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@iconify/utils/-/utils-3.1.4.tgz", { "dependencies": { "@antfu/install-pkg": "^1.1.0", "@iconify/types": "^2.0.0", "import-meta-resolve": "^4.2.0" } }, "sha1-BNrQFOjtgLG740H10JAFnqDGBXg="],
 
+    "@kwsites/file-exists": ["@kwsites/file-exists@1.1.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@kwsites/file-exists/-/file-exists-1.1.1.tgz", { "dependencies": { "debug": "^4.1.1" } }, "sha1-rR78rBPhmH2NuvI17zvlsNlvqpk="],
+
+    "@kwsites/promise-deferred": ["@kwsites/promise-deferred@1.1.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@kwsites/promise-deferred/-/promise-deferred-1.1.1.tgz", {}, "sha1-is5SWSVEJszvV/MXW8ZO1wle2Rk="],
+
     "@lezer/common": ["@lezer/common@1.5.2", "https://packagefeedproxy.microsoft.io/npm/@lezer/common/-/common-1.5.2.tgz", {}, "sha512-sxQE460fPZyU3sdc8lafxiPwJHBzZRy/udNFynGQky1SePYBdhkBl1kOagA9uT3pxR8K09bOrmTUqA9wb/PjSQ=="],
 
     "@lezer/highlight": ["@lezer/highlight@1.2.3", "https://packagefeedproxy.microsoft.io/npm/@lezer/highlight/-/highlight-1.2.3.tgz", { "dependencies": { "@lezer/common": "^1.3.0" } }, "sha512-qXdH7UqTvGfdVBINrgKhDsVTJTxactNNxLk7+UMwZhU13lMHaOBlJe9Vqp907ya56Y3+ed2tlqzys7jDkTmW0g=="],
@@ -127,6 +133,12 @@
     "@nodelib/fs.stat": ["@nodelib/fs.stat@2.0.5", "https://packagefeedproxy.microsoft.io/npm/@nodelib/fs.stat/-/fs.stat-2.0.5.tgz", {}, "sha512-RkhPPp2zrqDAQA/2jNhnztcPAlv64XdhIp7a7454A5ovI7Bukxgt7MX7udwAu3zg1DcpPU0rz3VV1SeaqvY4+A=="],
 
     "@nodelib/fs.walk": ["@nodelib/fs.walk@1.2.8", "https://packagefeedproxy.microsoft.io/npm/@nodelib/fs.walk/-/fs.walk-1.2.8.tgz", { "dependencies": { "@nodelib/fs.scandir": "2.1.5", "fastq": "^1.6.0" } }, "sha512-oGB+UxlgWcgQkgwo8GcEGwemoTFt3FIO9ababBmaGwXIoBKZ+GTy0pP185beGg7Llih/NSHSV2XAs1lnznocSg=="],
+
+    "@playwright/test": ["@playwright/test@1.61.1", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@playwright/test/-/test-1.61.1.tgz", { "dependencies": { "playwright": "1.61.1" }, "bin": { "playwright": "cli.js" } }, "sha1-SFaNwir3gZ5V+l6OO8ebfmo+ZnU="],
+
+    "@simple-git/args-pathspec": ["@simple-git/args-pathspec@1.0.3", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@simple-git/args-pathspec/-/args-pathspec-1.0.3.tgz", {}, "sha1-nvSirV9Jq0BWNi0D+T93W5MRjKU="],
+
+    "@simple-git/argv-parser": ["@simple-git/argv-parser@1.1.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@simple-git/argv-parser/-/argv-parser-1.1.1.tgz", { "dependencies": { "@simple-git/args-pathspec": "^1.0.3" } }, "sha1-J1uDnG7rUDCHLHOx6oOaQWiF2p0="],
 
     "@ts-morph/common": ["@ts-morph/common@0.23.0", "https://packagefeedproxy.microsoft.io/npm/@ts-morph/common/-/common-0.23.0.tgz", { "dependencies": { "fast-glob": "^3.3.2", "minimatch": "^9.0.3", "mkdirp": "^3.0.1", "path-browserify": "^1.0.1" } }, "sha512-m7Lllj9n/S6sOkCkRftpM7L24uvmfXQFedlW/4hENcuJH1HHm9u5EgxZb9uVjQSCGrbBWBkOGgcTxNg36r6ywA=="],
 
@@ -312,6 +324,8 @@
 
     "dayjs": ["dayjs@1.11.21", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/dayjs/-/dayjs-1.11.21.tgz", {}, "sha1-V/h1YuYt5288cEvSuNUi/DMGjrI="],
 
+    "debug": ["debug@4.4.3", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/debug/-/debug-4.4.3.tgz", { "dependencies": { "ms": "^2.1.3" }, "peerDependencies": { "supports-color": "*" }, "optionalPeers": ["supports-color"] }, "sha1-xq5DLZvZZiWC/OCHCbA4xY6ePWo="],
+
     "delaunator": ["delaunator@5.1.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/delaunator/-/delaunator-5.1.0.tgz", { "dependencies": { "robust-predicates": "^3.0.2" } }, "sha1-0TJx+/Ov9nU/nqbiNVV/IJAQRuo="],
 
     "dompurify": ["dompurify@3.4.11", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/dompurify/-/dompurify-3.4.11.tgz", { "optionalDependencies": { "@types/trusted-types": "^2.0.7" } }, "sha1-Kci6SWR18nnvQBV4QGhFL7FKBoA="],
@@ -390,6 +404,8 @@
 
     "mnemonist": ["mnemonist@0.39.8", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/mnemonist/-/mnemonist-0.39.8.tgz", { "dependencies": { "obliterator": "^2.0.1" } }, "sha1-kHjNg4YIGv2YbMo0tStdhOp6TTg="],
 
+    "ms": ["ms@2.1.3", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/ms/-/ms-2.1.3.tgz", {}, "sha1-V0yBOM4dK1hh8LRFedut1gxmFbI="],
+
     "nomnoml": ["nomnoml@1.7.0", "https://packagefeedproxy.microsoft.io/npm/nomnoml/-/nomnoml-1.7.0.tgz", { "dependencies": { "graphre": "^0.1.3" }, "bin": { "nomnoml": "dist/nomnoml-cli.js" } }, "sha512-l4eP+/2oSLT+zybLhvaWAQhPluiVbJuD3YUsLM0ggPbQMKH5ni2Vfc0YQPQRsolRHSt5H9SXtzng9MBVCbd+Ag=="],
 
     "obliterator": ["obliterator@2.0.5", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/obliterator/-/obliterator-2.0.5.tgz", {}, "sha1-Ax4BRTVLDBiEAzauUdQefW0sdqo="],
@@ -403,6 +419,10 @@
     "path-data-parser": ["path-data-parser@0.1.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/path-data-parser/-/path-data-parser-0.1.0.tgz", {}, "sha1-j1ulzHD8e+yz3O+uoI4mWaumC4w="],
 
     "picomatch": ["picomatch@2.3.2", "https://packagefeedproxy.microsoft.io/npm/picomatch/-/picomatch-2.3.2.tgz", {}, "sha512-V7+vQEJ06Z+c5tSye8S+nHUfI51xoXIXjHQ99cQtKUkQqqO1kO/KCJUfZXuB47h/YBlDhah2H3hdUGXn8ie0oA=="],
+
+    "playwright": ["playwright@1.61.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/playwright/-/playwright-1.61.1.tgz", { "dependencies": { "playwright-core": "1.61.1" }, "optionalDependencies": { "fsevents": "2.3.2" }, "bin": { "playwright": "cli.js" } }, "sha1-2MDAbrk8KJga/HR7rORTvb1QGLw="],
+
+    "playwright-core": ["playwright-core@1.61.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/playwright-core/-/playwright-core-1.61.1.tgz", { "bin": { "playwright-core": "cli.js" } }, "sha1-PJmEEwfvu6vJ1yTEGojJFHBdFfw="],
 
     "points-on-curve": ["points-on-curve@0.2.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/points-on-curve/-/points-on-curve-0.2.0.tgz", {}, "sha1-fbuYxDeRhZQ0KEdhMw+ok8uBtNE="],
 
@@ -427,6 +447,8 @@
     "rw": ["rw@1.3.3", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/rw/-/rw-1.3.3.tgz", {}, "sha1-P4Yt+pGrdmsUiF700BEkv9oHT7Q="],
 
     "safer-buffer": ["safer-buffer@2.1.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/safer-buffer/-/safer-buffer-2.1.2.tgz", {}, "sha1-RPoWGwGHuVSd2Eu5GAL5vYOFzWo="],
+
+    "simple-git": ["simple-git@3.36.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/simple-git/-/simple-git-3.36.0.tgz", { "dependencies": { "@kwsites/file-exists": "^1.1.1", "@kwsites/promise-deferred": "^1.1.1", "@simple-git/args-pathspec": "^1.0.3", "@simple-git/argv-parser": "^1.1.0", "debug": "^4.4.0" } }, "sha1-AZsowKNYR+40KZxvtjdwqxst/7c="],
 
     "string-width": ["string-width@4.2.3", "https://packagefeedproxy.microsoft.io/npm/string-width/-/string-width-4.2.3.tgz", { "dependencies": { "emoji-regex": "^8.0.0", "is-fullwidth-code-point": "^3.0.0", "strip-ansi": "^6.0.1" } }, "sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g=="],
 
@@ -473,6 +495,8 @@
     "d3-sankey/d3-array": ["d3-array@2.12.1", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/d3-array/-/d3-array-2.12.1.tgz", { "dependencies": { "internmap": "^1.0.0" } }, "sha1-4gtBqvzf/fXVCSgATs7PgVpGXoE="],
 
     "d3-sankey/d3-shape": ["d3-shape@1.3.7", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/d3-shape/-/d3-shape-1.3.7.tgz", { "dependencies": { "d3-path": "1" } }, "sha1-32OAG+B7yYa8VPY3ibT+UCmStdc="],
+
+    "playwright/fsevents": ["fsevents@2.3.2", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/fsevents/-/fsevents-2.3.2.tgz", { "os": "darwin" }, "sha1-ilJveLj99GI7cJ4Ll1xSwkwC/Ro="],
 
     "cytoscape-fcose/cose-base/layout-base": ["layout-base@2.0.1", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/layout-base/-/layout-base-2.0.1.tgz", {}, "sha1-0DN5E1hskPnCwHUpIGn1wtpd0oU="],
 

@@ -1,7 +1,6 @@
 import {
   UML_METHOD_RETURN_MARKER,
   type DiagramKind,
-  type UmlEntitySource,
   type UmlSourceLocation,
 } from "../types.ts";
 
@@ -52,12 +51,47 @@ export function localUserIdFromNodeId(id: string): string | undefined {
   return /classId-(local\d+)-\d+$/.exec(id)?.[1];
 }
 
+export function packageNodeIdFromNodeId(id: string): string | undefined {
+  return /(?:^|-)flowchart-(p\d+)-\d+$/.exec(id)?.[1];
+}
+
 export function formatUmlMethodReturnLabel(text: string): string | undefined {
   const normalized = text.trim();
   const prefix = `${UML_METHOD_RETURN_MARKER}()`;
   if (!normalized.startsWith(prefix)) return undefined;
   const returnType = normalized.slice(prefix.length).replace(/^\s*:\s*/, "").trim();
   return returnType ? `\u00a0\u00a0${returnType}` : undefined;
+}
+
+export function matchesSearchQuery(candidate: string, query: string): boolean {
+  const normalized = query.trim().toLowerCase();
+  return normalized.length > 0 && candidate.toLowerCase().includes(normalized);
+}
+
+export function adjacentTreeRowIndex(
+  currentIndex: number,
+  direction: -1 | 1,
+  rowCount: number,
+): number {
+  if (currentIndex < 0 || currentIndex >= rowCount || rowCount <= 0) return -1;
+  return Math.min(rowCount - 1, Math.max(0, currentIndex + direction));
+}
+
+export function treeScrollTopForRow(
+  currentScrollTop: number,
+  maxScrollTop: number,
+  viewportTop: number,
+  viewportBottom: number,
+  rowTop: number,
+  rowBottom: number,
+): number {
+  let nextScrollTop = currentScrollTop;
+  if (rowTop < viewportTop) {
+    nextScrollTop -= viewportTop - rowTop;
+  } else if (rowBottom > viewportBottom) {
+    nextScrollTop += rowBottom - viewportBottom;
+  }
+  return Math.min(Math.max(0, maxScrollTop), Math.max(0, nextScrollTop));
 }
 
 export function zoomViewportAt(
@@ -75,38 +109,6 @@ export function zoomViewportAt(
   viewport.y = originY - worldY * nextScale;
 }
 
-function bareUmlName(name: string): string {
-  const genericStart = name.indexOf("<");
-  return genericStart === -1 ? name : name.slice(0, genericStart);
-}
-
-function compareLocations(left: UmlSourceLocation, right: UmlSourceLocation): number {
-  return left.path.localeCompare(right.path)
-    || left.line - right.line
-    || left.column - right.column;
-}
-
-export function resolveUmlSource(
-  sources: readonly UmlEntitySource[],
-  entityName: string,
-  methodName?: string,
-  occurrence = 0,
-): UmlSourceLocation | undefined {
-  let entity: UmlEntitySource | undefined;
-  for (const candidate of sources) {
-    if (bareUmlName(candidate.name) !== entityName) continue;
-    if (!entity || compareLocations(candidate, entity) < 0) entity = candidate;
-  }
-  if (!entity || methodName === undefined) return entity;
-
-  let currentOccurrence = 0;
-  for (const method of entity.methods) {
-    if (method.name !== methodName) continue;
-    if (currentOccurrence === occurrence) return method;
-    currentOccurrence += 1;
-  }
-  return undefined;
-}
 
 type TextDocument = {
   lines: number;

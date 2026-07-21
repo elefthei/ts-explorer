@@ -172,7 +172,52 @@ test("encodes nested generic member return types without Mermaid tildes", async 
   expect(genericTypeLine).not.toMatch(/&(?:lt|gt);/);
 });
 
-test("reports exact source metadata for rendered UML declarations", async () => {
+test("removes import qualifiers from nested generic property and method labels", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-import-types-"));
+  roots.push(root);
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(
+    join(root, "src", "types.ts"),
+    [
+      "export interface Skill { name: string; }",
+      "export interface AgentTool<TSchema, TContext> {",
+      "  schema: TSchema;",
+      "  context: TContext;",
+      "}",
+      "export interface DurableContext { durable: true; }",
+      "export declare function definitions<TSchema>(): Map<Skill, AgentTool<TSchema, any>>;",
+      "export declare function current<TSchema>(): {",
+      "  tool: AgentTool<TSchema, any>;",
+      "  context: DurableContext;",
+      "};",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    join(root, "src", "runtime.ts"),
+    [
+      'import { current, definitions } from "./types";',
+      "export class Runtime<TSchema> {",
+      "  readonly registry = definitions<TSchema>();",
+      "  resolve() { return current<TSchema>(); }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+
+  const dsl = await buildUmlDiagram(root, "", []);
+  const lines = dsl.split(/\r?\n/).map((line) => line.trim());
+  const registryLine = lines.find((line) => line.includes("registry:"));
+  const resolveIndex = lines.findIndex((line) => line.includes("resolve()"));
+
+  expect(registryLine).toBe("+registry: Map⟨Skill, AgentTool⟨TSchema, any⟩⟩");
+  expect(lines[resolveIndex]).toBe("+resolve()");
+  expect(lines[resolveIndex + 1]).toBe(
+    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext; ｝",
+  );
+});
+
+test("reports canonical definition metadata with deterministic duplicate-name ordering", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-sources-"));
   roots.push(root);
   await mkdir(join(root, "src"), { recursive: true });
@@ -186,6 +231,8 @@ test("reports exact source metadata for rendered UML declarations", async () => 
       "export type Hooks = {",
       "  before(): boolean;",
       "};",
+      "",
+      "export enum Status { Other }",
       "",
     ].join("\n"),
   );
@@ -209,45 +256,114 @@ test("reports exact source metadata for rendered UML declarations", async () => 
 
   const bundle = await buildUmlDiagrams(root, "", []);
 
-  expect(bundle.sources).toEqual([
+  expect(bundle.definitions).toEqual([
     {
+      key: '["enum","Status",0,null,null]',
+      kind: "enum",
       name: "Status",
-      path: "src/a-models.ts",
-      line: 1,
-      column: 13,
-      methods: [],
+      qualifiedName: "Status",
+      source: { path: "src/a-models.ts", line: 1, column: 13 },
+      uml: { scopePath: "src/a-models.ts", entityName: "Status" },
     },
     {
-      name: "Processor<T>",
-      path: "src/a-models.ts",
-      line: 5,
-      column: 22,
-      methods: [
-        { name: "process", path: "src/a-models.ts", line: 6, column: 3 },
-        { name: "process", path: "src/a-models.ts", line: 7, column: 3 },
-        { name: "reset", path: "src/a-models.ts", line: 8, column: 3 },
-      ],
+      key: '["class","Processor",0,null,null]',
+      kind: "class",
+      name: "Processor",
+      qualifiedName: "Processor",
+      source: { path: "src/a-models.ts", line: 5, column: 22 },
+      uml: { scopePath: "src/a-models.ts", entityName: "Processor<T>" },
     },
     {
+      key: '["class","Processor",0,"process",0]',
+      kind: "method",
+      name: "process",
+      qualifiedName: "Processor.process",
+      source: { path: "src/a-models.ts", line: 6, column: 3 },
+      uml: {
+        scopePath: "src/a-models.ts",
+        entityName: "Processor<T>",
+        memberName: "process",
+        memberOccurrence: 0,
+      },
+    },
+    {
+      key: '["class","Processor",0,"process",1]',
+      kind: "method",
+      name: "process",
+      qualifiedName: "Processor.process",
+      source: { path: "src/a-models.ts", line: 7, column: 3 },
+      uml: {
+        scopePath: "src/a-models.ts",
+        entityName: "Processor<T>",
+        memberName: "process",
+        memberOccurrence: 1,
+      },
+    },
+    {
+      key: '["class","Processor",0,"reset",0]',
+      kind: "method",
+      name: "reset",
+      qualifiedName: "Processor.reset",
+      source: { path: "src/a-models.ts", line: 8, column: 3 },
+      uml: {
+        scopePath: "src/a-models.ts",
+        entityName: "Processor<T>",
+        memberName: "reset",
+        memberOccurrence: 0,
+      },
+    },
+    {
+      key: '["interface","Runner",0,null,null]',
+      kind: "interface",
       name: "Runner",
-      path: "src/z-contracts.ts",
-      line: 1,
-      column: 18,
-      methods: [
-        { name: "execute", path: "src/z-contracts.ts", line: 2, column: 3 },
-      ],
+      qualifiedName: "Runner",
+      source: { path: "src/z-contracts.ts", line: 1, column: 18 },
+      uml: { scopePath: "src/z-contracts.ts", entityName: "Runner" },
     },
     {
+      key: '["interface","Runner",0,"execute",0]',
+      kind: "method",
+      name: "execute",
+      qualifiedName: "Runner.execute",
+      source: { path: "src/z-contracts.ts", line: 2, column: 3 },
+      uml: {
+        scopePath: "src/z-contracts.ts",
+        entityName: "Runner",
+        memberName: "execute",
+        memberOccurrence: 0,
+      },
+    },
+    {
+      key: '["type","Hooks",0,null,null]',
+      kind: "type",
       name: "Hooks",
-      path: "src/z-contracts.ts",
-      line: 5,
-      column: 13,
-      methods: [
-        { name: "before", path: "src/z-contracts.ts", line: 6, column: 3 },
-      ],
+      qualifiedName: "Hooks",
+      source: { path: "src/z-contracts.ts", line: 5, column: 13 },
+      uml: { scopePath: "src/z-contracts.ts", entityName: "Hooks" },
+    },
+    {
+      key: '["type","Hooks",0,"before",0]',
+      kind: "method",
+      name: "before",
+      qualifiedName: "Hooks.before",
+      source: { path: "src/z-contracts.ts", line: 6, column: 3 },
+      uml: {
+        scopePath: "src/z-contracts.ts",
+        entityName: "Hooks",
+        memberName: "before",
+        memberOccurrence: 0,
+      },
+    },
+    {
+      key: '["enum","Status",0,null,null]',
+      kind: "enum",
+      name: "Status",
+      qualifiedName: "Status",
+      source: { path: "src/z-contracts.ts", line: 9, column: 13 },
+      uml: { scopePath: "src/z-contracts.ts", entityName: "Status" },
     },
   ]);
-  expect(bundle.sources.map(({ name }) => name)).not.toContain("hidden");
+  expect(bundle.definitions.map(({ name }) => name)).not.toContain("hidden");
 });
 
 test("groups cross-scope method references into one fan-out external user", async () => {
@@ -328,9 +444,23 @@ test("groups cross-scope method references into one fan-out external user", asyn
       kind: "export",
     },
   ]);
-  expect(scoped.sources.map(({ name, path }) => ({ name, path }))).toEqual([
-    { name: "Gadget", path: "src/lib/gadget.ts" },
-    { name: "Widget", path: "src/lib/widget.ts" },
+  expect(scoped.definitions).toEqual([
+    {
+      key: '["class","Gadget",0,null,null]',
+      kind: "class",
+      name: "Gadget",
+      qualifiedName: "Gadget",
+      source: { path: "src/lib/gadget.ts", line: 1, column: 14 },
+      uml: { scopePath: "src/lib/gadget.ts", entityName: "Gadget" },
+    },
+    {
+      key: '["class","Widget",0,null,null]',
+      kind: "class",
+      name: "Widget",
+      qualifiedName: "Widget",
+      source: { path: "src/lib/widget.ts", line: 1, column: 14 },
+      uml: { scopePath: "src/lib/widget.ts", entityName: "Widget" },
+    },
   ]);
   expect(
     scoped.dsl.match(
@@ -344,13 +474,311 @@ test("groups cross-scope method references into one fan-out external user", asyn
   expect(scoped.dsl).not.toContain("extern3");
 
   const consumer = await buildUmlDiagrams(root, "src/app/consumer.ts", []);
-  expect(consumer.sources.map(({ name, path }) => ({ name, path }))).toEqual([
-    { name: "Consumer", path: "src/app/consumer.ts" },
+  expect(consumer.definitions).toEqual([
+    {
+      key: '["class","Consumer",0,null,null]',
+      kind: "class",
+      name: "Consumer",
+      qualifiedName: "Consumer",
+      source: { path: "src/app/consumer.ts", line: 4, column: 14 },
+      uml: { scopePath: "src/app/consumer.ts", entityName: "Consumer" },
+    },
+    {
+      key: '["class","Consumer",0,"build",0]',
+      kind: "method",
+      name: "build",
+      qualifiedName: "Consumer.build",
+      source: { path: "src/app/consumer.ts", line: 5, column: 3 },
+      uml: {
+        scopePath: "src/app/consumer.ts",
+        entityName: "Consumer",
+        memberName: "build",
+        memberOccurrence: 0,
+      },
+    },
   ]);
   expect(consumer.dsl).toMatch(/^class Consumer\s*\{$/m);
 
   const rootBundle = await buildUmlDiagrams(root, "", []);
   expect(rootBundle.externalUsers).toEqual([]);
+}, 15_000);
+
+test("filters same-package test external users and renders retained extern nodes purple", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-same-package-tests-"));
+  roots.push(root);
+  await Promise.all([
+    mkdir(join(root, "packages", "demo", "src", "target"), { recursive: true }),
+    mkdir(join(root, "packages", "demo", "z-child", "test"), { recursive: true }),
+    mkdir(join(root, "packages", "demo", "test"), { recursive: true }),
+    mkdir(join(root, "packages", "demo", "tests"), { recursive: true }),
+    mkdir(join(root, "packages", "demo", "__tests__"), { recursive: true }),
+    mkdir(join(root, "packages", "other", "test"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(
+      join(root, "packages", "demo", "src", "target", "widget.ts"),
+      "export class Widget {}\n",
+    ),
+    writeFile(
+      join(root, "packages", "demo", "src", "consumer.ts"),
+      [
+        'import { Widget } from "./target/widget";',
+        "export class SourceConsumer {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "z-child", "test", "consumer.test.ts"),
+      [
+        'import { Widget } from "../../src/target/widget";',
+        "export class ChildPackageTest {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "other", "test", "consumer.test.ts"),
+      [
+        'import { Widget } from "../../demo/src/target/widget";',
+        "export class OtherPackageTest {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "test", "test-user.ts"),
+      [
+        'import { Widget } from "../src/target/widget";',
+        "export class TestDirectoryUser {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "tests", "tests-user.ts"),
+      [
+        'import { Widget } from "../src/target/widget";',
+        "export class TestsDirectoryUser {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "__tests__", "dunder-user.ts"),
+      [
+        'import { Widget } from "../src/target/widget";',
+        "export class DunderTestUser {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "src", "co-located.test.ts"),
+      [
+        'import { Widget } from "./target/widget";',
+        "export class CoLocatedTestUser {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "demo", "src", "co-located.spec.ts"),
+      [
+        'import { Widget } from "./target/widget";',
+        "export class CoLocatedSpecUser {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+  ]);
+
+  const bundle = await buildUmlDiagrams(root, "packages/demo/src/target", [
+    { name: "demo", path: "packages/demo", dependencies: [] },
+    { name: "demo-child", path: "packages/demo/z-child", dependencies: ["demo"] },
+    { name: "other", path: "packages/other", dependencies: ["demo"] },
+  ]);
+
+  expect(bundle.externalUsers).toEqual([
+    {
+      nodeId: "extern0",
+      label: "extern: packages/demo/src/consumer.ts: SourceConsumer.build()",
+      scopePath: "packages/demo/src/consumer.ts",
+      kind: "method",
+    },
+    {
+      nodeId: "extern1",
+      label:
+        "extern: packages/demo/z-child/test/consumer.test.ts: ChildPackageTest.build()",
+      scopePath: "packages/demo/z-child/test/consumer.test.ts",
+      kind: "method",
+    },
+    {
+      nodeId: "extern2",
+      label: "extern: packages/other/test/consumer.test.ts: OtherPackageTest.build()",
+      scopePath: "packages/other/test/consumer.test.ts",
+      kind: "method",
+    },
+  ]);
+  expect(bundle.definitions).toEqual([
+    {
+      key: '["class","Widget",0,null,null]',
+      kind: "class",
+      name: "Widget",
+      qualifiedName: "Widget",
+      source: { path: "packages/demo/src/target/widget.ts", line: 1, column: 14 },
+      uml: {
+        scopePath: "packages/demo/src/target/widget.ts",
+        entityName: "Widget",
+      },
+    },
+  ]);
+
+  expect(bundle.dsl).toContain(
+    'class extern0["extern: packages/demo/src/consumer.ts<br/>SourceConsumer.build()"]',
+  );
+  expect(bundle.dsl).toContain(
+    'class extern1["extern: packages/demo/z-child/test/consumer.test.ts<br/>ChildPackageTest.build()"]',
+  );
+  expect(bundle.dsl).toContain(
+    'class extern2["extern: packages/other/test/consumer.test.ts<br/>OtherPackageTest.build()"]',
+  );
+  const dslLines = bundle.dsl.split(/\r?\n/).map((line) => line.trim());
+  for (const nodeId of ["extern0", "extern1", "extern2"]) {
+    expect(dslLines.filter((line) => line === `${nodeId} --> Widget`)).toHaveLength(1);
+    expect(bundle.dsl).toContain(`cssClass "${nodeId}" external`);
+  }
+
+  const filteredPaths = [
+    "packages/demo/test/test-user.ts",
+    "packages/demo/tests/tests-user.ts",
+    "packages/demo/__tests__/dunder-user.ts",
+    "packages/demo/src/co-located.test.ts",
+    "packages/demo/src/co-located.spec.ts",
+  ];
+  const externalMetadata = JSON.stringify(bundle.externalUsers);
+  for (const filteredPath of filteredPaths) {
+    expect(externalMetadata).not.toContain(filteredPath);
+    expect(bundle.dsl).not.toContain(filteredPath);
+    for (const communityDsl of bundle.dsls) {
+      expect(communityDsl).not.toContain(filteredPath);
+    }
+  }
+  expect(externalMetadata).not.toContain("extern3");
+  expect(bundle.dsl).not.toContain("extern3");
+  for (const communityDsl of bundle.dsls) {
+    expect(communityDsl).not.toContain("extern3");
+  }
+
+  const externalGraphNodeIds = bundle.graph
+    .nodes()
+    .filter((node) => bundle.graph.getNodeAttribute(node, "kind") === "external-user")
+    .sort();
+  expect(externalGraphNodeIds).toEqual([
+    "external-user:extern0",
+    "external-user:extern1",
+    "external-user:extern2",
+  ]);
+  const widgetEntityIds = bundle.graph.nodes().filter((node) => {
+    const attributes = bundle.graph.getNodeAttributes(node);
+    return attributes.kind === "entity" && attributes.name === "Widget";
+  });
+  expect(widgetEntityIds).toHaveLength(1);
+  const widgetEntityId = widgetEntityIds[0];
+  if (widgetEntityId === undefined) {
+    throw new Error("Expected the Widget entity graph node");
+  }
+  const graphRelations = bundle.graph.edges().flatMap((edge) =>
+    bundle.graph.getEdgeAttribute(edge, "relations")
+  );
+  const externalRelations = graphRelations
+    .filter(({ kind }) => kind === "external-user")
+    .map(({ sourceId, targetId }) => ({ sourceId, targetId }))
+    .sort(({ sourceId: left }, { sourceId: right }) => left.localeCompare(right));
+  expect(externalRelations).toEqual([
+    { sourceId: "external-user:extern0", targetId: widgetEntityId },
+    { sourceId: "external-user:extern1", targetId: widgetEntityId },
+    { sourceId: "external-user:extern2", targetId: widgetEntityId },
+  ]);
+  const graphNodeNames = bundle.graph
+    .nodes()
+    .map((node) => bundle.graph.getNodeAttribute(node, "name"));
+  const relationNodeNames = graphRelations.flatMap(({ sourceId, targetId }) => [
+    bundle.graph.getNodeAttribute(sourceId, "name"),
+    bundle.graph.getNodeAttribute(targetId, "name"),
+  ]);
+  for (const filteredPath of filteredPaths) {
+    expect(graphNodeNames.some((name) => name.includes(filteredPath))).toBe(false);
+    expect(relationNodeNames.some((name) => name.includes(filteredPath))).toBe(false);
+  }
+
+  expect(bundle.dsl).toContain(
+    "classDef external fill:#3a2b52,stroke:#b58bff,color:#f4f7fb,stroke-dasharray: 4 3",
+  );
+});
+
+test("keeps nested-package tests external for a root source package", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-root-package-tests-"));
+  roots.push(root);
+  await Promise.all([
+    mkdir(join(root, "src", "target"), { recursive: true }),
+    mkdir(join(root, "test"), { recursive: true }),
+    mkdir(join(root, "packages", "nested", "test"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(join(root, "src", "target", "widget.ts"), "export class Widget {}\n"),
+    writeFile(
+      join(root, "test", "root-user.ts"),
+      [
+        'import { Widget } from "../src/target/widget";',
+        "export class RootTest {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+    writeFile(
+      join(root, "packages", "nested", "test", "consumer.test.ts"),
+      [
+        'import { Widget } from "../../../src/target/widget";',
+        "export class NestedPackageTest {",
+        "  build(): Widget { return new Widget(); }",
+        "}",
+        "",
+      ].join("\n"),
+    ),
+  ]);
+
+  const bundle = await buildUmlDiagrams(root, "src/target", [
+    { name: "root", path: "", dependencies: [] },
+    { name: "nested", path: "packages/nested", dependencies: ["root"] },
+  ]);
+
+  expect(bundle.externalUsers).toEqual([
+    {
+      nodeId: "extern0",
+      label:
+        "extern: packages/nested/test/consumer.test.ts: NestedPackageTest.build()",
+      scopePath: "packages/nested/test/consumer.test.ts",
+      kind: "method",
+    },
+  ]);
+  const rootTestPath = "test/root-user.ts";
+  expect(JSON.stringify(bundle.externalUsers)).not.toContain(rootTestPath);
+  expect(bundle.dsl).not.toContain(rootTestPath);
+  for (const communityDsl of bundle.dsls) {
+    expect(communityDsl).not.toContain(rootTestPath);
+  }
+  expect(bundle.dsl.split(/\r?\n/).filter((line) => line.trim() === "extern0 --> Widget")).toHaveLength(1);
+  expect(bundle.dsl).not.toContain("extern1");
 });
 
 test("keeps external users for targets already connected inside the selected scope", async () => {
@@ -566,14 +994,6 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
   expect(bundle.localUsers).toEqual([
     {
       nodeId: "local0",
-      label: "local: src/edges.ts: DataflowEdge",
-      kind: "type",
-      path: "src/edges.ts",
-      line: 12,
-      column: 13,
-    },
-    {
-      nodeId: "local1",
       label: "local: src/edges.ts: DataflowEdge.ret()",
       kind: "method",
       path: "src/edges.ts",
@@ -581,7 +1001,7 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
       column: 3,
     },
     {
-      nodeId: "local2",
+      nodeId: "local1",
       label: "local: src/edges.ts: isRetEdge(DataflowEdge⟨N, T, ES⟩)",
       kind: "function",
       path: "src/edges.ts",
@@ -589,7 +1009,7 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
       column: 14,
     },
     {
-      nodeId: "local3",
+      nodeId: "local2",
       label: "export: src/index.ts: RetEdge",
       kind: "export",
       path: "src/index.ts",
@@ -603,20 +1023,62 @@ test("renders every local and re-exported user of a RetEdge-shaped type", async 
       .filter((line) => / --> RetEdge~T~$/.test(line))
       .sort(),
   ).toEqual([
+    "DataflowEdge~N,T,ES~ --> RetEdge~T~",
     "local0 --> RetEdge~T~",
     "local1 --> RetEdge~T~",
     "local2 --> RetEdge~T~",
-    "local3 --> RetEdge~T~",
   ]);
   expect(
     bundle.dsl.split(/\r?\n/).filter((line) => / --> MsgEdge~N,ES~$/.test(line)),
-  ).toEqual(["local0 --> MsgEdge~N,ES~"]);
-  expect(
-    bundle.sources
-      .filter(({ name }) => name === "DeadEdge" || name === "RecursiveEdge")
-      .map(({ name }) => name)
-      .sort(),
-  ).toEqual(["DeadEdge", "RecursiveEdge"]);
+  ).toEqual(["DataflowEdge~N,T,ES~ --> MsgEdge~N,ES~"]);
+  expect(bundle.definitions).toEqual([
+    {
+      key: '["type","MsgEdge",0,null,null]',
+      kind: "type",
+      name: "MsgEdge",
+      qualifiedName: "MsgEdge",
+      source: { path: "src/edges.ts", line: 1, column: 13 },
+      uml: { scopePath: "src/edges.ts", entityName: "MsgEdge<N,ES>" },
+    },
+    {
+      key: '["type","RetEdge",0,null,null]',
+      kind: "type",
+      name: "RetEdge",
+      qualifiedName: "RetEdge",
+      source: { path: "src/edges.ts", line: 7, column: 13 },
+      uml: { scopePath: "src/edges.ts", entityName: "RetEdge<T>" },
+    },
+    {
+      key: '["type","DataflowEdge",0,null,null]',
+      kind: "type",
+      name: "DataflowEdge",
+      qualifiedName: "DataflowEdge",
+      source: { path: "src/edges.ts", line: 12, column: 13 },
+      uml: { scopePath: "src/edges.ts", entityName: "DataflowEdge<N,T,ES>" },
+    },
+    {
+      key: '["type","DeadEdge",0,null,null]',
+      kind: "type",
+      name: "DeadEdge",
+      qualifiedName: "DeadEdge",
+      source: { path: "src/edges.ts", line: 24, column: 13 },
+      uml: { scopePath: "src/edges.ts", entityName: "DeadEdge" },
+    },
+    {
+      key: '["type","RecursiveEdge",0,null,null]',
+      kind: "type",
+      name: "RecursiveEdge",
+      qualifiedName: "RecursiveEdge",
+      source: { path: "src/edges.ts", line: 28, column: 13 },
+      uml: { scopePath: "src/edges.ts", entityName: "RecursiveEdge" },
+    },
+  ]);
+  expect(bundle.dsl).toMatch(/^class DataflowEdge~N,T,ES~\s*\{$/m);
+  const dataflowNode = bundle.graph.nodes().find(
+    (node) => bundle.graph.getNodeAttribute(node, "name") === "DataflowEdge<N,T,ES>",
+  );
+  expect(dataflowNode).toBeDefined();
+  expect(bundle.graph.getNodeAttribute(dataflowNode!, "kind")).toBe("entity");
   expect(
     bundle.dsl
       .split(/\r?\n/)
@@ -866,15 +1328,15 @@ test("exposes every UML relation through an assigned undirected simple graph", a
   ]);
 });
 
-test("reuses one graph entity node for same-file merged interfaces", async () => {
+test("preserves merged definition occurrences while reusing one graph entity node", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-merged-interface-"));
   roots.push(root);
   await mkdir(join(root, "src"), { recursive: true });
   await writeFile(
     join(root, "src", "merged.ts"),
     [
-      "export interface Merged { first: string; }",
-      "export interface Merged { second: number; }",
+      "export interface Merged { run(value: string): string; }",
+      "export interface Merged { run(value: number): number; stop(): void; }",
       "",
     ].join("\n"),
   );
@@ -884,6 +1346,63 @@ test("reuses one graph entity node for same-file merged interfaces", async () =>
     (node) => bundle.graph.getNodeAttribute(node, "name") === "Merged",
   );
 
+  expect(bundle.definitions).toEqual([
+    {
+      key: '["interface","Merged",0,null,null]',
+      kind: "interface",
+      name: "Merged",
+      qualifiedName: "Merged",
+      source: { path: "src/merged.ts", line: 1, column: 18 },
+      uml: { scopePath: "src/merged.ts", entityName: "Merged" },
+    },
+    {
+      key: '["interface","Merged",0,"run",0]',
+      kind: "method",
+      name: "run",
+      qualifiedName: "Merged.run",
+      source: { path: "src/merged.ts", line: 1, column: 27 },
+      uml: {
+        scopePath: "src/merged.ts",
+        entityName: "Merged",
+        memberName: "run",
+        memberOccurrence: 0,
+      },
+    },
+    {
+      key: '["interface","Merged",1,null,null]',
+      kind: "interface",
+      name: "Merged",
+      qualifiedName: "Merged",
+      source: { path: "src/merged.ts", line: 2, column: 18 },
+      uml: { scopePath: "src/merged.ts", entityName: "Merged" },
+    },
+    {
+      key: '["interface","Merged",1,"run",1]',
+      kind: "method",
+      name: "run",
+      qualifiedName: "Merged.run",
+      source: { path: "src/merged.ts", line: 2, column: 27 },
+      uml: {
+        scopePath: "src/merged.ts",
+        entityName: "Merged",
+        memberName: "run",
+        memberOccurrence: 1,
+      },
+    },
+    {
+      key: '["interface","Merged",1,"stop",0]',
+      kind: "method",
+      name: "stop",
+      qualifiedName: "Merged.stop",
+      source: { path: "src/merged.ts", line: 2, column: 55 },
+      uml: {
+        scopePath: "src/merged.ts",
+        entityName: "Merged",
+        memberName: "stop",
+        memberOccurrence: 0,
+      },
+    },
+  ]);
   expect(mergedNodes).toHaveLength(1);
   expect(bundle.graph.getNodeAttribute(mergedNodes[0]!, "kind")).toBe("entity");
   expect(Number.isInteger(bundle.graph.getNodeAttribute(mergedNodes[0]!, "community"))).toBe(true);

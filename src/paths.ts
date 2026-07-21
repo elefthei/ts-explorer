@@ -15,7 +15,7 @@ function isWithin(root: string, candidate: string): boolean {
   return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
 }
 
-function validateRelativePath(value: string): string {
+export function normalizeRelativePath(value: string): string {
   if (typeof value !== "string" || value.includes("\0")) {
     throw new PathError("BAD_REQUEST", "path must be a valid string");
   }
@@ -23,7 +23,7 @@ function validateRelativePath(value: string): string {
   if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
     throw new PathError("FORBIDDEN", "path must be relative to the source root");
   }
-  const parts = normalized.split("/").filter(Boolean);
+  const parts = normalized.split("/").filter((part) => part !== "" && part !== ".");
   if (parts.some((part) => part === "..")) {
     throw new PathError("FORBIDDEN", "path escapes the source root");
   }
@@ -31,7 +31,7 @@ function validateRelativePath(value: string): string {
 }
 
 export async function resolveInside(root: string, relativePath: string, mustExist: boolean): Promise<string> {
-  const safePath = validateRelativePath(relativePath);
+  const safePath = normalizeRelativePath(relativePath);
   const realRoot = await realpath(root).catch(() => {
     throw new PathError("NOT_FOUND", "source root does not exist");
   });

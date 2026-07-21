@@ -4,6 +4,10 @@ export function posix(path: string): string {
   return path.split(sep).join("/");
 }
 
+export function isTestPath(path: string): boolean {
+  return /(^|[\\/])(test|tests|__tests__)([\\/]|$)|\.(test|spec)\.[cm]?[tj]sx?$/.test(path);
+}
+
 export function umlEntityKey(fileName: string, name: string): string {
   const path = posix(fileName);
   return `${process.platform === "win32" ? path.toLowerCase() : path}\0${name}`;
