@@ -47,6 +47,9 @@ const priorityRequests=new RequestSequence();
 const definitionRequests=new RequestSequence();
 const editorRequests=new RequestSequence();
 const emittedUmlScopes=new Set<string>();
+const diagramLoadingState={loading:false,showMessage:false};
+let activeScopeSyncToken:number|undefined;
+let deferredOpenFileRefresh=false;
 mermaid.initialize({startOnLoad:false,securityLevel:"strict",theme:"dark"});
 async function api<T>(url:string,init?:RequestInit):Promise<T>{const response=await fetch(url,init);const body=await response.json() as T & {error?:string};if(!response.ok)throw new Error(body.error??`Request failed (${response.status})`);return body;}
 type PriorityPollResult={cancelled:true}|{cancelled:false;response:PreprocessPriorityResponse};
@@ -78,7 +81,38 @@ async function prioritizeScope(
 }
 function setStatus(text:string,error=false){const node=$("#status");node.textContent=text;node.classList.toggle("error",error);}
 function showError(error:string|undefined){const panel=$("#error-panel");panel.textContent=error??"";panel.hidden=!error;}
-function setDiagramLoading(loading:boolean,showMessage=false):void{const panel=$("#diagram-loading");panel.hidden=!showMessage;const stage=$("#diagram-stage");stage.setAttribute("aria-busy",String(loading));stage.classList.toggle("loading",loading);if(loading)showError(undefined);}
+function applyDiagramLoading():void{
+  const loading=diagramLoadingState.loading||activeScopeSyncToken!==undefined;
+  const showMessage=diagramLoadingState.showMessage||activeScopeSyncToken!==undefined;
+  const panel=$("#diagram-loading");
+  panel.hidden=!showMessage;
+  const stage=$("#diagram-stage");
+  stage.setAttribute("aria-busy",String(loading));
+  stage.classList.toggle("loading",loading);
+  if(loading)showError(undefined);
+}
+function setDiagramLoading(loading:boolean,showMessage=false):void{
+  diagramLoadingState.loading=loading;
+  diagramLoadingState.showMessage=showMessage;
+  applyDiagramLoading();
+}
+function supersedeScopeSyncLoading():void{
+  activeScopeSyncToken=undefined;
+  deferredOpenFileRefresh=false;
+  applyDiagramLoading();
+}
+function beginScopeSyncLoading(token:number):void{
+  activeScopeSyncToken=token;
+  applyDiagramLoading();
+}
+function endScopeSyncLoading(token:number):void{
+  if(activeScopeSyncToken!==token)return;
+  activeScopeSyncToken=undefined;
+  applyDiagramLoading();
+  const refreshOpenFile=deferredOpenFileRefresh;
+  deferredOpenFileRefresh=false;
+  if(refreshOpenFile&&state.file)void reloadOpenFile();
+}
 function setEditorLoading(loading:boolean):void{$("#editor-loading").hidden=!loading;}
 function parseMethodName(text:string):string{const normalized=text.trim().replace(/^\\?[+\-#~]/,"");const parenthesis=normalized.indexOf("(");return (parenthesis===-1?normalized:normalized.slice(0,parenthesis)).trim();}
 function sourceFromLink(link:Element):UmlSourceLocation|undefined{const data=(link as HTMLElement).dataset;const line=Number(data.sourceLine);const column=Number(data.sourceColumn);if(!data.sourcePath||!Number.isInteger(line)||!Number.isInteger(column))return undefined;return{path:data.sourcePath,line,column};}
@@ -496,23 +530,22 @@ async function selectScope(
   }
   const diagramToken=context?.diagramToken??diagramRequests.next();
   const priorityToken=priorityRequests.next();
+  supersedeScopeSyncLoading();
   const isCurrent=()=>priorityRequests.isCurrent(priorityToken)
     &&diagramRequests.isCurrent(diagramToken)
     &&(context===undefined||definitionContextCurrent(context));
   searchRequests.next();
   if(!isCurrent())return false;
-  state.mode=requestedMode??(node.path===""||node.name==="packages"?"packages":"uml");
+  state.mode=requestedMode??(node.path===""?"packages":"uml");
   state.scope=state.mode==="packages"?"":node.path;
   if(state.mode==="uml")state.umlScope=node.path;
   activateView(state.mode);
   viewport.reset();
   renderTree();
-  const showPriorityLoading=state.mode==="uml"
-    &&node.kind==="directory"
-    &&!emittedUmlScopes.has(state.scope);
-  if(showPriorityLoading)setDiagramLoading(true,true);
+  const syncClickedScope=state.mode==="uml"&&node.kind==="directory";
+  if(syncClickedScope)beginScopeSyncLoading(priorityToken);
   try{
-    if(state.mode==="uml"&&node.kind==="directory"){
+    if(syncClickedScope){
       const priority=await prioritizeScope(node.path,priorityRequests,priorityToken);
       if(priority.cancelled)return false;
     }
@@ -525,6 +558,8 @@ async function selectScope(
     showError(error instanceof Error?error.message:String(error));
     setStatus("Request failed",true);
     return false;
+  }finally{
+    if(syncClickedScope)endScopeSyncLoading(priorityToken);
   }
 }
 function destroyEditor(invalidate=true):void{
@@ -681,7 +716,18 @@ async function navigateToDefinition(
   }
 }
 async function reloadOpenFile():Promise<void>{if(!state.file)return;const path=state.file.path;const activeView=state.activeView;await openFile(path);if(activeView!=="editor")activateView(activeView);}
-function refreshCachedViews():void{definitionRequests.next();editorRequests.next();if(state.file)void reloadOpenFile();void loadTree().catch((error)=>setStatus(error instanceof Error?error.message:String(error),true));if(state.search&&state.mode==="uml"&&state.scope==="")void commitSearch(state.search);else void loadDiagram();}
+function refreshCachedViews():void{
+  definitionRequests.next();
+  editorRequests.next();
+  void loadTree().catch((error)=>setStatus(error instanceof Error?error.message:String(error),true));
+  if(activeScopeSyncToken!==undefined){
+    deferredOpenFileRefresh||=state.file!==null;
+    return;
+  }
+  if(state.file)void reloadOpenFile();
+  if(state.search&&state.mode==="uml"&&state.scope==="")void commitSearch(state.search);
+  else void loadDiagram();
+}
 function handleWatch(message:WatchMessage){
   if(message.type==="watch-error"){setStatus(message.error,true);return;}
   state.version=message.version;

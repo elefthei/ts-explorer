@@ -5,13 +5,14 @@ import {
   type Page,
   type Request,
   type Response,
+  type Route,
   type WebSocket as PlaywrightWebSocket,
 } from "@playwright/test";
 import {
   spawn,
   type ChildProcessByStdio,
 } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -690,7 +691,7 @@ test.afterEach(async ({}, testInfo) => {
   await cleanupAll();
 });
 
-test("clicking a packages directory selects the root Packages tab", async ({ browser }) => {
+test("clicking a nested packages directory selects its UML scope", async ({ browser }) => {
   const resource = registerResource();
   try {
     const fixtureRoot = await createNestedPackagesFixture(resource);
@@ -725,27 +726,131 @@ test("clicking a packages directory selects the root Packages tab", async ({ bro
     );
     await expect(packagesRow).toBeVisible();
 
-    const [diagramRequest] = await Promise.all([
-      page.waitForRequest((request) => {
-        const url = new URL(request.url());
-        return url.pathname === "/api/diagram" &&
-          url.searchParams.get("kind") === "packages";
-      }),
-      packagesRow.click(),
-    ]);
-    const diagramUrl = new URL(diagramRequest.url());
-    expect(diagramUrl.searchParams.get("kind")).toBe("packages");
-    expect(diagramUrl.searchParams.get("path")).toBe("");
-    expect((await diagramRequest.response())?.status()).toBe(200);
-    await expect(dsl).toContainText("flowchart LR");
-    await expect(page.locator("#packages-mode")).toHaveClass(
-      /(?:^|\s)active(?:\s|$)/,
-    );
-    const errorPanel = page.locator("#error-panel");
-    await expect(errorPanel).toBeHidden();
-    await expect(errorPanel).not.toContainText(
-      "packages diagram scope must be the source root",
-    );
+    const preprocessRoutePattern = "**/api/preprocess";
+    type HeldPackagePriority = {
+      request: Extract<PreprocessControlRequest, { action: "prioritize" }>;
+      body: PreprocessPriorityResponse;
+      status: number;
+    };
+    let resolveCaptured!: (priority: HeldPackagePriority) => void;
+    const captured = new Promise<HeldPackagePriority>((resolve) => {
+      resolveCaptured = resolve;
+    });
+    let resolveRelease!: () => void;
+    const releaseSignal = new Promise<void>((resolve) => {
+      resolveRelease = resolve;
+    });
+    let resolveFinished!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      resolveFinished = resolve;
+    });
+    let held = false;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      resolveRelease();
+    };
+    const priorityGate = async (route: Route): Promise<void> => {
+      const request = route.request();
+      if (request.method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      const requestBody = request.postDataJSON() as PreprocessControlRequest;
+      if (
+        held ||
+        requestBody.action !== "prioritize" ||
+        requestBody.resource !== "./junco-runtime/packages"
+      ) {
+        await route.continue();
+        return;
+      }
+      held = true;
+      const fetchedResponse = await route.fetch();
+      const responseBody = await fetchedResponse.json() as PreprocessPriorityResponse;
+      resolveCaptured({
+        request: requestBody,
+        body: responseBody,
+        status: fetchedResponse.status(),
+      });
+      await releaseSignal;
+      await route.fulfill({ response: fetchedResponse });
+      resolveFinished();
+    };
+    const nestedPackageDiagramRequests: Request[] = [];
+    let resolveNestedPackageDiagramRequest!: (request: Request) => void;
+    const nestedPackageDiagramRequest = new Promise<Request>((resolve) => {
+      resolveNestedPackageDiagramRequest = resolve;
+    });
+    const observeNestedPackageDiagramRequest = (request: Request): void => {
+      const url = new URL(request.url());
+      if (
+        url.pathname === "/api/diagram" &&
+        url.searchParams.get("kind") === "uml" &&
+        url.searchParams.get("path") === "junco-runtime/packages"
+      ) {
+        nestedPackageDiagramRequests.push(request);
+        if (nestedPackageDiagramRequests.length === 1) {
+          resolveNestedPackageDiagramRequest(request);
+        }
+      }
+    };
+    page.on("request", observeNestedPackageDiagramRequest);
+    await page.route(preprocessRoutePattern, priorityGate);
+    try {
+      await packagesRow.click();
+      const heldPriority = await withBound(
+        captured,
+        10_000,
+        "junco-runtime/packages prioritize response",
+      );
+
+      await expect(page.locator("#diagram-loading")).toBeVisible();
+      await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
+      expect(nestedPackageDiagramRequests).toHaveLength(0);
+      await expect(dsl).toContainText("classDiagram");
+      await expect(dsl).not.toContainText("flowchart LR");
+
+      release();
+      await withBound(
+        finished,
+        10_000,
+        "released junco-runtime/packages prioritize response",
+      );
+      expect(heldPriority.request).toEqual({
+        action: "prioritize",
+        resource: "./junco-runtime/packages",
+      });
+      expect(heldPriority.status).toBe(200);
+      expect(heldPriority.body.resource).toBe("junco-runtime/packages");
+      expect(Number.isSafeInteger(heldPriority.body.requestId)).toBe(true);
+      expect(heldPriority.body.requestId).toBeGreaterThan(0);
+      expect(["queued", "processing", "done"]).toContain(heldPriority.body.status);
+
+      const diagramRequest = await withBound(
+        nestedPackageDiagramRequest,
+        30_000,
+        "junco-runtime/packages UML diagram request after priority completion",
+      );
+      const diagramUrl = new URL(diagramRequest.url());
+      expect(diagramUrl.searchParams.get("kind")).toBe("uml");
+      expect(diagramUrl.searchParams.get("path")).toBe("junco-runtime/packages");
+      expect((await diagramRequest.response())?.status()).toBe(200);
+      await expect(dsl).toContainText("classDiagram");
+      await expect(dsl).toContainText("JuncoRuntimeDemo");
+      await expect(dsl).not.toContainText("flowchart LR");
+      await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
+      await expect(page.locator("#packages-mode")).not.toHaveClass(/\bactive\b/);
+      await expect(page.locator("#diagram-loading")).toBeHidden();
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+      await expect(page.locator("#error-panel")).toBeHidden();
+    } finally {
+      release();
+      await page.unroute(preprocessRoutePattern, priorityGate);
+      page.off("request", observeNestedPackageDiagramRequest);
+    }
   } finally {
     await cleanupResource(resource);
   }
@@ -834,6 +939,7 @@ test("renders a live tree independently and observes cache completion", async ({
 });
 
 test("navigates definitions within the active surface and cancels stale priority work", async ({ browser }) => {
+  test.setTimeout(150_000);
   const resource = registerResource();
   try {
     const fixtureRoot = await createFixture(resource);
@@ -841,6 +947,63 @@ test("navigates definitions within the active surface and cancels stale priority
     resource.page = await resource.context.newPage();
     const page = resource.page;
     const watch = watchCacheReady(page);
+    const afterTwoAnimationFrames = (): Promise<void> =>
+      page.evaluate(() =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        })
+      );
+    const preprocessRoutePattern = "**/api/preprocess";
+    const createZLateDonePollGate = () => {
+      type HeldDonePoll = {
+        request: PreprocessControlRequest;
+        body: PreprocessPriorityResponse;
+      };
+      let resolveCaptured!: (poll: HeldDonePoll) => void;
+      const captured = new Promise<HeldDonePoll>((resolve) => {
+        resolveCaptured = resolve;
+      });
+      let resolveRelease!: () => void;
+      const releaseSignal = new Promise<void>((resolve) => {
+        resolveRelease = resolve;
+      });
+      let resolveFinished!: () => void;
+      const finished = new Promise<void>((resolve) => {
+        resolveFinished = resolve;
+      });
+      let held = false;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        resolveRelease();
+      };
+      const handler = async (route: Route): Promise<void> => {
+        const request = route.request();
+        if (request.method() !== "POST") {
+          await route.continue();
+          return;
+        }
+        const requestBody = request.postDataJSON() as PreprocessControlRequest;
+        if (requestBody.action !== "poll") {
+          await route.continue();
+          return;
+        }
+        const fetchedResponse = await route.fetch();
+        const responseBody = await fetchedResponse.json() as PreprocessPriorityResponse;
+        const shouldHold = !held &&
+          responseBody.resource === "z-late" &&
+          responseBody.status === "done";
+        if (shouldHold) {
+          held = true;
+          resolveCaptured({ request: requestBody, body: responseBody });
+          await releaseSignal;
+        }
+        await route.fulfill({ response: fetchedResponse });
+        if (shouldHold) resolveFinished();
+      };
+      return { captured, finished, handler, release };
+    };
     await navigateToCli(page, fixtureRoot, resource);
     await Promise.all([
       expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
@@ -877,48 +1040,144 @@ test("navigates definitions within the active surface and cancels stale priority
 
     const observation = observeDefinitionApi(page);
     try {
-      const directoryPriorityRequest = page.waitForRequest((request) => {
-        if (new URL(request.url()).pathname !== "/api/preprocess") return false;
-        const body = request.postDataJSON() as PreprocessControlRequest;
-        return body.action === "prioritize" && body.resource === "./z-late";
-      });
-      const directoryPriorityResponse = page.waitForResponse((response) => {
-        if (new URL(response.url()).pathname !== "/api/preprocess") return false;
-        const body = response.request().postDataJSON() as PreprocessControlRequest;
-        return body.action === "prioritize" && body.resource === "./z-late";
-      });
-      await page.locator('.tree-row[data-tree-path="z-late"]').click();
-
-      expect((await directoryPriorityRequest).postDataJSON()).toEqual({
-        action: "prioritize",
-        resource: "./z-late",
-      });
-      await expect(page.locator("#diagram-loading")).toBeVisible();
-      await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-
-      const directoryPriorityBody = await (await directoryPriorityResponse).json() as
-        PreprocessPriorityResponse;
-      expect(directoryPriorityBody.status).not.toBe("done");
       const lateLink = page.locator(
         '#svg-holder .uml-definition-link[data-source-path="z-late/late-definition.ts"]' +
         '[data-source-line="1"][data-source-column="14"]',
       );
-      await expect(lateLink).toBeVisible({ timeout: 30_000 });
-      await expect(page.locator("#diagram-loading")).toBeHidden();
-      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
-      await observation.flush();
-      const directoryPolls = observation.preprocessResponses.filter(
-        (response) => response.request.action === "poll" &&
-          response.request.requestId === directoryPriorityBody.requestId,
+      const firstRefreshHistoryStart = watch.history.length;
+      const firstRefreshCacheReadyVersion = watch.history.reduce(
+        (highest, message) =>
+          message.type === "cache-ready" ? Math.max(highest, message.version) : highest,
+        -1,
       );
-      expect(directoryPolls.length).toBeGreaterThan(0);
-      expect(directoryPolls.at(-1)?.body.status).toBe("done");
-      await expect(lateLink).toHaveAttribute("role", "link");
-      await expect(lateLink).toHaveAttribute(
-        "aria-label",
-        "Open LateDefinition UML definition",
+      const directoryDoneGate = createZLateDonePollGate();
+      await page.route(preprocessRoutePattern, directoryDoneGate.handler);
+      try {
+        const directoryPriorityRequest = page.waitForRequest((request) => {
+          if (new URL(request.url()).pathname !== "/api/preprocess") return false;
+          const body = request.postDataJSON() as PreprocessControlRequest;
+          return body.action === "prioritize" && body.resource === "./z-late";
+        });
+        const directoryPriorityResponse = page.waitForResponse((response) => {
+          if (new URL(response.url()).pathname !== "/api/preprocess") return false;
+          const body = response.request().postDataJSON() as PreprocessControlRequest;
+          return body.action === "prioritize" && body.resource === "./z-late";
+        });
+        await page.locator('.tree-row[data-tree-path="z-late"]').click();
+
+        expect((await directoryPriorityRequest).postDataJSON()).toEqual({
+          action: "prioritize",
+          resource: "./z-late",
+        });
+        await expect(page.locator("#diagram-loading")).toBeVisible();
+        await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
+        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
+
+        const directoryPriorityBody = await (await directoryPriorityResponse).json() as
+          PreprocessPriorityResponse;
+        expect(directoryPriorityBody.status).not.toBe("done");
+        const heldDirectoryDone = await withBound(
+          directoryDoneGate.captured,
+          30_000,
+          "correlated z-late directory done poll",
+        );
+
+        await writeFile(
+          join(fixtureRoot, "refresh-trigger.ts"),
+          "export const refreshTrigger = true;\n",
+        );
+        let refreshChangedHistoryIndex = -1;
+        await expect.poll(
+          () => {
+            refreshChangedHistoryIndex = watch.history.findIndex(
+              (message, index) =>
+                index >= firstRefreshHistoryStart &&
+                message.type === "changed" &&
+                message.paths.some((path) => path.includes("refresh-trigger.ts")),
+            );
+            return refreshChangedHistoryIndex;
+          },
+          {
+            message: "a changed watcher message for refresh-trigger.ts",
+            timeout: 30_000,
+          },
+        ).toBeGreaterThanOrEqual(firstRefreshHistoryStart);
+        await expect.poll(
+          () =>
+            watch.history.find(
+              (message, index) =>
+                index > refreshChangedHistoryIndex &&
+                message.type === "cache-ready" &&
+                message.version > firstRefreshCacheReadyVersion,
+            )?.version ?? firstRefreshCacheReadyVersion,
+          {
+            message: "a later cache-ready watcher generation after refresh-trigger.ts",
+            timeout: 30_000,
+          },
+        ).toBeGreaterThan(firstRefreshCacheReadyVersion);
+
+        await afterTwoAnimationFrames();
+        await expect(page.locator("#diagram-loading")).toBeVisible();
+        await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
+        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
+        await expect(lateLink).toHaveCount(0);
+
+        directoryDoneGate.release();
+        await withBound(
+          directoryDoneGate.finished,
+          10_000,
+          "released z-late directory done response",
+        );
+        expect(heldDirectoryDone.request).toEqual({
+          action: "poll",
+          requestId: directoryPriorityBody.requestId,
+        });
+        expect(heldDirectoryDone.body).toEqual({
+          status: "done",
+          resource: "z-late",
+          requestId: directoryPriorityBody.requestId,
+        });
+
+        await expect(lateLink).toBeVisible({ timeout: 30_000 });
+        await expect(page.locator("#diagram-loading")).toBeHidden();
+        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+        await observation.flush();
+        const directoryPolls = observation.preprocessResponses.filter(
+          (response) => response.request.action === "poll" &&
+            response.request.requestId === directoryPriorityBody.requestId,
+        );
+        expect(directoryPolls.length).toBeGreaterThan(0);
+        expect(directoryPolls.at(-1)?.body.status).toBe("done");
+        await expect(lateLink).toHaveAttribute("role", "link");
+        await expect(lateLink).toHaveAttribute(
+          "aria-label",
+          "Open LateDefinition UML definition",
+        );
+      } finally {
+        directoryDoneGate.release();
+        await page.unroute(preprocessRoutePattern, directoryDoneGate.handler);
+      }
+
+      const definitionResetHistoryStart = watch.history.length;
+      await appendFile(
+        join(fixtureRoot, lateLocation.path),
+        "export const lateGenerationReset = true;\n",
       );
+      await expect.poll(
+        () =>
+          watch.history.findIndex(
+            (message, index) =>
+              index >= definitionResetHistoryStart &&
+              message.type === "changed" &&
+              message.paths.some((path) =>
+                path.replaceAll("\\", "/").endsWith(lateLocation.path)
+              ),
+          ),
+        {
+          message: "a changed watcher generation for the late definition source",
+          timeout: 30_000,
+        },
+      ).toBeGreaterThanOrEqual(definitionResetHistoryStart);
 
       const firstLookup = page.waitForResponse((response) => {
         const url = new URL(response.url());
@@ -993,6 +1252,129 @@ test("navigates definitions within the active surface and cancels stale priority
           response.body.requestId === priorityBody.requestId,
       )).toBe(true);
       expect(latePolls.at(-1)?.body.status).toBe("done");
+
+      const repeatedDirectoryFileRequests: Request[] = [];
+      const observeRepeatedDirectoryFileRequest = (request: Request): void => {
+        const url = new URL(request.url());
+        if (
+          url.pathname === "/api/file" &&
+          url.searchParams.get("path") === lateLocation.path
+        ) {
+          repeatedDirectoryFileRequests.push(request);
+        }
+      };
+      page.on("request", observeRepeatedDirectoryFileRequest);
+      try {
+        const repeatRefreshHistoryStart = watch.history.length;
+        const repeatDoneGate = createZLateDonePollGate();
+        await page.route(preprocessRoutePattern, repeatDoneGate.handler);
+        try {
+          const repeatDirectoryPriorityResponse = page.waitForResponse((response) => {
+            if (new URL(response.url()).pathname !== "/api/preprocess") return false;
+            const body = response.request().postDataJSON() as PreprocessControlRequest;
+            return body.action === "prioritize" && body.resource === "./z-late";
+          });
+          await page.locator('.tree-row[data-tree-path="z-late"]').click();
+          const repeatDirectoryPriorityBody =
+            await (await repeatDirectoryPriorityResponse).json() as PreprocessPriorityResponse;
+          expect(repeatDirectoryPriorityBody.status).not.toBe("done");
+          await expect(page.locator("#diagram-loading")).toBeVisible();
+          await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
+          await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
+
+          const heldRepeatDone = await withBound(
+            repeatDoneGate.captured,
+            30_000,
+            "correlated repeated z-late directory done poll",
+          );
+          await writeFile(
+            join(fixtureRoot, "refresh-trigger-cancel.ts"),
+            "export const refreshTriggerCancel = true;\n",
+          );
+          await expect.poll(
+            () =>
+              watch.history.findIndex(
+                (message, index) =>
+                  index >= repeatRefreshHistoryStart &&
+                  message.type === "changed" &&
+                  message.paths.some((path) =>
+                    path.includes("refresh-trigger-cancel.ts")
+                  ),
+              ),
+            {
+              message: "a changed watcher message for refresh-trigger-cancel.ts",
+              timeout: 30_000,
+            },
+          ).toBeGreaterThanOrEqual(repeatRefreshHistoryStart);
+          await afterTwoAnimationFrames();
+          expect(repeatedDirectoryFileRequests).toHaveLength(0);
+
+          const packagesDiagramResponse = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return url.pathname === "/api/diagram" &&
+              url.searchParams.get("kind") === "packages" &&
+              url.searchParams.get("path") === "";
+          });
+          await page.locator("#packages-mode").click();
+          expect((await packagesDiagramResponse).status()).toBe(200);
+          await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
+          await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
+          await expect(page.locator("#graph-panel")).toBeVisible();
+          await expect(page.locator("#editor-panel")).toBeHidden();
+          await expect(page.locator("#diagram-loading")).toBeHidden({
+            timeout: 30_000,
+          });
+          await expect(page.locator("#diagram-stage")).toHaveAttribute(
+            "aria-busy",
+            "false",
+          );
+          const packageDsl = page.locator("#dsl-content");
+          await expect(packageDsl).toContainText("flowchart LR");
+          const packageDslBeforeStaleRelease = await packageDsl.textContent();
+          if (packageDslBeforeStaleRelease === null) {
+            throw new Error("package DSL content was unavailable before stale release");
+          }
+          const fileRequestsBeforeStaleRelease =
+            repeatedDirectoryFileRequests.length;
+
+          repeatDoneGate.release();
+          await withBound(
+            repeatDoneGate.finished,
+            10_000,
+            "released repeated z-late directory done response",
+          );
+          expect(heldRepeatDone.request).toEqual({
+            action: "poll",
+            requestId: repeatDirectoryPriorityBody.requestId,
+          });
+          expect(heldRepeatDone.body).toEqual({
+            status: "done",
+            resource: "z-late",
+            requestId: repeatDirectoryPriorityBody.requestId,
+          });
+          await afterTwoAnimationFrames();
+
+          expect(repeatedDirectoryFileRequests).toHaveLength(
+            fileRequestsBeforeStaleRelease,
+          );
+          await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
+          await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
+          await expect(page.locator("#graph-panel")).toBeVisible();
+          await expect(page.locator("#editor-panel")).toBeHidden();
+          await expect(page.locator("#diagram-loading")).toBeHidden();
+          await expect(page.locator("#diagram-stage")).toHaveAttribute(
+            "aria-busy",
+            "false",
+          );
+          await expect(packageDsl).toHaveText(packageDslBeforeStaleRelease);
+          await expect(lateLink).toHaveCount(0);
+        } finally {
+          repeatDoneGate.release();
+          await page.unroute(preprocessRoutePattern, repeatDoneGate.handler);
+        }
+      } finally {
+        page.off("request", observeRepeatedDirectoryFileRequest);
+      }
 
       const immediateTreeRow = page.locator('.tree-row[data-tree-path="00-ready.ts"]');
       await page.locator('.tree-row[data-tree-path="zz-stale"]').click();
@@ -1069,7 +1451,25 @@ test("navigates definitions within the active surface and cancels stale priority
       await expect(page.locator(
         '#svg-holder .definition-target[data-source-path="zz-stale/stale-definition.ts"]',
       )).toHaveCount(0);
-      await withBound(watch.cacheReady, 45_000, "cache-ready before structured search");
+      const structuredSearchGeneration = watch.history.reduce(
+        (latest, message) =>
+          message.type === "changed" ? Math.max(latest, message.version) : latest,
+        -1,
+      );
+      await expect.poll(
+        () =>
+          watch.history.reduce(
+            (latest, message) =>
+              message.type === "cache-ready"
+                ? Math.max(latest, message.version)
+                : latest,
+            -1,
+          ),
+        {
+          message: "the latest watcher generation to finish before structured search",
+          timeout: 45_000,
+        },
+      ).toBeGreaterThanOrEqual(structuredSearchGeneration);
       await immediateTreeRow.click();
       await expect(page.locator("#editor-path")).toHaveText("00-ready.ts");
       await expect(page.locator("#editor-panel")).toBeVisible();
