@@ -25,6 +25,7 @@ import type {
   PreprocessControlRequest,
   PreprocessPriorityResponse,
   WatchMessage,
+  SearchResponse,
 } from "../../src/types.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -322,7 +323,9 @@ function cleanupResource(resource: TestResource): Promise<void> {
 async function cleanupAll(): Promise<void> {
   const pending = [...resources];
   const results = await Promise.allSettled(pending.map((resource) => cleanupResource(resource)));
-  pending.forEach((resource) => resources.delete(resource));
+  pending.forEach((resource) => {
+    resources.delete(resource);
+  });
   const failures = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => result.reason);
@@ -686,7 +689,8 @@ async function expectCliOutput(
   ).toContain(expected);
 }
 
-test.afterEach(async ({}, testInfo) => {
+test.afterEach(async ({ browserName }, testInfo) => {
+  void browserName;
   testInfo.setTimeout(20_000);
   await cleanupAll();
 });
@@ -1478,7 +1482,8 @@ test("navigates definitions within the active surface and cancels stale priority
       const searchResponse = page.waitForResponse((response) => {
         const url = new URL(response.url());
         return url.pathname === "/api/search" &&
-          url.searchParams.get("q") === "ImmediateDefinition";
+          url.searchParams.get("q") === "ImmediateDefinition" &&
+          url.searchParams.get("caseInsensitive") === "false";
       });
       await searchInput.fill("ImmediateDefinition");
       await searchInput.press("Enter");
@@ -1540,6 +1545,242 @@ test("navigates definitions within the active surface and cancels stale priority
     } finally {
       await observation.stop();
     }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("submits case-insensitive search only after Enter", async ({ browser }) => {
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-search-mode-e2e-"));
+    resource.fixtureRoot = fixtureRoot;
+    const fixturePath = join(fixtureRoot, "index.ts");
+    const initialSource = [
+      "export class MixedCaseWidget {",
+      '  value(): string { return "MixedCaseWidget"; }',
+      "}",
+      "",
+    ].join("\n");
+    await writeFile(fixturePath, initialSource);
+
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    const cli = resource.clis.at(-1);
+    if (!cli) throw new Error("managed CLI was not registered");
+    await expectCliOutput(cli, "TS explorer listening at", 30_000);
+    const initialReady = await withBound(
+      watch.cacheReady,
+      45_000,
+      "case-insensitive search cache-ready version 0",
+    );
+    await expect(page.locator('.tree-row[data-tree-path="index.ts"]')).toBeVisible({
+      timeout: 10_000,
+    });
+
+    const query = "mixedcasewidget";
+    const searchInput = page.locator("#node-search");
+    const checkbox = page.locator("#search-case-insensitive");
+    const definitionResult = page.locator("#definition-results .definition-result", {
+      hasText: "class · MixedCaseWidget",
+    }).filter({ hasText: "index.ts:1" });
+    const matchedTreeRow = page.locator(
+      '.tree-row.search-match[data-tree-path="index.ts"]',
+    );
+    const isSearchRequest = (request: Request, caseInsensitive: boolean): boolean => {
+      const url = new URL(request.url());
+      return url.pathname === "/api/search" &&
+        url.searchParams.get("q") === query &&
+        url.searchParams.get("caseInsensitive") === String(caseInsensitive);
+    };
+    const isSearchResponse = (response: Response, caseInsensitive: boolean): boolean =>
+      isSearchRequest(response.request(), caseInsensitive);
+    const observedSearchRequests: Request[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/search") {
+        observedSearchRequests.push(request);
+      }
+    });
+    const afterTwoAnimationFrames = (): Promise<void> =>
+      page.evaluate(() =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        })
+      );
+    const readSearchDom = () =>
+      page.evaluate(() => ({
+        definitions: [...document.querySelectorAll("#definition-results .definition-result")]
+          .map((element) => element.textContent),
+        matchedTreePaths: [...document.querySelectorAll<HTMLElement>("#tree .tree-row.search-match")]
+          .map((element) => element.dataset.treePath),
+        invalid: document.querySelector("#node-search")?.getAttribute("aria-invalid") ?? null,
+      }));
+
+    await expect(checkbox).not.toBeChecked();
+    const initialFalseResponse = page.waitForResponse(
+      (response) => isSearchResponse(response, false),
+    );
+    await searchInput.fill(query);
+    await searchInput.press("Enter");
+    const falseResponse = await initialFalseResponse;
+    expect(falseResponse.status()).toBe(200);
+    await falseResponse.finished();
+    await afterTwoAnimationFrames();
+    await expect(definitionResult).toHaveCount(0);
+    await expect(matchedTreeRow).toHaveCount(0);
+    await expect(searchInput).toHaveAttribute("aria-invalid", "true");
+
+    const falseDom = await readSearchDom();
+    const requestsBeforeCheckedToggle = observedSearchRequests.length;
+    await checkbox.check();
+    await afterTwoAnimationFrames();
+    expect(observedSearchRequests).toHaveLength(requestsBeforeCheckedToggle);
+    expect(await readSearchDom()).toEqual(falseDom);
+
+    const initialTrueResponse = page.waitForResponse(
+      (response) => isSearchResponse(response, true),
+    );
+    await searchInput.press("Enter");
+    expect((await initialTrueResponse).status()).toBe(200);
+    await expect(definitionResult).toBeVisible();
+    await expect(matchedTreeRow).toBeVisible();
+    await expect(searchInput).not.toHaveAttribute("aria-invalid");
+
+    const trueDom = await readSearchDom();
+    const requestsBeforeUncheckedToggle = observedSearchRequests.length;
+    await checkbox.uncheck();
+    await afterTwoAnimationFrames();
+    expect(observedSearchRequests).toHaveLength(requestsBeforeUncheckedToggle);
+    expect(await readSearchDom()).toEqual(trueDom);
+
+    let resolveFalseCaptured!: (request: Request) => void;
+    const falseCaptured = new Promise<Request>((resolve) => {
+      resolveFalseCaptured = resolve;
+    });
+    let releaseFalse!: () => void;
+    const falseRelease = new Promise<void>((resolve) => {
+      releaseFalse = resolve;
+    });
+    let gatedFalseRequest: Request | undefined;
+    const falseGate = async (route: Route): Promise<void> => {
+      const request = route.request();
+      if (gatedFalseRequest || !isSearchRequest(request, false)) {
+        await route.continue();
+        return;
+      }
+      gatedFalseRequest = request;
+      resolveFalseCaptured(request);
+      await falseRelease;
+      await route.continue();
+    };
+    await page.route("**/api/search?*", falseGate);
+
+    await searchInput.press("Enter");
+    expect(await withBound(falseCaptured, 10_000, "captured stale false-mode search"))
+      .toBe(gatedFalseRequest);
+    await expect(definitionResult).toHaveCount(0);
+    await expect(matchedTreeRow).toHaveCount(0);
+
+    await checkbox.check();
+    const racingTrueResponse = page.waitForResponse(
+      (response) => isSearchResponse(response, true),
+    );
+    await searchInput.press("Enter");
+    expect((await racingTrueResponse).status()).toBe(200);
+    await expect(definitionResult).toBeVisible();
+    await expect(matchedTreeRow).toBeVisible();
+    const winningTrueDom = await readSearchDom();
+
+    const staleFalseResponse = page.waitForResponse(
+      (response) => isSearchResponse(response, false),
+    );
+    releaseFalse();
+    const releasedFalseResponse = await staleFalseResponse;
+    expect(releasedFalseResponse.status()).toBe(200);
+    await releasedFalseResponse.finished();
+    await page.unroute("**/api/search?*", falseGate);
+    await afterTwoAnimationFrames();
+    expect(await readSearchDom()).toEqual(winningTrueDom);
+    await expect(definitionResult).toBeVisible();
+    await expect(matchedTreeRow).toBeVisible();
+
+    let forcedFailureCount = 0;
+    const forceNextFalseFailure = async (route: Route): Promise<void> => {
+      if (forcedFailureCount > 0 || !isSearchRequest(route.request(), false)) {
+        await route.continue();
+        return;
+      }
+      forcedFailureCount += 1;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "forced search failure" }),
+      });
+    };
+    await page.route("**/api/search?*", forceNextFalseFailure);
+    await checkbox.uncheck();
+    const failedFalseResponse = page.waitForResponse(
+      (response) => isSearchResponse(response, false) && response.status() === 503,
+    );
+    await searchInput.press("Enter");
+    expect((await failedFalseResponse).status()).toBe(503);
+    await expect(page.locator("#status")).toHaveText("forced search failure");
+    await expect(definitionResult).toHaveCount(0);
+    await expect(matchedTreeRow).toHaveCount(0);
+    await expect(searchInput).toHaveAttribute("aria-invalid", "true");
+    expect(forcedFailureCount).toBe(1);
+    await page.unroute("**/api/search?*", forceNextFalseFailure);
+
+    const failedDom = await readSearchDom();
+    const requestsBeforePendingRefreshToggle = observedSearchRequests.length;
+    await checkbox.check();
+    await afterTwoAnimationFrames();
+    expect(observedSearchRequests).toHaveLength(requestsBeforePendingRefreshToggle);
+    expect(await readSearchDom()).toEqual(failedDom);
+    await expect(page.locator("#status")).toHaveText("forced search failure");
+
+    const automaticRefreshRequest = page.waitForRequest(
+      (request) => new URL(request.url()).pathname === "/api/search",
+      { timeout: 45_000 },
+    );
+    const refreshedFalseResponse = page.waitForResponse(async (response) => {
+      if (!isSearchResponse(response, false) || response.status() !== 200) return false;
+      const body = await response.json() as SearchResponse;
+      return body.caseInsensitive === false && body.version > initialReady.version;
+    }, { timeout: 45_000 });
+    await writeFile(
+      fixturePath,
+      initialSource.replace(
+        'return "MixedCaseWidget";',
+        'return "MixedCaseWidgetAfterRefresh";',
+      ),
+    );
+    await expectCliOutput(cli, "[sync] invalidate watch", 15_000);
+    expect(isSearchRequest(await automaticRefreshRequest, false)).toBe(true);
+    await expect.poll(
+      () =>
+        watch.history
+          .filter((message) =>
+            message.type === "cache-ready" && message.version > initialReady.version
+          )
+          .at(-1)?.version ?? initialReady.version,
+      {
+        message: `a promoted cache-ready version after editing the search fixture\n${describeCli(cli)}`,
+        timeout: 45_000,
+      },
+    ).toBeGreaterThan(initialReady.version);
+    const refreshResponse = await refreshedFalseResponse;
+    const refreshBody = await refreshResponse.json() as SearchResponse;
+    expect(refreshBody.caseInsensitive).toBe(false);
+    expect(refreshBody.files).toEqual([]);
+    expect(refreshBody.definitions).toEqual([]);
+    await expect(checkbox).toBeChecked();
+    await expect(definitionResult).toHaveCount(0);
+    await expect(matchedTreeRow).toHaveCount(0);
+    await expect(searchInput).toHaveAttribute("aria-invalid", "true");
   } finally {
     await cleanupResource(resource);
   }

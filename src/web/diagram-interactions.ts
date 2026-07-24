@@ -60,9 +60,12 @@ export function formatUmlMethodReturnLabel(text: string): string | undefined {
   return returnType ? `\u00a0\u00a0${returnType}` : undefined;
 }
 
-export function matchesSearchQuery(candidate: string, query: string): boolean {
-  const normalized = query.trim().toLowerCase();
-  return normalized.length > 0 && candidate.toLowerCase().includes(normalized);
+export function matchesSearchQuery(candidate: string, query: string, caseInsensitive: boolean): boolean {
+  const comparisonQuery = query.trim();
+  if (comparisonQuery.length === 0) return false;
+  return caseInsensitive
+    ? candidate.toLowerCase().includes(comparisonQuery.toLowerCase())
+    : candidate.includes(comparisonQuery);
 }
 
 export function adjacentTreeRowIndex(

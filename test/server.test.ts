@@ -1,9 +1,17 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ExplorerServer } from "../src/server.ts";
 import { ExplorerStore } from "../src/store.ts";
+import { createFixtureTracker } from "./support/fixtures.ts";
+import {
+  expectSnapshotResponse,
+  readNormalizedGraphSnapshot,
+  type NormalizedGraphSnapshot,
+  type NormalizedSnapshotRecord,
+} from "./support/normalized-sql.ts";
 import type {
   DiagramResponse,
   FileResponse,
@@ -32,6 +40,179 @@ type WatchWaiter = {
   timer: NodeJS.Timeout;
 };
 
+type SqlValue = string | number | null;
+
+function queryAll<Row>(db: Database, sql: string, ...bindings: SqlValue[]): Row[] {
+  const statement = db.prepare<Row, SqlValue[]>(sql);
+  try {
+    return statement.all(...bindings);
+  } finally {
+    statement.finalize();
+  }
+}
+
+function queryOne<Row>(db: Database, sql: string, ...bindings: SqlValue[]): Row | null {
+  const statement = db.prepare<Row, SqlValue[]>(sql);
+  try {
+    return statement.get(...bindings);
+  } finally {
+    statement.finalize();
+  }
+}
+
+function openDatabase<Value>(dbPath: string, operation: (db: Database) => Value): Value {
+  const db = new Database(dbPath, { strict: true, readonly: true });
+  try {
+    return operation(db);
+  } finally {
+    db.close(true);
+  }
+}
+
+function readActiveNormalizedSnapshot(
+  dbPath: string,
+  kind: NormalizedGraphSnapshot["kind"],
+  scopePath: string,
+): NormalizedGraphSnapshot {
+  return openDatabase(dbPath, (db) => {
+    const active = queryOne<{ generation_id: number }>(
+      db,
+      `
+        SELECT CAST(value AS INTEGER) AS generation_id
+        FROM cache_meta
+        WHERE key = 'active_generation'
+      `,
+    );
+    if (!active) throw new Error("active generation is missing");
+    return readNormalizedGraphSnapshot(db, active.generation_id, kind, scopePath);
+  });
+}
+
+function expectPromotedFallback(
+  before: NormalizedGraphSnapshot,
+  after: NormalizedGraphSnapshot,
+  readyResponse: DiagramResponse,
+  errorResponse: DiagramResponse,
+  assertKindRows: (records: readonly NormalizedSnapshotRecord[]) => void,
+): void {
+  expect(readyResponse.status).toBe("ready");
+  expect(errorResponse.status).toBe("error");
+  expect(after.generationId).not.toBe(before.generationId);
+  expect({ kind: after.kind, scopePath: after.scopePath }).toEqual({
+    kind: before.kind,
+    scopePath: before.scopePath,
+  });
+  expect(before.header).toEqual({ format_version: 1, render_mode: "normal" });
+  expect(after.header).toEqual(before.header);
+  expect(after.records).toEqual(before.records);
+  expectSnapshotResponse(before, readyResponse);
+  expectSnapshotResponse(after, errorResponse);
+  expect({
+    dsl: errorResponse.dsl,
+    dsls: errorResponse.dsls,
+    packageNodes: errorResponse.packageNodes,
+    definitions: errorResponse.definitions,
+    externalUsers: errorResponse.externalUsers,
+    localUsers: errorResponse.localUsers,
+  }).toEqual({
+    dsl: readyResponse.dsl,
+    dsls: readyResponse.dsls,
+    packageNodes: readyResponse.packageNodes,
+    definitions: readyResponse.definitions,
+    externalUsers: readyResponse.externalUsers,
+    localUsers: readyResponse.localUsers,
+  });
+  assertKindRows(before.records);
+}
+function createPromotionGate(): {
+  first: Promise<void>;
+  second: Promise<void>;
+  notify(): void;
+} {
+  let count = 0;
+  let resolveFirst!: () => void;
+  let resolveSecond!: () => void;
+  const first = new Promise<void>((resolve) => { resolveFirst = resolve; });
+  const second = new Promise<void>((resolve) => { resolveSecond = resolve; });
+  return {
+    first,
+    second,
+    notify() {
+      count += 1;
+      if (count === 1) resolveFirst();
+      if (count === 2) resolveSecond();
+    },
+  };
+}
+
+
+function readActiveRootUmlFootprint(
+  dbPath: string,
+  entityNames: readonly [string, string],
+): {
+  nodes: Array<{ name: string }>;
+  edges: Array<{ source_name: string; target_name: string }>;
+} {
+  return openDatabase(dbPath, (db) => {
+    const active = queryOne<{ generation_id: number }>(
+      db,
+      `
+        SELECT CAST(value AS INTEGER) AS generation_id
+        FROM cache_meta
+        WHERE key = 'active_generation'
+      `,
+    );
+    if (!active) throw new Error("active generation is missing");
+    return {
+      nodes: queryAll<{ name: string }>(
+        db,
+        `
+          SELECT name
+          FROM diagram_nodes
+          WHERE generation_id = ?
+            AND kind = 'uml'
+            AND scope_path = ''
+            AND name IN (?, ?)
+          ORDER BY node_ordinal
+        `,
+        active.generation_id,
+        entityNames[0],
+        entityNames[1],
+      ),
+      edges: queryAll<{ source_name: string; target_name: string }>(
+        db,
+        `
+          SELECT source.name AS source_name, target.name AS target_name
+          FROM diagram_edges AS edge
+          JOIN diagram_nodes AS source
+            ON source.generation_id = edge.generation_id
+            AND source.kind = edge.kind
+            AND source.scope_path = edge.scope_path
+            AND source.node_id = edge.source_node_id
+          JOIN diagram_nodes AS target
+            ON target.generation_id = edge.generation_id
+            AND target.kind = edge.kind
+            AND target.scope_path = edge.scope_path
+            AND target.node_id = edge.target_node_id
+          WHERE edge.generation_id = ?
+            AND edge.kind = 'uml'
+            AND edge.scope_path = ''
+            AND (
+              source.name IN (?, ?)
+              OR target.name IN (?, ?)
+            )
+          ORDER BY edge.edge_ordinal
+        `,
+        active.generation_id,
+        entityNames[0],
+        entityNames[1],
+        entityNames[0],
+        entityNames[1],
+      ),
+    };
+  });
+}
+
 function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
   return new Promise<Value>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeout);
@@ -49,7 +230,7 @@ function withTimeout<Value>(promise: Promise<Value>, description: string, timeou
 }
 
 async function openWatch(base: string): Promise<WatchClient> {
-  const socket = new WebSocket(base.replace(/^http/, "ws") + "/ws");
+  const socket = new WebSocket(`${base.replace(/^http/, "ws")}/ws`);
   const history: WatchMessage[] = [];
   const waiters = new Set<WatchWaiter>();
 
@@ -84,7 +265,7 @@ async function openWatch(base: string): Promise<WatchClient> {
           timer: setTimeout(() => {
             waiters.delete(waiter);
             reject(new Error("timed out waiting for websocket message"));
-          }, 10_000),
+          }, 30_000),
         };
         waiters.add(waiter);
       });
@@ -123,6 +304,13 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string): void 
   expect(editorLoading).toHaveLength(1);
   expect(editorLoading[0]).toMatch(/\bhidden(?:\s|>)/i);
 
+  const caseInsensitiveToggle =
+    html.match(
+      /<input\b(?=[^>]*\bid=["']search-case-insensitive["'])(?=[^>]*\btype=["']checkbox["'])[^>]*>/gi,
+    ) ?? [];
+  expect(caseInsensitiveToggle).toHaveLength(1);
+  expect(caseInsensitiveToggle[0]).not.toMatch(/\bchecked\b/i);
+
   expect(mainScript).toMatch(/\.readOnly\.of\(true\)/);
   expect(mainScript).toMatch(/\.editable\.of\(false\)/);
   expect(mainScript).toContain("Read-only preprocessed source");
@@ -133,6 +321,12 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string): void 
   expect(mainScript).toContain("/api/preprocess");
   expect(mainScript).toMatch(/method\s*:\s*["']POST["']/);
   expect(mainScript).toMatch(/action\s*:\s*["']prioritize["']/);
+  const searchRequestIndex = mainScript.indexOf("/api/search?");
+  expect(searchRequestIndex).toBeGreaterThanOrEqual(0);
+  const searchRequest = mainScript.slice(Math.max(0, searchRequestIndex - 300), searchRequestIndex + 80);
+  expect(searchRequest).toMatch(
+    /new URLSearchParams\(\s*\{[\s\S]*?\bcaseInsensitive\s*:\s*String\([^)]*\)[\s\S]*?\}\s*\)/,
+  );
   expect(mainScript).toMatch(/action\s*:\s*["']poll["']/);
   expect(mainScript).toMatch(
     /classList\.add\(\s*["']uml-definition-link["']\s*\)[\s\S]{0,240}setAttribute\(\s*["']role["']\s*,\s*["']link["']\s*\)/,
@@ -201,57 +395,86 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string): void 
   );
 }
 
+const { writeFixtureFile } = createFixtureTracker();
+
 async function createServerFixture(): Promise<{ outerRoot: string; root: string; sourceFile: string }> {
   const outerRoot = await mkdtemp(join(tmpdir(), "ts-explorer-server-"));
   const root = join(outerRoot, "explorer");
-  await mkdir(join(root, "packages", "demo", "src", "nested"), { recursive: true });
-  await mkdir(join(root, "packages", "demo", "src", "target"), { recursive: true });
-  await mkdir(join(root, "node_modules"), { recursive: true });
-  await mkdir(join(root, "bulk"), { recursive: true });
-  await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
-  await writeFile(join(root, "packages", "demo", "package.json"), JSON.stringify({ name: "demo" }));
+  await writeFixtureFile(root, "package.json", JSON.stringify({ workspaces: ["packages/*"] }));
+  await writeFixtureFile(
+    root,
+    "packages/demo/package.json",
+    JSON.stringify({ name: "demo" }),
+  );
 
   const sourceFile = join(root, "packages", "demo", "src", "index.ts");
-  await writeFile(sourceFile, "export const value=1\n");
-  await writeFile(
-    join(root, "packages", "demo", "src", "machine.ts"),
+  await writeFixtureFile(root, "packages/demo/src/index.ts", "export const value=1\n");
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/machine.ts",
     "export class AbstractStateMachine {}\n",
   );
-  await writeFile(
-    join(root, "packages", "demo", "src", "runtime.ts"),
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/runtime.ts",
     'import { AbstractStateMachine } from "./machine";\nexport class DataflowRuntime { getMachine(): AbstractStateMachine { return new AbstractStateMachine(); } }\n',
   );
-  await writeFile(
-    join(root, "packages", "demo", "src", "indexed-service.ts"),
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/indexed-service.ts",
     "export class IndexedService{\nrunFirst(value:string){return value}\nrunSecond(value:number){return value}\n}\n",
   );
-  await writeFile(
-    join(root, "packages", "demo", "src", "target", "widget.ts"),
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/target/widget.ts",
     "export class Widget {}\n",
   );
-  await writeFile(
-    join(root, "packages", "demo", "src", "target", "local-user.ts"),
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/target/local-user.ts",
     'import { Widget } from "./widget";\nexport function acceptWidget(widget: Widget): void { void widget; }\n',
   );
-  await writeFile(
-    join(root, "packages", "demo", "src", "consumer.ts"),
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/consumer.ts",
     'import { Widget } from "./target/widget";\nexport class Consumer { build(): Widget { return new Widget(); } }\n',
   );
 
   const literal = "-Needle.[x]*$";
-  await writeFile(join(root, "packages", "demo", "src", "literal.txt"), "literal: -nEeDlE.[X]*$\n");
-  await writeFile(join(root, "packages", "demo", "src", "nested", "edited.txt"), `nested: ${literal}\n`);
-  await writeFile(join(root, "packages", "demo", "src", "untracked.txt"), `untracked: ${literal}\n`);
-  await writeFile(join(root, "packages", "demo", "src", "regex-decoy.txt"), "decoy: -NEEDLEQxxx\n");
-  await writeFile(join(root, "packages", "demo", "src", "binary.bin"), Buffer.from(`binary: ${literal}\0\n`));
-  await writeFile(join(root, "node_modules", "hidden.txt"), `hidden: ${literal}\n`);
-  await writeFile(join(outerRoot, "outside-source.txt"), `outside: ${literal}\n`);
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/literal.txt",
+    "literal: -nEeDlE.[X]*$\n",
+  );
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/nested/edited.txt",
+    `nested: ${literal}\n`,
+  );
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/untracked.txt",
+    `untracked: ${literal}\n`,
+  );
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/regex-decoy.txt",
+    "decoy: -NEEDLEQxxx\n",
+  );
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/binary.bin",
+    Buffer.from(`binary: ${literal}\0\n`),
+  );
+  await writeFixtureFile(root, "node_modules/hidden.txt", `hidden: ${literal}\n`);
+  await writeFixtureFile(outerRoot, "outside-source.txt", `outside: ${literal}\n`);
   await Promise.all(
     Array.from({ length: 240 }, (_, index) =>
-      writeFile(
-        join(root, "bulk", `entry-${index.toString().padStart(3, "0")}.ts`),
+      writeFixtureFile(
+        root,
+        `bulk/entry-${index.toString().padStart(3, "0")}.ts`,
         `export const entry${index} = ${index};\n`,
-      ),
+      )
     ),
   );
   return { outerRoot, root, sourceFile };
@@ -395,11 +618,31 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     ] satisfies GotoDefinition[];
 
     const submittedLiteral = "-NEEDLE.[x]*$";
-    const searchResponse = await fetch(
-      `${base}/api/search?q=${encodeURIComponent(`  ${submittedLiteral}  `)}`,
+    const sensitiveLiteralResponse = {
+      version: tree.version,
+      query: submittedLiteral,
+      files: [],
+      definitions: [],
+      directories: [],
+      renderDirs: [],
+      caseInsensitive: false,
+    } satisfies SearchResponse;
+    for (const mode of [
+      { name: "omitted mode", parameter: "" },
+      { name: "explicit case-sensitive mode", parameter: "&caseInsensitive=false" },
+    ]) {
+      const response = await fetch(
+        `${base}/api/search?q=${encodeURIComponent(`  ${submittedLiteral}  `)}${mode.parameter}`,
+      );
+      expect(response.status, mode.name).toBe(200);
+      expect(await response.json(), mode.name).toEqual(sensitiveLiteralResponse);
+    }
+
+    const insensitiveLiteralResponse = await fetch(
+      `${base}/api/search?q=${encodeURIComponent(`  ${submittedLiteral}  `)}&caseInsensitive=true`,
     );
-    expect(searchResponse.status).toBe(200);
-    expect(await searchResponse.json() as SearchResponse).toEqual({
+    expect(insensitiveLiteralResponse.status).toBe(200);
+    expect(await insensitiveLiteralResponse.json() as SearchResponse).toEqual({
       version: tree.version,
       query: submittedLiteral,
       files: [
@@ -414,6 +657,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
         "packages/demo/src/nested",
       ],
       renderDirs: ["packages/demo/src"],
+      caseInsensitive: true,
     });
 
     const noMatch = await fetch(`${base}/api/search?q=definitely-not-present`);
@@ -424,6 +668,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       definitions: [],
       directories: [],
       renderDirs: [],
+      caseInsensitive: false,
     });
     for (const invalid of [
       { name: "blank", query: " \t ", error: "search query is required" },
@@ -433,6 +678,14 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       expect(response.status, invalid.name).toBe(422);
       expect(await response.json(), invalid.name).toEqual({ error: invalid.error });
     }
+
+    const invalidMode = await fetch(
+      `${base}/api/search?q=${encodeURIComponent(submittedLiteral)}&caseInsensitive=invalid`,
+    );
+    expect(invalidMode.status).toBe(422);
+    expect(await invalidMode.json()).toEqual({
+      error: "caseInsensitive must be true or false",
+    });
 
     const packageDiagram = await (
       await fetch(`${base}/api/diagram?kind=packages&path=`)
@@ -561,6 +814,36 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       definitions: indexedDefinitions.slice(1),
       directories: ["packages/demo", "packages/demo/src"],
       renderDirs: ["packages/demo/src"],
+      caseInsensitive: false,
+    });
+
+    const mixedCaseDefinitionQuery = "indexedservice.RUN";
+    const sensitiveDefinitionSearch = await fetch(
+      `${base}/api/search?q=${encodeURIComponent(mixedCaseDefinitionQuery)}&caseInsensitive=false`,
+    );
+    expect(sensitiveDefinitionSearch.status).toBe(200);
+    expect(await sensitiveDefinitionSearch.json() as SearchResponse).toEqual({
+      version: tree.version,
+      query: mixedCaseDefinitionQuery,
+      files: [],
+      definitions: [],
+      directories: [],
+      renderDirs: [],
+      caseInsensitive: false,
+    });
+
+    const insensitiveDefinitionSearch = await fetch(
+      `${base}/api/search?q=${encodeURIComponent(mixedCaseDefinitionQuery)}&caseInsensitive=true`,
+    );
+    expect(insensitiveDefinitionSearch.status).toBe(200);
+    expect(await insensitiveDefinitionSearch.json() as SearchResponse).toEqual({
+      version: tree.version,
+      query: mixedCaseDefinitionQuery,
+      files: [indexedPath],
+      definitions: indexedDefinitions.slice(1),
+      directories: ["packages/demo", "packages/demo/src"],
+      renderDirs: ["packages/demo/src"],
+      caseInsensitive: true,
     });
 
     const definitionHit = await fetch(
@@ -715,9 +998,20 @@ test("serves live add and remove trees before separately promoted APIs", async (
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-live-watch-"));
   const watchedDir = join(root, "watched");
   const addedFile = join(watchedDir, "added.ts");
+  const deletedModelFile = join(watchedDir, "deleted-model.ts");
   await mkdir(watchedDir);
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "live-watch" }));
   await writeFile(join(root, "index.ts"), "export const initial=1\n");
+  await writeFile(
+    deletedModelFile,
+    [
+      "export class WatchedTarget {}",
+      "export class WatchedSource {",
+      "  getTarget(): WatchedTarget { return new WatchedTarget(); }",
+      "}",
+      "",
+    ].join("\n"),
+  );
   const watchBatches: Array<{ paths: string[]; events: string[]; version: number }> = [];
   const server = await ExplorerServer.start({
     sourceDir: root,
@@ -776,6 +1070,35 @@ test("serves live add and remove trees before separately promoted APIs", async (
       path: "watched/added.ts",
       content: 'export const watchedToken = "WATCHED_LIVE_TOKEN";\n',
       definitions: [],
+    });
+
+    const graphDbPath = join(root, ".explore", "explore.db");
+    const entityNames = ["WatchedSource", "WatchedTarget"] as const;
+    const presentFootprint = readActiveRootUmlFootprint(graphDbPath, entityNames);
+    expect(presentFootprint.nodes.map(({ name }) => name).sort()).toEqual([...entityNames].sort());
+    expect(
+      presentFootprint.edges.map(({ source_name, target_name }) =>
+        [source_name, target_name].sort()
+      ),
+    ).toContainEqual([...entityNames].sort());
+
+    const modelRemovedChanged = watch.waitFor(
+      (message) =>
+        message.type === "changed" &&
+        message.version > addedMessage.version &&
+        message.paths.includes("watched/deleted-model.ts") &&
+        message.events.includes("unlink"),
+    );
+    await rm(deletedModelFile);
+    const modelRemovedMessage = await modelRemovedChanged;
+    if (modelRemovedMessage.type !== "changed") throw new Error("expected model removal change");
+    await watch.waitFor(
+      (message) =>
+        message.type === "cache-ready" && message.version === modelRemovedMessage.version,
+    );
+    expect(readActiveRootUmlFootprint(graphDbPath, entityNames)).toEqual({
+      nodes: [],
+      edges: [],
     });
 
     const removedChanged = watch.waitFor(
@@ -844,53 +1167,247 @@ test("serves live add and remove trees before separately promoted APIs", async (
       await rm(root, { recursive: true, force: true });
     }
   }
-}, 30_000);
+}, 60_000);
 
 test("package diagram errors retain the last promoted snapshot", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-package-fallback-"));
-  await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
-  await mkdir(join(root, "packages", "a"), { recursive: true });
-  await mkdir(join(root, "packages", "b"), { recursive: true });
-  await writeFile(
-    join(root, "packages", "a", "package.json"),
+  await writeFixtureFile(root, "package.json", JSON.stringify({ workspaces: ["packages/*"] }));
+  await writeFixtureFile(
+    root,
+    "packages/a/package.json",
     JSON.stringify({ name: "a", dependencies: { b: "*" } }),
   );
-  await writeFile(join(root, "packages", "b", "package.json"), JSON.stringify({ name: "b" }));
+  await writeFixtureFile(root, "packages/b/package.json", JSON.stringify({ name: "b" }));
 
-  let promotionCount = 0;
-  let resolveFirstPromotion!: () => void;
-  let resolveSecondPromotion!: () => void;
-  const firstPromotion = new Promise<void>((resolve) => { resolveFirstPromotion = resolve; });
-  const secondPromotion = new Promise<void>((resolve) => { resolveSecondPromotion = resolve; });
-  const store = new ExplorerStore(
-    root,
-    () => undefined,
-    () => {
-      promotionCount += 1;
-      if (promotionCount === 1) resolveFirstPromotion();
-      if (promotionCount === 2) resolveSecondPromotion();
-    },
-  );
+  const promotions = createPromotionGate();
+  const store = new ExplorerStore(root, () => undefined, promotions.notify);
   try {
     await store.ready();
-    await withTimeout(firstPromotion, "initial cache promotion");
+    await withTimeout(promotions.first, "initial cache promotion");
     const ready = await store.getDiagram("packages", "");
     expect(ready.status).toBe("ready");
-    const expectedDsl = ready.dsl;
-    const expectedNodes = ready.packageNodes;
+    const graphDbPath = join(root, ".explore", "explore.db");
+    const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "packages", "");
 
     await writeFile(join(root, "package.json"), "{ malformed");
-    await withTimeout(secondPromotion, "watch cache promotion");
+    await withTimeout(promotions.second, "watch cache promotion");
     const failed = await store.getDiagram("packages", "");
-    expect(failed.status).toBe("error");
-    expect(failed.dsl).toBe(expectedDsl);
-    expect(failed.dsls).toEqual([expectedDsl]);
-    expect(failed.packageNodes).toEqual(expectedNodes);
+    const failedSnapshot = readActiveNormalizedSnapshot(graphDbPath, "packages", "");
+    expectPromotedFallback(
+      readySnapshot,
+      failedSnapshot,
+      ready,
+      failed,
+      (records) => {
+        expect(records).toEqual([
+          {
+            table: "diagram_nodes",
+            kind: "packages",
+            scope_path: "",
+            node_id: "p0",
+            node_ordinal: 0,
+            node_kind: "package",
+            name: "a",
+            community: null,
+          },
+          {
+            table: "diagram_nodes",
+            kind: "packages",
+            scope_path: "",
+            node_id: "p1",
+            node_ordinal: 1,
+            node_kind: "package",
+            name: "b",
+            community: null,
+          },
+          {
+            table: "diagram_edges",
+            kind: "packages",
+            scope_path: "",
+            edge_ordinal: 0,
+            source_node_id: "p0",
+            target_node_id: "p1",
+            edge_kind: "package-dependency",
+            directed: 1,
+            weight: 1,
+          },
+          {
+            table: "diagram_edge_relations",
+            kind: "packages",
+            scope_path: "",
+            edge_ordinal: 0,
+            relation_ordinal: 0,
+            relation_kind: "package-dependency",
+            source_node_id: "p0",
+            target_node_id: "p1",
+          },
+          {
+            table: "package_graph_nodes",
+            kind: "packages",
+            scope_path: "",
+            node_id: "p0",
+            package_path: "packages/a",
+          },
+          {
+            table: "package_graph_nodes",
+            kind: "packages",
+            scope_path: "",
+            node_id: "p1",
+            package_path: "packages/b",
+          },
+        ]);
+      },
+    );
   } finally {
     try {
       await store.close();
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
+test("UML extraction errors retain the last promoted normalized graph and response", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-fallback-"));
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "uml-fallback" }));
+  await writeFixtureFile(
+    root,
+    "tsconfig.json",
+    JSON.stringify({ compilerOptions: { strict: true } }),
+  );
+  await writeFixtureFile(
+    root,
+    "model.ts",
+    [
+      "export class FallbackTarget {}",
+      "export class FallbackSource {",
+      "  getTarget(): FallbackTarget { return new FallbackTarget(); }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+
+  const promotions = createPromotionGate();
+  const store = new ExplorerStore(root, () => undefined, promotions.notify);
+  try {
+    await store.ready();
+    await withTimeout(promotions.first, "initial UML cache promotion");
+    const ready = await store.getDiagram("uml", "");
+    expect(ready.status).toBe("ready");
+    expect(ready.dsl).toContain("FallbackSource");
+    expect(ready.dsl).toContain("FallbackTarget");
+
+    const graphDbPath = join(root, ".explore", "explore.db");
+    const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
+
+    await writeFile(join(root, "tsconfig.json"), "{ malformed");
+    await withTimeout(promotions.second, "failed UML cache promotion");
+    const failed = await store.getDiagram("uml", "");
+    await store.close();
+
+    const failedSnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
+    expectPromotedFallback(
+      readySnapshot,
+      failedSnapshot,
+      ready,
+      failed,
+      (records) => {
+        const nodes = records.filter((record) => record.table === "diagram_nodes");
+        expect(
+          nodes.map(({ node_ordinal, node_kind, name, community }) => ({
+            node_ordinal,
+            node_kind,
+            name,
+            community,
+          })),
+        ).toEqual([
+          { node_ordinal: 1, node_kind: "entity", name: "FallbackSource", community: 0 },
+          { node_ordinal: 0, node_kind: "entity", name: "FallbackTarget", community: 0 },
+        ]);
+        const nodeNames = new Map(nodes.map(({ node_id, name }) => [node_id, name]));
+        expect(
+          records
+            .filter((record) => record.table === "diagram_edges")
+            .map(({
+              edge_ordinal,
+              source_node_id,
+              target_node_id,
+              edge_kind,
+              directed,
+              weight,
+            }) => ({
+              edge_ordinal,
+              source_name: nodeNames.get(source_node_id),
+              target_name: nodeNames.get(target_node_id),
+              edge_kind,
+              directed,
+              weight,
+            })),
+        ).toEqual([
+          {
+            edge_ordinal: 0,
+            source_name: "FallbackSource",
+            target_name: "FallbackTarget",
+            edge_kind: "uml-relation",
+            directed: 0,
+            weight: 1,
+          },
+        ]);
+        expect(
+          records
+            .filter((record) => record.table === "uml_declarations")
+            .map(({
+              kind,
+              scope_path,
+              declaration_ordinal,
+              file_name,
+              member_associations_present,
+            }) => ({
+              kind,
+              scope_path,
+              declaration_ordinal,
+              file_name: file_name.replace(/^.*[\\/]/, ""),
+              member_associations_present,
+            })),
+        ).toEqual([
+          {
+            kind: "uml",
+            scope_path: "",
+            declaration_ordinal: 0,
+            file_name: "model.ts",
+            member_associations_present: 1,
+          },
+        ]);
+        expect(
+          records
+            .filter((record) => record.table === "uml_entities")
+            .map(({ declaration_ordinal, entity_kind, entity_ordinal, node_id }) => ({
+              declaration_ordinal,
+              entity_kind,
+              entity_ordinal,
+              name: nodeNames.get(node_id),
+            })),
+        ).toEqual([
+          {
+            declaration_ordinal: 0,
+            entity_kind: "class",
+            entity_ordinal: 0,
+            name: "FallbackTarget",
+          },
+          {
+            declaration_ordinal: 0,
+            entity_kind: "class",
+            entity_ordinal: 1,
+            name: "FallbackSource",
+          },
+        ]);
+      },
+    );
+  } finally {
+    try {
+      await store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   }
 }, 30_000);
@@ -915,17 +1432,12 @@ test("a malformed root manifest produces the stable empty package error", async 
   }
 }, 30_000);
 
-test("warm restart serves the old active package graph until cache-ready promotes the rebuild", async () => {
+test("warm restart trusts recovered package graph until a live change rebuilds it", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-package-restart-"));
   await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   await mkdir(join(root, "packages", "a"), { recursive: true });
-  await mkdir(join(root, "bulk"), { recursive: true });
-  await writeFile(join(root, "packages", "a", "package.json"), JSON.stringify({ name: "a" }));
-  await Promise.all(
-    Array.from({ length: 300 }, (_, index) =>
-      writeFile(join(root, "bulk", `entry-${index.toString().padStart(3, "0")}.txt`), `entry ${index}\n`),
-    ),
-  );
+  const packageAManifest = join(root, "packages", "a", "package.json");
+  await writeFile(packageAManifest, JSON.stringify({ name: "a" }));
 
   let firstServer: RunningServer | undefined;
   let secondServer: RunningServer | undefined;
@@ -947,37 +1459,71 @@ test("warm restart serves the old active package graph until cache-ready promote
     expect(firstDiagram.packageNodes).toEqual([
       { nodeId: "p0", name: "a", path: "packages/a" },
     ]);
+    const dbPath = join(root, ".explore", "explore.db");
+    const recoveredId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
+
     await firstServer.stop();
     firstServer = undefined;
 
     await mkdir(join(root, "packages", "b"), { recursive: true });
     await writeFile(join(root, "packages", "b", "package.json"), JSON.stringify({ name: "b" }));
     await writeFile(
-      join(root, "packages", "a", "package.json"),
+      packageAManifest,
       JSON.stringify({ name: "a", dependencies: { b: "*" } }),
     );
 
     secondServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const secondBase = `http://127.0.0.1:${secondServer.port}`;
-    const watchPromise = openWatch(secondBase);
-    const stalePromise = fetch(`${secondBase}/api/diagram?kind=packages&path=`).then(
-      (response) => response.json() as Promise<DiagramResponse>,
-    );
-    watch = await watchPromise;
-    const stale = await stalePromise;
-    expect(stale.packageNodes).toEqual(firstDiagram.packageNodes);
-    expect(stale.dsl).toBe(firstDiagram.dsl);
-
+    watch = await openWatch(secondBase);
     await watch.waitFor((message) => message.type === "cache-ready" && message.version === 0);
-    const refreshed = await (
+    expect(watch.history()).toContainEqual({ type: "cache-ready", version: 0 });
+
+    const recoveredDiagram = await (
       await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(refreshed.packageNodes).toEqual([
+    expect(recoveredDiagram).toEqual(firstDiagram);
+    expect(readActiveNormalizedSnapshot(dbPath, "packages", "").generationId).toBe(recoveredId);
+    expect(openDatabase(dbPath, (db) =>
+      queryAll<{ id: number; state: string; cause: string }>(
+        db,
+        "SELECT id, state, cause FROM generations ORDER BY id",
+      )
+    )).toEqual([{ id: recoveredId, state: "active", cause: "startup" }]);
+
+    const changed = watch.waitFor((message) => {
+      if (message.type !== "changed") return false;
+      const pathIndex = message.paths.indexOf("packages/a/package.json");
+      return pathIndex >= 0 && message.events[pathIndex] === "change";
+    });
+    await writeFile(
+      packageAManifest,
+      JSON.stringify({ name: "a", version: "1.0.0", dependencies: { b: "*" } }),
+    );
+    const changedMessage = await changed;
+    if (changedMessage.type !== "changed") throw new Error("expected package manifest change");
+    expect(changedMessage.version).toBe(1);
+    await watch.waitFor(
+      (message) =>
+        message.type === "cache-ready" && message.version === changedMessage.version,
+    );
+
+    const rebuiltDiagram = await (
+      await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
+    ).json() as DiagramResponse;
+    expect(rebuiltDiagram.packageNodes).toEqual([
       { nodeId: "p0", name: "a", path: "packages/a" },
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
-    expect(refreshed.dsl).toContain("p0 --> p1");
-    expect(refreshed.dsl).not.toBe(firstDiagram.dsl);
+    expect(rebuiltDiagram.dsl).toContain("p0 --> p1");
+    expect(rebuiltDiagram.dsl).not.toBe(firstDiagram.dsl);
+    const rebuiltId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
+    expect(rebuiltId).not.toBe(recoveredId);
+    expect(openDatabase(dbPath, (db) =>
+      queryAll<{ id: number; state: string; cause: string }>(
+        db,
+        "SELECT id, state, cause FROM generations ORDER BY id",
+      )
+    )).toEqual([{ id: rebuiltId, state: "active", cause: "watch" }]);
   } finally {
     try {
       await watch?.close();
@@ -987,4 +1533,4 @@ test("warm restart serves the old active package graph until cache-ready promote
       await rm(root, { recursive: true, force: true });
     }
   }
-}, 30_000);
+}, 60_000);

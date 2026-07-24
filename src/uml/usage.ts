@@ -1,8 +1,12 @@
 import { Node, Project } from "ts-morph";
 import type {
+  ClassDeclaration,
+  EnumDeclaration,
+  InterfaceDeclaration,
   ParameterDeclaration,
   Symbol as MorphSymbol,
   Type,
+  TypeAliasDeclaration,
 } from "ts-morph";
 import type { FileDeclaration } from "tsuml2/dist/core/model";
 import {
@@ -11,18 +15,14 @@ import {
   type ParsedEntityKind,
 } from "../goto-definition.ts";
 import { bareUmlName, scopeRelativePath, umlEntityKey, umlFileKey } from "./keys.ts";
+import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
 import { formatSignatureType } from "./mermaid.ts";
 import type {
   CategoryMap,
   ExternalUserNode,
-  ExternalUserTarget,
   LocalUserNode,
-  MethodReturnDependency,
-  ReferenceDeclaration,
-  ReferenceOwner,
-  UmlAnalysis,
-  UmlEntityReference,
-  UmlUsageEdge,
+  UmlDependency,
+  UmlReference,
 } from "./model.ts";
 import { isDeclarationPath } from "../source.ts";
 import type {
@@ -30,6 +30,33 @@ import type {
   UmlExternalUserKind,
   UmlSourceLocation,
 } from "../types.ts";
+
+type ReferenceOwner = {
+  scopePath: string;
+  signature: string;
+  kind: UmlExternalUserKind;
+  source: UmlSourceLocation;
+  ownerEntityKey?: string;
+};
+
+type ReferenceDeclaration = {
+  declarationNode: Node;
+  nameNode: Node;
+  target: UmlReference;
+};
+
+type UmlEntityDeclaration =
+  | ClassDeclaration
+  | InterfaceDeclaration
+  | TypeAliasDeclaration
+  | EnumDeclaration;
+
+function isUmlEntityDeclaration(node: Node | undefined): node is UmlEntityDeclaration {
+  return Node.isClassDeclaration(node)
+    || Node.isInterfaceDeclaration(node)
+    || Node.isTypeAliasDeclaration(node)
+    || Node.isEnumDeclaration(node);
+}
 
 function parameterTypes(parameters: readonly ParameterDeclaration[]): string {
   return parameters.map((parameter) =>
@@ -60,25 +87,12 @@ function owningTypeName(node: Node): string | undefined {
   return owner?.getName();
 }
 
-function enclosingEntityDeclaration(node: Node): Node | undefined {
-  return node.getFirstAncestor((ancestor) =>
-    Node.isClassDeclaration(ancestor)
-    || Node.isInterfaceDeclaration(ancestor)
-    || Node.isTypeAliasDeclaration(ancestor)
-    || Node.isEnumDeclaration(ancestor)
-  );
+function enclosingEntityDeclaration(node: Node): UmlEntityDeclaration | undefined {
+  return node.getFirstAncestor(isUmlEntityDeclaration);
 }
 
 function entityDeclarationName(node: Node | undefined): string | undefined {
-  if (
-    Node.isClassDeclaration(node)
-    || Node.isInterfaceDeclaration(node)
-    || Node.isTypeAliasDeclaration(node)
-    || Node.isEnumDeclaration(node)
-  ) {
-    return node.getName();
-  }
-  return undefined;
+  return isUmlEntityDeclaration(node) ? node.getName() : undefined;
 }
 
 function referenceSource(sourceDir: string, node: Node): UmlSourceLocation {
@@ -96,10 +110,7 @@ function isDeclarationName(node: Node): boolean {
   if (
     !parent
     || !(
-      Node.isClassDeclaration(parent)
-      || Node.isInterfaceDeclaration(parent)
-      || Node.isTypeAliasDeclaration(parent)
-      || Node.isEnumDeclaration(parent)
+      isUmlEntityDeclaration(parent)
       || Node.isFunctionDeclaration(parent)
       || Node.isVariableDeclaration(parent)
       || Node.isMethodDeclaration(parent)
@@ -213,14 +224,14 @@ function classifyReferenceOwner(
     }
   }
 
-  const constructor = reference.getFirstAncestor(Node.isConstructorDeclaration);
-  if (constructor) {
-    const owner = owningTypeName(constructor);
+  const constructorDeclaration = reference.getFirstAncestor(Node.isConstructorDeclaration);
+  if (constructorDeclaration) {
+    const owner = owningTypeName(constructorDeclaration);
     if (owner) {
       return result(
-        `${owner}.constructor(${parameterTypes(constructor.getParameters())})`,
+        `${owner}.constructor(${parameterTypes(constructorDeclaration.getParameters())})`,
         "constructor",
-        constructor,
+        constructorDeclaration,
       );
     }
   }
@@ -295,12 +306,12 @@ function collectUsageGraph(
   sourceDir: string,
   inScopeFiles: ReadonlySet<string>,
   declarations: readonly ReferenceDeclaration[],
-  entities: ReadonlyMap<string, UmlEntityReference>,
+  entities: ReadonlyMap<string, UmlReference>,
   fileDeclarations: readonly FileDeclaration[],
-  methodReturnDependencies: readonly MethodReturnDependency[],
+  methodReturnDependencies: readonly UmlDependency[],
   ignoredExternalUserFiles: ReadonlySet<string>,
 ): {
-  usageEdges: UmlUsageEdge[];
+  usageEdges: UmlDependency[];
   localUserNodes: LocalUserNode[];
   externalUserNodes: ExternalUserNode[];
 } {
@@ -314,16 +325,16 @@ function collectUsageGraph(
     directedKeys.add(`${dependency.sourceId}\0${dependency.targetId}`);
   }
 
-  const usageEdges: UmlUsageEdge[] = [];
+  const usageEdges: UmlDependency[] = [];
   const localGroups = new Map<string, ReferenceOwner & {
     ownerEntityId?: string;
-    targets: Map<string, ExternalUserTarget>;
+    targets: Map<string, UmlReference>;
   }>();
   const externalGroups = new Map<string, {
     scopePath: string;
     signature: string;
     kind: UmlExternalUserKind;
-    targets: Map<string, ExternalUserTarget>;
+    targets: Map<string, UmlReference>;
   }>();
 
   for (const declaration of declarations) {
@@ -363,7 +374,7 @@ function collectUsageGraph(
           group = {
             ...user,
             ...(userEntity ? { ownerEntityId: userEntity.id } : {}),
-            targets: new Map<string, ExternalUserTarget>(),
+            targets: new Map<string, UmlReference>(),
           };
           localGroups.set(key, group);
         }
@@ -380,7 +391,7 @@ function collectUsageGraph(
           scopePath: user.scopePath,
           signature: user.signature,
           kind: user.kind,
-          targets: new Map<string, ExternalUserTarget>(),
+          targets: new Map<string, UmlReference>(),
         };
         externalGroups.set(key, group);
       }
@@ -438,20 +449,6 @@ function collectUsageGraph(
   return { usageEdges, localUserNodes, externalUserNodes };
 }
 
-type RenderedEntity = UmlEntityReference & {
-  methods?: readonly { name: string }[];
-};
-
-function renderedEntities(
-  declaration: FileDeclaration,
-): Array<{ kind: ParsedEntityKind; entity: RenderedEntity }> {
-  return [
-    ...declaration.classes.map((entity) => ({ kind: "class" as const, entity })),
-    ...declaration.interfaces.map((entity) => ({ kind: "interface" as const, entity })),
-    ...declaration.enums.map((entity) => ({ kind: "enum" as const, entity })),
-    ...declaration.types.map((entity) => ({ kind: "type" as const, entity })),
-  ];
-}
 
 function parsedDeclarationKey(
   kind: ParsedEntityKind,
@@ -461,12 +458,13 @@ function parsedDeclarationKey(
   return `${kind}\0${name}\0${occurrence}`;
 }
 
-function collectGotoDefinitions(
+function collectRenderedModel(
   sourceDir: string,
   project: Project,
   declarations: readonly FileDeclaration[],
-): GotoDefinition[] {
+): { definitions: GotoDefinition[]; entities: Map<string, UmlReference> } {
   const definitions: GotoDefinition[] = [];
+  const entities = new Map<string, UmlReference>();
   for (const declaration of declarations) {
     const sourceFile = project.getSourceFileOrThrow(declaration.fileName);
     const parsed = parseDefinitionSpans(sourceFile.getFilePath(), sourceFile.getFullText());
@@ -490,58 +488,61 @@ function collectGotoDefinitions(
     const entityOccurrences = new Map<string, number>();
     const renderedMethodOccurrences = new Map<string, number>();
     const scopePath = scopeRelativePath(sourceDir, sourceFile.getFilePath());
-    for (const { kind, entity } of renderedEntities(declaration)) {
-      const bareName = bareUmlName(entity.name);
-      const counterKey = `${kind}\0${bareName}`;
-      const entityOccurrence = entityOccurrences.get(counterKey) ?? 0;
-      entityOccurrences.set(counterKey, entityOccurrence + 1);
-      const declarationKey = parsedDeclarationKey(kind, bareName, entityOccurrence);
-      const parsedEntity = entitiesByKey.get(declarationKey);
-      if (!parsedEntity) continue;
-      definitions.push({
-        key: parsedEntity.key,
-        kind: parsedEntity.kind,
-        name: parsedEntity.name,
-        qualifiedName: parsedEntity.qualifiedName,
-        source: {
-          path: scopePath,
-          line: parsedEntity.line,
-          column: parsedEntity.column,
-        },
-        uml: {
-          scopePath,
-          entityName: entity.name,
-        },
-      });
-
-      const parsedMethods = methodsByEntity.get(declarationKey) ?? [];
-      const usedMethods = new Set<string>();
-      for (const renderedMethod of entity.methods ?? []) {
-        const occurrenceKey = `${bareName}\0${renderedMethod.name}`;
-        const memberOccurrence = renderedMethodOccurrences.get(occurrenceKey) ?? 0;
-        renderedMethodOccurrences.set(occurrenceKey, memberOccurrence + 1);
-        const parsedMethod = parsedMethods.find((candidate) =>
-          candidate.memberName === renderedMethod.name && !usedMethods.has(candidate.key)
-        );
-        if (!parsedMethod) continue;
-        usedMethods.add(parsedMethod.key);
+    for (const descriptor of UML_ENTITY_COLLECTIONS) {
+      for (const entity of descriptor.entities(declaration)) {
+        const bareName = bareUmlName(entity.name);
+        entities.set(umlEntityKey(declaration.fileName, bareName), entity);
+        const counterKey = `${descriptor.kind}\0${bareName}`;
+        const entityOccurrence = entityOccurrences.get(counterKey) ?? 0;
+        entityOccurrences.set(counterKey, entityOccurrence + 1);
+        const declarationKey = parsedDeclarationKey(descriptor.kind, bareName, entityOccurrence);
+        const parsedEntity = entitiesByKey.get(declarationKey);
+        if (!parsedEntity) continue;
         definitions.push({
-          key: parsedMethod.key,
-          kind: "method",
-          name: parsedMethod.name,
-          qualifiedName: parsedMethod.qualifiedName,
+          key: parsedEntity.key,
+          kind: parsedEntity.kind,
+          name: parsedEntity.name,
+          qualifiedName: parsedEntity.qualifiedName,
           source: {
             path: scopePath,
-            line: parsedMethod.line,
-            column: parsedMethod.column,
+            line: parsedEntity.line,
+            column: parsedEntity.column,
           },
           uml: {
             scopePath,
             entityName: entity.name,
-            memberName: renderedMethod.name,
-            memberOccurrence,
           },
         });
+
+        const parsedMethods = methodsByEntity.get(declarationKey) ?? [];
+        const usedMethods = new Set<string>();
+        for (const renderedMethod of "methods" in entity ? entity.methods : []) {
+          const occurrenceKey = `${bareName}\0${renderedMethod.name}`;
+          const memberOccurrence = renderedMethodOccurrences.get(occurrenceKey) ?? 0;
+          renderedMethodOccurrences.set(occurrenceKey, memberOccurrence + 1);
+          const parsedMethod = parsedMethods.find((candidate) =>
+            candidate.memberName === renderedMethod.name && !usedMethods.has(candidate.key)
+          );
+          if (!parsedMethod) continue;
+          usedMethods.add(parsedMethod.key);
+          definitions.push({
+            key: parsedMethod.key,
+            kind: "method",
+            name: parsedMethod.name,
+            qualifiedName: parsedMethod.qualifiedName,
+            source: {
+              path: scopePath,
+              line: parsedMethod.line,
+              column: parsedMethod.column,
+            },
+            uml: {
+              scopePath,
+              entityName: entity.name,
+              memberName: renderedMethod.name,
+              memberOccurrence,
+            },
+          });
+        }
       }
     }
   }
@@ -551,7 +552,7 @@ function collectGotoDefinitions(
     || left.source.column - right.source.column
     || left.key.localeCompare(right.key)
   );
-  return definitions;
+  return { definitions, entities };
 }
 
 export function analyzeUmlTypes(
@@ -562,35 +563,24 @@ export function analyzeUmlTypes(
   tsconfig: string | undefined,
   categories: CategoryMap,
   ignoredExternalUserFiles: ReadonlySet<string>,
-): UmlAnalysis {
+): {
+  methodReturnDependencies: UmlDependency[];
+  usageEdges: UmlDependency[];
+  definitions: GotoDefinition[];
+  localUserNodes: LocalUserNode[];
+  externalUserNodes: ExternalUserNode[];
+} {
   const project = new Project({
     skipAddingFilesFromTsConfig: true,
     ...(tsconfig ? { tsConfigFilePath: tsconfig } : {}),
   });
   for (const file of projectFiles) project.addSourceFileAtPath(file);
 
-  const entities = new Map<string, UmlEntityReference>();
-  for (const declaration of declarations) {
-    for (const entity of [
-      ...declaration.classes,
-      ...declaration.interfaces,
-      ...declaration.enums,
-      ...declaration.types,
-    ]) {
-      entities.set(umlEntityKey(declaration.fileName, bareUmlName(entity.name)), entity);
-    }
-  }
+  const { definitions, entities } = collectRenderedModel(sourceDir, project, declarations);
 
-  const resolveSymbol = (symbol: MorphSymbol | undefined): UmlEntityReference | undefined => {
+  const resolveSymbol = (symbol: MorphSymbol | undefined): UmlReference | undefined => {
     for (const declaration of symbol?.getDeclarations() ?? []) {
-      if (
-        !Node.isClassDeclaration(declaration)
-        && !Node.isInterfaceDeclaration(declaration)
-        && !Node.isEnumDeclaration(declaration)
-        && !Node.isTypeAliasDeclaration(declaration)
-      ) {
-        continue;
-      }
+      if (!isUmlEntityDeclaration(declaration)) continue;
       const name = declaration.getName();
       if (!name) continue;
       const entity = entities.get(umlEntityKey(declaration.getSourceFile().getFilePath(), name));
@@ -599,11 +589,11 @@ export function analyzeUmlTypes(
     return undefined;
   };
 
-  const methodReturnDependencies: MethodReturnDependency[] = [];
+  const methodReturnDependencies: UmlDependency[] = [];
   const dependencyKeys = new Set<string>();
   const collectDependencies = (
     type: Type,
-    source: UmlEntityReference,
+    source: UmlReference,
     visited: Set<object>,
   ): void => {
     if (visited.has(type.compilerType)) return;
@@ -630,19 +620,25 @@ export function analyzeUmlTypes(
     for (const nested of type.getTypeArguments()) collectDependencies(nested, source, visited);
   };
 
-  const definitions = collectGotoDefinitions(sourceDir, project, declarations);
   const referenceDeclarations: ReferenceDeclaration[] = [];
+  const registerReferenceDeclaration = (
+    declaration: UmlEntityDeclaration,
+  ): UmlReference | undefined => {
+    const name = declaration.getName();
+    const nameNode = declaration.getNameNode();
+    if (!name || !nameNode) return undefined;
+    const source = entities.get(umlEntityKey(declaration.getSourceFile().getFilePath(), name));
+    if (!source) return undefined;
+    referenceDeclarations.push({ declarationNode: declaration, nameNode, target: source });
+    return source;
+  };
 
   for (const file of sourceFiles) {
     const sourceFile = project.getSourceFileOrThrow(file);
 
     for (const declaration of sourceFile.getClasses()) {
-      const name = declaration.getName();
-      const nameNode = declaration.getNameNode();
-      if (!name || !nameNode) continue;
-      const source = entities.get(umlEntityKey(sourceFile.getFilePath(), name));
+      const source = registerReferenceDeclaration(declaration);
       if (!source) continue;
-      referenceDeclarations.push({ declarationNode: declaration, nameNode, target: source });
       if (declaration.isAbstract()) {
         const existing = categories.get(source.name);
         if (existing) existing.category = "abstract";
@@ -652,25 +648,15 @@ export function analyzeUmlTypes(
     }
 
     for (const declaration of sourceFile.getInterfaces()) {
-      const source = entities.get(umlEntityKey(sourceFile.getFilePath(), declaration.getName()));
+      const source = registerReferenceDeclaration(declaration);
       if (!source) continue;
-      referenceDeclarations.push({
-        declarationNode: declaration,
-        nameNode: declaration.getNameNode(),
-        target: source,
-      });
       const methods = declaration.getMethods();
       for (const method of methods) collectDependencies(method.getReturnType(), source, new Set());
     }
 
     for (const declaration of sourceFile.getTypeAliases()) {
-      const source = entities.get(umlEntityKey(sourceFile.getFilePath(), declaration.getName()));
+      const source = registerReferenceDeclaration(declaration);
       if (!source) continue;
-      referenceDeclarations.push({
-        declarationNode: declaration,
-        nameNode: declaration.getNameNode(),
-        target: source,
-      });
       const typeNode = declaration.getTypeNode();
       if (Node.isTypeLiteral(typeNode)) {
         for (const method of typeNode.getMethods()) {
@@ -680,13 +666,7 @@ export function analyzeUmlTypes(
     }
 
     for (const declaration of sourceFile.getEnums()) {
-      const source = entities.get(umlEntityKey(sourceFile.getFilePath(), declaration.getName()));
-      if (!source) continue;
-      referenceDeclarations.push({
-        declarationNode: declaration,
-        nameNode: declaration.getNameNode(),
-        target: source,
-      });
+      if (!registerReferenceDeclaration(declaration)) continue;
     }
   }
 

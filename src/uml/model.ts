@@ -1,106 +1,31 @@
-import type { UndirectedGraph } from "graphology";
-import type { Node } from "ts-morph";
-import type {
-  GotoDefinition,
-  UmlExternalUserKind,
-  UmlLocalUser,
-  UmlSourceLocation,
-  UmlExternalUser,
-} from "../types.ts";
+import type { UmlDiagramGraph } from "../diagram-graph.ts";
+import type { UmlExternalUser, UmlLocalUser } from "../types.ts";
 
-type UmlGraphNodeKind = "entity" | "boundary" | "local-user" | "external-user";
-
-type UmlGraphRelationKind =
-  | "heritage"
-  | "member-association"
-  | "method-return"
-  | "usage"
-  | "local-user"
-  | "external-user";
-
-export type UmlGraphNodeAttributes = {
-  kind: UmlGraphNodeKind;
-  name: string;
-  aliases?: string[];
-  community?: number;
-};
-
-export type UmlGraphRelation = {
-  kind: UmlGraphRelationKind;
-  sourceId: string;
-  targetId: string;
-};
-
-export type UmlGraphEdgeAttributes = {
-  weight: number;
-  relations: UmlGraphRelation[];
-};
-
-export type UmlGraph = UndirectedGraph<UmlGraphNodeAttributes, UmlGraphEdgeAttributes>;
-
-export type UmlDiagramBundle = {
-  dsl: string;
-  dsls: string[];
-  definitions: GotoDefinition[];
-  externalUsers: UmlExternalUser[];
-  localUsers: UmlLocalUser[];
-  graph: UmlGraph;
-};
-
-export type UmlUsageEdge = {
+export type UmlDependency = {
   sourceId: string;
   sourceName: string;
   targetId: string;
   targetName: string;
 };
 
-export type MethodReturnDependency = UmlUsageEdge;
-
-export type UmlEntityReference = {
-  id: string;
-  name: string;
-};
-
-export type ExternalUserTarget = {
+export type UmlReference = {
   id: string;
   name: string;
 };
 
 export type ExternalUserNode = {
   navigation: UmlExternalUser;
-  targets: ExternalUserTarget[];
+  targets: UmlReference[];
 };
 
 export type LocalUserNode = {
   navigation: UmlLocalUser;
   ownerEntityId?: string;
-  targets: ExternalUserTarget[];
-};
-
-export type ReferenceOwner = {
-  scopePath: string;
-  signature: string;
-  kind: UmlExternalUserKind;
-  source: UmlSourceLocation;
-  ownerEntityKey?: string;
-};
-
-export type ReferenceDeclaration = {
-  declarationNode: Node;
-  nameNode: Node;
-  target: ExternalUserTarget;
-};
-
-export type UmlAnalysis = {
-  methodReturnDependencies: MethodReturnDependency[];
-  usageEdges: UmlUsageEdge[];
-  definitions: GotoDefinition[];
-  localUserNodes: LocalUserNode[];
-  externalUserNodes: ExternalUserNode[];
+  targets: UmlReference[];
 };
 
 type UmlCategory = {
-  category: string;
+  category: UmlDiagramGraph["categories"][number]["category"];
   test: boolean;
 };
 

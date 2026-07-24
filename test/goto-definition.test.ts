@@ -291,7 +291,12 @@ test("keys distinguish declaration merges and overloads while remaining stable a
     { line: 5, column: 3 },
     { line: 6, column: 3 },
   ]);
-  expect(formattedDefinitions[3]!.from).not.toBe(compactDefinitions[3]!.from);
+  const compactRun = compactDefinitions[3];
+  const formattedRun = formattedDefinitions[3];
+  if (!compactRun || !formattedRun) {
+    throw new Error("expected merged interface run definitions");
+  }
+  expect(formattedRun.from).not.toBe(compactRun.from);
 });
 
 test("excludes declarations that have no canonical UML definition target", () => {

@@ -159,8 +159,19 @@ export class ExplorerServer {
         });
       }
       if (url.pathname === "/api/search") {
+        const caseInsensitiveValue = url.searchParams.get("caseInsensitive");
+        if (
+          caseInsensitiveValue !== null
+          && caseInsensitiveValue !== "true"
+          && caseInsensitiveValue !== "false"
+        ) {
+          throw new InputError("caseInsensitive must be true or false");
+        }
         return Response.json(
-          await this.store.search(url.searchParams.get("q") ?? ""),
+          await this.store.search(
+            url.searchParams.get("q") ?? "",
+            caseInsensitiveValue === "true",
+          ),
         );
       }
       if (url.pathname === "/api/diagram") {

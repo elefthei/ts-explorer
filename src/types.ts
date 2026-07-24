@@ -99,6 +99,7 @@ export type UmlLocalUser = UmlSourceLocation & {
 export type SearchResponse = {
   version: number;
   query: string;
+  caseInsensitive: boolean;
   files: string[];
   definitions: GotoDefinition[];
   directories: string[];

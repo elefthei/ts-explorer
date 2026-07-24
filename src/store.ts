@@ -94,14 +94,14 @@ export class ExplorerStore {
     return this.fromPreprocessor(() => this.preprocessor.getPackages());
   }
 
-  async search(query: string): Promise<SearchResponse> {
+  async search(query: string, caseInsensitive: boolean): Promise<SearchResponse> {
     const normalized = query.trim();
     if (!normalized) throw new InputError("search query is required");
     if (/[\r\n]/.test(normalized)) {
       throw new InputError("search query must be one line");
     }
     const result = await this.fromPreprocessor(() =>
-      this.preprocessor.search(normalized),
+      this.preprocessor.search(normalized, caseInsensitive),
     );
     return { version: this.version, ...result };
   }

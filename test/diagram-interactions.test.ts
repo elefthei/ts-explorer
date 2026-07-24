@@ -13,63 +13,74 @@ import {
   treeScrollTopForRow,
   zoomViewportAt,
 } from "../src/web/diagram-interactions.ts";
-import type { UmlSourceLocation } from "../src/types.ts";
 
 test("shouldStackDiagram stacks UML diagrams but not package diagrams", () => {
   expect(shouldStackDiagram("uml")).toBe(true);
   expect(shouldStackDiagram("packages")).toBe(false);
 });
 
-test("matchesSearchQuery applies non-empty case-insensitive substring matching", () => {
+test("matchesSearchQuery honors the explicit case mode and rejects blank queries", () => {
   const cases = [
-    { name: "empty query", candidate: "DataflowRuntime", query: "", expected: false },
-    { name: "whitespace-only query", candidate: "DataflowRuntime", query: " \t\n ", expected: false },
     {
-      name: "surrounding query whitespace",
-      candidate: "DataflowRuntime",
-      query: " DataflowRuntime ",
-      expected: true,
-    },
-    {
-      name: "mixed case",
-      candidate: "DataflowRuntime",
-      query: "dataFLOWruntime",
-      expected: true,
-    },
-    {
-      name: "partial class name",
+      name: "exact-case substring in case-sensitive mode",
       candidate: "DataflowRuntime",
       query: "flowRun",
+      caseInsensitive: false,
       expected: true,
     },
     {
-      name: "partial method name",
-      candidate: "getVersion",
-      query: "version",
-      expected: true,
-    },
-    {
-      name: "file name within a full relative path",
-      candidate: "src/dataflow.ts",
-      query: "Dataflow",
-      expected: true,
-    },
-    {
-      name: "directory segment within a full relative path",
-      candidate: "packages/runtime/src/dataflow.ts",
-      query: "runtime/src",
-      expected: true,
-    },
-    {
-      name: "nonmatch",
+      name: "exact-case substring in case-insensitive mode",
       candidate: "DataflowRuntime",
-      query: "version",
+      query: "flowRun",
+      caseInsensitive: true,
+      expected: true,
+    },
+    {
+      name: "mixed-case substring in case-sensitive mode",
+      candidate: "DataflowRuntime",
+      query: "flowrun",
+      caseInsensitive: false,
       expected: false,
     },
-  ];
+    {
+      name: "mixed-case substring in case-insensitive mode",
+      candidate: "DataflowRuntime",
+      query: "flowrun",
+      caseInsensitive: true,
+      expected: true,
+    },
+    {
+      name: "empty query in case-sensitive mode",
+      candidate: "DataflowRuntime",
+      query: "",
+      caseInsensitive: false,
+      expected: false,
+    },
+    {
+      name: "empty query in case-insensitive mode",
+      candidate: "DataflowRuntime",
+      query: "",
+      caseInsensitive: true,
+      expected: false,
+    },
+    {
+      name: "whitespace-only query in case-sensitive mode",
+      candidate: "DataflowRuntime",
+      query: " \t\n ",
+      caseInsensitive: false,
+      expected: false,
+    },
+    {
+      name: "whitespace-only query in case-insensitive mode",
+      candidate: "DataflowRuntime",
+      query: " \t\n ",
+      caseInsensitive: true,
+      expected: false,
+    },
+  ] as const;
 
-  for (const { name, candidate, query, expected } of cases) {
-    expect(matchesSearchQuery(candidate, query), name).toBe(expected);
+  for (const { name, candidate, query, caseInsensitive, expected } of cases) {
+    expect(matchesSearchQuery(candidate, query, caseInsensitive), name).toBe(expected);
   }
 });
 

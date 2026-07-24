@@ -13,6 +13,7 @@ export type PreprocessErrorCode =
   | "FORBIDDEN"
   | "NOT_FOUND"
   | "INVALID_INPUT"
+  | "SCHEMA_RETRY"
   | "INTERNAL";
 
 export type PreprocessCause = "startup" | "watch";
@@ -70,7 +71,13 @@ export type PreprocessRequest =
     line: number;
     column: number;
   }
-  | { id: number; type: "search"; generationId: number; query: string }
+  | {
+    id: number;
+    type: "search";
+    generationId: number;
+    query: string;
+    caseInsensitive: boolean;
+  }
   | { id: number; type: "promote-generation"; generationId: number }
   | {
     id: number;
@@ -130,6 +137,7 @@ const PREPROCESS_ERROR_CODES = new Set<PreprocessErrorCode>([
   "FORBIDDEN",
   "NOT_FOUND",
   "INVALID_INPUT",
+  "SCHEMA_RETRY",
   "INTERNAL",
 ]);
 

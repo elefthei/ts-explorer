@@ -36,8 +36,8 @@ type TreeNode={name:string;path:string;kind:"directory"|"file";children?:TreeNod
 type Diagram={kind:"packages"|"uml";scopePath:string;version:number;status:"ready"|"error";dsl:string;dsls:string[];packageNodes:PackageDiagramNode[];definitions:GotoDefinition[];externalUsers:UmlExternalUser[];localUsers:UmlLocalUser[];error?:string};
 type FileResponse={path:string;content:string;definitions:EditorGotoDefinition[];cursorOffset?:number};
 type WatchMessage={type:"changed";version:number;paths:string[];events:string[]}|{type:"cache-ready";version:number}|{type:"watch-error";version:number;error:string};
-const $=<T extends Element = HTMLInputElement>(selector:string)=>document.querySelector<T>(selector)!;
-const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
+function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
+const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
 const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
@@ -128,7 +128,7 @@ function decorateUmlDefinitions(root:Element,definitions:readonly GotoDefinition
   for(const node of root.querySelectorAll<SVGGElement>("g.node")){
     const match=/classId-(.+)-\d+$/.exec(node.id);
     if(!match)continue;
-    const entityName=match[1]!;
+    const entityName=match[1];if(entityName===undefined)continue;
     const candidates=ordered.filter((definition)=>bareDiagramName(definition.uml.entityName)===bareDiagramName(entityName));
     const entity=candidates.find((definition)=>definition.kind!=="method");
     const title=node.querySelector(".label-group .label, .classTitle");
@@ -165,7 +165,7 @@ function focusUmlDefinition(location:UmlSourceLocation):boolean{
     && Number(element.dataset.sourceColumn)===location.column
   );
   if(!target)return false;
-  document.querySelectorAll("#svg-holder .definition-target").forEach((element)=>element.classList.remove("definition-target"));
+  document.querySelectorAll("#svg-holder .definition-target").forEach((element)=>{element.classList.remove("definition-target");});
   target.classList.add("definition-target");
   target.scrollIntoView({block:"center",inline:"center"});
   target.focus({preventScroll:true});
@@ -181,7 +181,7 @@ function applySearchHighlights():void{
   }
   if(state.activeView==="uml"){
     for(const candidate of document.querySelectorAll<HTMLElement>("#svg-holder [data-search-text]")){
-      candidate.classList.toggle("search-match",matchesSearchQuery(candidate.dataset.searchText??"",state.search));
+      candidate.classList.toggle("search-match",matchesSearchQuery(candidate.dataset.searchText??"",state.search,state.searchCaseInsensitive));
     }
   }
   const failed=state.searchFiles.size===0;
@@ -228,7 +228,7 @@ function renderTree(){
     if(children.length&&expanded){
       const nested=document.createElement("div");
       nested.className="tree-children";
-      children.forEach((child)=>nested.append(child.element));
+      children.forEach((child)=>{nested.append(child.element);});
       wrap.append(nested);
     }
     return{element:wrap,hasSearchMatch};
@@ -473,20 +473,34 @@ async function renderSearchDiagrams(renderDirs:readonly string[],searchToken:num
     if(diagramRequests.isCurrent(renderToken))setDiagramLoading(false);
   }
 }
-async function commitSearch(query:string):Promise<void>{
+async function commitSearch(query:string,caseInsensitive:boolean):Promise<void>{
   if(!query){clearSearch();return;}
   definitionRequests.next();
   const activeView=state.activeView;
   const token=searchRequests.next();
   diagramRequests.next();
   setDiagramLoading(false);
+  state.search=query;
+  state.searchCaseInsensitive=caseInsensitive;
+  state.searchFiles=new Set();
+  state.searchDirs=new Set();
+  state.searchDefinitions=[];
+  renderDefinitionResults();
+  renderTree();
+  for(const element of document.querySelectorAll("#svg-holder .search-match"))element.classList.remove("search-match");
+  const input=$("#node-search");
+  input.classList.remove("no-match");
+  input.removeAttribute("aria-invalid");
   try{
-    const response=await api<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}`);
+    const params=new URLSearchParams({q:query,caseInsensitive:String(caseInsensitive)});
+    const response=await api<SearchResponse>(`/api/search?${params}`);
     if(!searchRequests.isCurrent(token))return;
+    if(response.caseInsensitive!==caseInsensitive)throw new Error("Search response mode mismatch");
     state.search=response.query;
     state.searchFiles=new Set(response.files);
     state.searchDirs=new Set(response.directories);
     state.searchDefinitions=response.definitions;
+    state.searchCaseInsensitive=response.caseInsensitive;
     state.version=response.version;
     renderDefinitionResults();
     renderTree();
@@ -499,6 +513,7 @@ async function commitSearch(query:string):Promise<void>{
   }catch(error){
     if(!searchRequests.isCurrent(token))return;
     state.search=query;
+    state.searchCaseInsensitive=caseInsensitive;
     state.searchFiles=new Set();
     state.searchDirs=new Set();
     state.searchDefinitions=[];
@@ -507,7 +522,7 @@ async function commitSearch(query:string):Promise<void>{
     setStatus(error instanceof Error?error.message:String(error),true);
   }
 }
-function activateView(view:"packages"|"uml"|"editor"){state.activeView=view;const activeButtonId=view==="editor"?"editor-mode":`${state.mode}-mode`;document.querySelectorAll(".mode").forEach((button)=>button.classList.toggle("active",button.id===activeButtonId));const editorActive=view==="editor";$("#graph-panel").hidden=editorActive;$("#editor-panel").hidden=!editorActive;const hasFile=state.file!==null;$("#editor-empty").hidden=hasFile;$("#editor-content").hidden=!hasFile;applySearchHighlights();}
+function activateView(view:"packages"|"uml"|"editor"){state.activeView=view;const activeButtonId=view==="editor"?"editor-mode":`${state.mode}-mode`;document.querySelectorAll(".mode").forEach((button)=>{button.classList.toggle("active",button.id===activeButtonId);});const editorActive=view==="editor";$("#graph-panel").hidden=editorActive;$("#editor-panel").hidden=!editorActive;const hasFile=state.file!==null;$("#editor-empty").hidden=hasFile;$("#editor-content").hidden=!hasFile;applySearchHighlights();}
 type DefinitionNavigationContext={
   definitionToken:number;
   diagramToken:number;
@@ -725,7 +740,7 @@ function refreshCachedViews():void{
     return;
   }
   if(state.file)void reloadOpenFile();
-  if(state.search&&state.mode==="uml"&&state.scope==="")void commitSearch(state.search);
+  if(state.search&&state.mode==="uml"&&state.scope==="")void commitSearch(state.search,state.searchCaseInsensitive);
   else void loadDiagram();
 }
 function handleWatch(message:WatchMessage){
@@ -778,12 +793,12 @@ tree.addEventListener("keydown",(event)=>{
   const nextIndex=adjacentTreeRowIndex(rows.indexOf(current),event.key==="ArrowUp"?-1:1,rows.length);
   if(nextIndex<0)return;
   event.preventDefault();
-  const next=rows[nextIndex]!;
+  const next=rows[nextIndex];if(!next)return;
   next.focus({preventScroll:true});
   scrollTreeRowIntoView(next);
 });
 const nodeSearch=$("#node-search");
-nodeSearch.onkeydown=(event)=>{if(event.key!=="Enter")return;event.preventDefault();void commitSearch(nodeSearch.value.trim());};
+nodeSearch.onkeydown=(event)=>{if(event.key!=="Enter")return;event.preventDefault();void commitSearch(nodeSearch.value.trim(),$("#search-case-insensitive").checked);};
 nodeSearch.oninput=()=>{if(nodeSearch.value!=="")return;clearSearch();};
 $("#packages-mode").onclick=()=>void selectScope({name:"Packages",path:"",kind:"directory"},"packages");
 $("#uml-mode").onclick=()=>void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");
