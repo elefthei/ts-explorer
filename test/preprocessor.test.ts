@@ -1,10 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Cache } from "../src/cache.ts";
+import { Cache, DiagramMaterializationError } from "../src/cache.ts";
+import type {
+  DiagramGraph,
+  RenderedDiagram,
+  UmlDiagramGraph,
+} from "../src/diagram-graph.ts";
 import { Preprocessor } from "../src/preprocessor.ts";
 import {
   isPreprocessProgressEvent,
@@ -13,8 +17,120 @@ import {
   type PreprocessResponse,
 } from "../src/preprocess-protocol.ts";
 import type { EditorGotoDefinition, GotoDefinition, TreeNode } from "../src/types.ts";
+import { createFixtureTracker } from "./support/fixtures.ts";
+import { renderDiagramGraph } from "./support/normalized-graph.ts";
+import {
+  expectOnlyNormalizedGeneration,
+  NORMALIZED_TABLE_SPECS,
+  normalizedGenerationIds,
+  type NormalizedTable,
+} from "./support/normalized-sql.ts";
 
-const roots: string[] = [];
+const NORMALIZED_GRAPH_TABLES = Object.keys(NORMALIZED_TABLE_SPECS) as NormalizedTable[];
+
+function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
+  return {
+    kind: "uml",
+    scopePath,
+    formatVersion: 1,
+    renderMode: "normal",
+    nodes: [
+      { nodeId: "a", nodeOrdinal: 0, nodeKind: "entity", name: "Alpha", community: 0 },
+      { nodeId: "b", nodeOrdinal: 1, nodeKind: "entity", name: "Beta", community: 0 },
+      { nodeId: "c", nodeOrdinal: 2, nodeKind: "entity", name: "Gamma", community: 0 },
+    ],
+    aliases: [{ nodeId: "a", aliasOrdinal: 0, alias: "AlphaAlias" }],
+    edges: [{
+      edgeOrdinal: 0,
+      sourceNodeId: "a",
+      targetNodeId: "b",
+      edgeKind: "uml-relation",
+      directed: false,
+      weight: 1,
+    }],
+    relations: [{
+      edgeOrdinal: 0,
+      relationOrdinal: 0,
+      relationKind: "usage",
+      sourceNodeId: "a",
+      targetNodeId: "b",
+    }],
+    settings: {
+      glob: scopePath,
+      tsconfig: null,
+      outFile: "",
+      propertyTypes: true,
+      modifiers: true,
+      typeLinks: true,
+      outDsl: "",
+      outMermaidDsl: "",
+      memberAssociations: true,
+      exportedTypesOnly: false,
+    },
+    settingLines: [],
+    declarations: [
+      { declarationOrdinal: 0, fileName: "alpha.ts", memberAssociationsPresent: false },
+      { declarationOrdinal: 1, fileName: "beta.ts", memberAssociationsPresent: false },
+      { declarationOrdinal: 2, fileName: "gamma.ts", memberAssociationsPresent: false },
+    ],
+    entities: [
+      { declarationOrdinal: 0, entityKind: "class", entityOrdinal: 0, nodeId: "a" },
+      { declarationOrdinal: 1, entityKind: "class", entityOrdinal: 0, nodeId: "b" },
+      { declarationOrdinal: 2, entityKind: "class", entityOrdinal: 0, nodeId: "c" },
+    ],
+    properties: [],
+    propertyTypeIds: [],
+    methods: [{
+      declarationOrdinal: 0,
+      entityKind: "class",
+      entityOrdinal: 0,
+      methodOrdinal: 0,
+      modifierFlags: 0,
+      name: "beta",
+      returnType: "Beta",
+      returnTypeIdsPresent: true,
+    }],
+    methodReturnTypeIds: [{
+      declarationOrdinal: 0,
+      entityKind: "class",
+      entityOrdinal: 0,
+      methodOrdinal: 0,
+      typeIdOrdinal: 0,
+      typeId: "b",
+    }],
+    enumItems: [],
+    entityHeritageClauses: [],
+    declarationHeritageGroups: [],
+    declarationHeritageClauses: [],
+    memberAssociations: [],
+    categories: [
+      { categoryOrdinal: 0, entityName: "Alpha", category: "concrete", isTest: false },
+      { categoryOrdinal: 1, entityName: "Beta", category: "concrete", isTest: false },
+      { categoryOrdinal: 2, entityName: "Gamma", category: "concrete", isTest: false },
+    ],
+    methodReturnDependencies: [],
+    usageEdges: [],
+    localUsers: [],
+    externalUsers: [],
+    localUserTargets: [],
+    externalUserTargets: [],
+    definitions: [],
+  };
+}
+
+function renderFixtureGraph(graph: DiagramGraph): RenderedDiagram {
+  return {
+    dsl: `${graph.kind}:${graph.scopePath}:${graph.nodes.map(({ name }) => name).join(",")}`,
+    dsls: [`${graph.kind}:${graph.scopePath}`],
+    packageNodes: [],
+    definitions: [],
+    externalUsers: [],
+    localUsers: [],
+  };
+}
+
+const fixtures = createFixtureTracker();
+const { temporaryRoot, writeFixtureFile } = fixtures;
 const preprocessors = new Set<Preprocessor>();
 const subprocesses = new Set<Bun.Subprocess>();
 
@@ -34,26 +150,15 @@ afterEach(async () => {
     }),
   );
   subprocesses.clear();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await fixtures.cleanup();
 });
-
-async function temporaryRoot(prefix: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(root);
-  return root;
-}
-
-async function writeFixtureFile(root: string, path: string, content: string | Uint8Array): Promise<void> {
-  const absolutePath = join(root, ...path.split("/"));
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, content);
-}
 
 function flattenTree(root: TreeNode): TreeNode[] {
   const nodes: TreeNode[] = [];
   const pending = [root];
   while (pending.length) {
-    const node = pending.pop()!;
+    const node = pending.pop();
+    if (node === undefined) throw new Error("tree traversal stack unexpectedly empty");
     nodes.push(node);
     pending.push(...(node.children ?? []));
   }
@@ -61,12 +166,39 @@ function flattenTree(root: TreeNode): TreeNode[] {
 }
 
 function openDatabase<T>(dbPath: string, operation: (db: Database) => T): T {
-  const db = new Database(dbPath, { strict: true });
+  let db: Database | null = new Database(dbPath, { strict: true });
   try {
     return operation(db);
   } finally {
     db.close();
+    db = null;
+    Bun.gc(true);
   }
+}
+
+function expectSearchSchema(
+  db: Database,
+  table: "files" | "GotoDef",
+  searchTable: "file_search" | "goto_def_search",
+  expectedTriggers: readonly string[],
+): void {
+  expect(db.query<{ name: string; type: string }, [string, string]>(`
+    SELECT name, type
+    FROM sqlite_schema
+    WHERE name IN (?, ?)
+    ORDER BY name
+  `).all(table, searchTable)).toEqual(
+    [
+      { name: table, type: "table" },
+      { name: searchTable, type: "table" },
+    ].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
+  );
+  expect(db.query<{ name: string }, [string]>(`
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'trigger' AND tbl_name = ?
+    ORDER BY name
+  `).all(table)).toEqual(expectedTriggers.map((name) => ({ name })));
 }
 
 function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
@@ -219,6 +351,11 @@ test("validates preprocessing response envelopes", () => {
     {
       name: "failure",
       value: { id: 2, ok: false, error: { code: "NOT_FOUND", message: "missing" } },
+      expected: true,
+    },
+    {
+      name: "schema retry failure",
+      value: { id: 7, ok: false, error: { code: "SCHEMA_RETRY", message: "repaired" } },
       expected: true,
     },
     { name: "non-boolean ok", value: { id: 3, ok: "true", value: null }, expected: false },
@@ -388,23 +525,49 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
     error: { code: "BAD_REQUEST" },
   });
 
-  const missingCauseResponse = waitForResponse(4);
+  const missingSearchModeResponse = waitForResponse(4);
+  const nonBooleanSearchModeResponse = waitForResponse(5);
   subprocess.send({
     id: 4,
+    type: "search",
+    generationId: 1,
+    query: "needle",
+  });
+  subprocess.send({
+    id: 5,
+    type: "search",
+    generationId: 1,
+    query: "needle",
+    caseInsensitive: "true",
+  });
+  expect(await missingSearchModeResponse).toEqual({
+    id: 4,
+    ok: false,
+    error: { code: "BAD_REQUEST", message: "caseInsensitive must be a boolean" },
+  });
+  expect(await nonBooleanSearchModeResponse).toEqual({
+    id: 5,
+    ok: false,
+    error: { code: "BAD_REQUEST", message: "caseInsensitive must be a boolean" },
+  });
+
+  const missingCauseResponse = waitForResponse(6);
+  subprocess.send({
+    id: 6,
     type: "preprocess-scope",
     generationId: 1,
     scope: { path: "", kind: "directory" },
     packages: [],
   });
   expect(await missingCauseResponse).toEqual({
-    id: 4,
+    id: 6,
     ok: false,
     error: { code: "BAD_REQUEST", message: "cause must be startup or watch" },
   });
 
-  const shutdownResponse = waitForResponse(5);
-  subprocess.send({ id: 5, type: "shutdown" });
-  expect(await shutdownResponse).toEqual({ id: 5, ok: true, value: null });
+  const shutdownResponse = waitForResponse(7);
+  subprocess.send({ id: 7, type: "shutdown" });
+  expect(await shutdownResponse).toEqual({ id: 7, ok: true, value: null });
   expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
 }, 30_000);
 
@@ -537,7 +700,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   await writeFixtureFile(
     root,
     "nested/deep/helper.js",
-    'export const helper="mixedcaseneedle"; export const short="§ Ωx"\n',
+    'export const helper="mixedcaseneedle"; export const short="§ Ωx"; export const unicode="ΩmegaNeedle"\n',
   );
   await writeFixtureFile(
     root,
@@ -584,7 +747,9 @@ test("preprocesses each visible scope once and serves formatted files and litera
   expect(progressEvents.length).toBeGreaterThan(0);
   const progressGenerationIds = [...new Set(progressEvents.map((event) => event.generationId))];
   expect(progressGenerationIds).toHaveLength(1);
-  expect(Number.isSafeInteger(progressGenerationIds[0]) && progressGenerationIds[0]! > 0).toBe(true);
+  const [progressGenerationId] = progressGenerationIds;
+  if (progressGenerationId === undefined) throw new Error("startup generation ID was not recorded");
+  expect(Number.isSafeInteger(progressGenerationId) && progressGenerationId > 0).toBe(true);
   expect([...new Set(progressEvents.map((event) => event.cause))]).toEqual(["startup"]);
   for (const group of groupProgressEvents(progressEvents)) {
     expect(group.events, `${group.component} ${group.resource}`).toEqual(["start", "done"]);
@@ -704,24 +869,80 @@ test("preprocesses each visible scope once and serves formatted files and litera
   );
   expect(await preprocessor.getDefinition("root.ts", { line: 2, column: 15 })).toBeNull();
 
-
-  const mixedCase = await preprocessor.search("mIxEdCaSeNeEdLe");
-  expect(mixedCase).toEqual({
+  expect(await preprocessor.search("mIxEdCaSeNeEdLe", false)).toEqual({
     query: "mIxEdCaSeNeEdLe",
+    caseInsensitive: false,
+    files: [],
+    definitions: [],
+    directories: [],
+    renderDirs: [],
+  });
+  expect(await preprocessor.search("mIxEdCaSeNeEdLe", true)).toEqual({
+    query: "mIxEdCaSeNeEdLe",
+    caseInsensitive: true,
     files: ["nested/deep/helper.js", "notes.txt", "root.ts"],
     definitions: [],
     directories: ["", "nested", "nested/deep"],
     renderDirs: [""],
   });
-  expect(await preprocessor.search("SearchNeedleEntity.SearchNeedle")).toEqual({
-    query: "SearchNeedleEntity.SearchNeedle",
+  expect(await preprocessor.search("sEaRcHnEeDlEaLpHa", false)).toEqual({
+    query: "sEaRcHnEeDlEaLpHa",
+    caseInsensitive: false,
+    files: [],
+    definitions: [],
+    directories: [],
+    renderDirs: [],
+  });
+  expect(await preprocessor.search("sEaRcHnEeDlEaLpHa", true)).toEqual({
+    query: "sEaRcHnEeDlEaLpHa",
+    caseInsensitive: true,
+    files: ["root.ts"],
+    definitions: [gotoDefinitions[1]],
+    directories: [""],
+    renderDirs: [""],
+  });
+  expect(await preprocessor.search("sEaRcHnEeDlEeNtItY.sEaRcHnEeDlE", false)).toEqual({
+    query: "sEaRcHnEeDlEeNtItY.sEaRcHnEeDlE",
+    caseInsensitive: false,
+    files: [],
+    definitions: [],
+    directories: [],
+    renderDirs: [],
+  });
+  expect(await preprocessor.search("sEaRcHnEeDlEeNtItY.sEaRcHnEeDlE", true)).toEqual({
+    query: "sEaRcHnEeDlEeNtItY.sEaRcHnEeDlE",
+    caseInsensitive: true,
     files: ["root.ts"],
     definitions: gotoDefinitions.slice(1, 4),
     directories: [""],
     renderDirs: [""],
   });
+  expect(await preprocessor.search("SearchNeedleEntity.SearchNeedle", false)).toEqual({
+    query: "SearchNeedleEntity.SearchNeedle",
+    caseInsensitive: false,
+    files: ["root.ts"],
+    definitions: gotoDefinitions.slice(1, 4),
+    directories: [""],
+    renderDirs: [""],
+  });
+  expect(await preprocessor.search("ωMEGAnEEDLE", false)).toEqual({
+    query: "ωMEGAnEEDLE",
+    caseInsensitive: false,
+    files: [],
+    definitions: [],
+    directories: [],
+    renderDirs: [],
+  });
+  expect(await preprocessor.search("ωMEGAnEEDLE", true)).toEqual({
+    query: "ωMEGAnEEDLE",
+    caseInsensitive: true,
+    files: ["nested/deep/helper.js"],
+    definitions: [],
+    directories: ["", "nested", "nested/deep"],
+    renderDirs: ["nested/deep"],
+  });
   const searchCases = [
-    { query: "-needle.[X]*$", files: ["notes.txt"] },
+    { query: "-NEEDLE.[x]*$", files: ["notes.txt"] },
     { query: '["quoted"]*', files: ["notes.txt"] },
     { query: "100%_literal", files: ["wildcard.txt"] },
     { query: "%_", files: ["wildcard.txt"] },
@@ -730,23 +951,25 @@ test("preprocesses each visible scope once and serves formatted files and litera
     { query: "not-present", files: [] },
   ];
   for (const { query, files } of searchCases) {
-    expect((await preprocessor.search(query)).files).toEqual(files);
+    expect((await preprocessor.search(query, false)).files).toEqual(files);
   }
 
   const dbPath = join(root, ".explore", "explore.db");
   expect((await stat(dbPath)).isFile()).toBe(true);
   await closePreprocessor(preprocessor);
 
-  const generationId = openDatabase(dbPath, (db) =>
-    db.query<{ id: number }, []>(`
+  const generationId = openDatabase(dbPath, (db) => {
+    const activeGeneration = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id
       FROM cache_meta
       WHERE key = 'active_generation'
-    `).get()!.id
-  );
+    `).get();
+    if (activeGeneration === null) throw new Error("active generation was not persisted");
+    return activeGeneration.id;
+  });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 2,
+      user_version: 3,
     });
     expect(db.query<{
       name: string;
@@ -797,6 +1020,74 @@ test("preprocesses each visible scope once and serves formatted files and litera
       expect(response.kind).toBe(row.kind);
       expect(response.scopePath).toBe(row.scope_path);
       expect(response.version).toBeUndefined();
+    }
+
+    expect(db.query<{
+      kind: string;
+      scope_path: string;
+      graph_headers: number;
+    }, [number]>(`
+      SELECT diagrams.kind, diagrams.scope_path, COUNT(diagram_graphs.kind) AS graph_headers
+      FROM diagrams
+      LEFT JOIN diagram_graphs
+        ON diagram_graphs.generation_id = diagrams.generation_id
+        AND diagram_graphs.kind = diagrams.kind
+        AND diagram_graphs.scope_path = diagrams.scope_path
+      WHERE diagrams.generation_id = ?
+      GROUP BY diagrams.kind, diagrams.scope_path
+      ORDER BY diagrams.kind, diagrams.scope_path
+    `).all(generationId)).toEqual(diagrams.map(({ kind, scope_path }) => ({
+      kind,
+      scope_path,
+      graph_headers: 1,
+    })));
+    expect(db.query<{ count: number }, [number]>(`
+      SELECT COUNT(*) AS count
+      FROM diagram_graphs
+      WHERE generation_id = ?
+    `).get(generationId)).toEqual({ count: diagrams.length });
+
+    const primaryPayloadColumns: string[] = [];
+    for (const table of NORMALIZED_GRAPH_TABLES) {
+      const statement = db.query<{ name: string; type: string }, []>(
+        `PRAGMA table_info('${table}')`,
+      );
+      try {
+        primaryPayloadColumns.push(...statement.all()
+          .filter(({ name, type }) =>
+            type.toUpperCase().includes("JSON")
+            || name === "response_json"
+            || name === "dsl"
+            || name === "dsls"
+            || name === "mermaid"
+            || name === "mermaid_dsl"
+          )
+          .map(({ name }) => `${table}.${name}`));
+      } finally {
+        statement.finalize();
+      }
+    }
+    expect(primaryPayloadColumns).toEqual([]);
+
+    for (const table of NORMALIZED_GRAPH_TABLES) {
+      const statement = db.query<{ detail: string }, [number, string, string]>(`
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM ${table}
+        WHERE generation_id = ? AND kind = ? AND scope_path = ?
+      `);
+      try {
+        const plan = statement.all(generationId, "uml", "");
+        expect(
+          plan.some(({ detail }) =>
+            detail.includes(`sqlite_autoindex_${table}_`)
+            && (detail.includes("USING INDEX") || detail.includes("USING COVERING INDEX"))
+          ),
+          `${table} complete-identity lookup`,
+        ).toBe(true);
+      } finally {
+        statement.finalize();
+      }
     }
 
     const files = db.query<{
@@ -877,14 +1168,19 @@ test("preprocesses each visible scope once and serves formatted files and litera
       uml_member_name: definition.uml.memberName ?? null,
       uml_member_occurrence: definition.uml.memberOccurrence ?? null,
     })));
-    expect(() => db.query<never, [number]>(`
+    const invalidGotoDef = db.query<never, [number]>(`
       INSERT INTO GotoDef(
         generation_id, definition_key, kind, name, qualified_name, source_path,
         source_line, source_column, display_from, display_to, uml_scope_path,
         uml_entity_name, uml_member_name, uml_member_occurrence
       ) VALUES (?, 'invalid-method', 'method', 'bad', 'Bad.bad', 'root.ts',
         1, 1, 0, 3, 'root.ts', 'Bad', NULL, NULL)
-    `).run(generationId)).toThrow();
+    `);
+    try {
+      expect(() => invalidGotoDef.run(generationId)).toThrow();
+    } finally {
+      invalidGotoDef.finalize();
+    }
     expect(db.query<{ count: number }, [number]>(
       "SELECT COUNT(*) AS count FROM GotoDef WHERE generation_id = ?",
     ).get(generationId)).toEqual({ count: rootDefinitions.length });
@@ -925,6 +1221,8 @@ test("preprocesses each visible scope once and serves formatted files and litera
     ]);
     expect(indexedLike.all(generationId, "%-needle.[X]*$%")).toEqual([{ path: "notes.txt" }]);
     expect(indexedLike.all(generationId, `%["quoted"]*%`)).toEqual([{ path: "notes.txt" }]);
+    expect(indexedLike.all(generationId, "%ωMEGAnEEDLE%")).toEqual([]);
+    indexedLike.finalize();
 
     const queryPlan = db.query<{ detail: string }, [number, string]>(`
       EXPLAIN QUERY PLAN
@@ -937,30 +1235,138 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
 
   const cache = new Cache(dbPath);
+  let activeCache = cache;
   try {
-    const originalFile = cache.readFile(generationId, "root.ts");
+    const persistedGraphs: DiagramGraph[] = [];
+    const persistedIdentities = [
+      { kind: "packages", scopePath: "" },
+      ...expectedPaths.map((scopePath) => ({ kind: "uml" as const, scopePath })),
+    ] as const;
+    for (const { kind, scopePath } of persistedIdentities) {
+      const graph = activeCache.readDiagramGraph(generationId, kind, scopePath);
+      const response = activeCache.readDiagram(generationId, kind, scopePath);
+      expect(graph, `${kind}:${scopePath} graph`).not.toBeNull();
+      expect(response, `${kind}:${scopePath} response`).not.toBeNull();
+      if (graph === null || response === null) {
+        throw new Error(`${kind}:${scopePath} graph or response was not persisted`);
+      }
+      persistedGraphs.push(graph);
+      expect(graph).toMatchObject({ kind, scopePath });
+      const rerendered = renderDiagramGraph(graph);
+      expect(response).toEqual({
+        kind,
+        scopePath,
+        status: response.status,
+        ...rerendered,
+        ...(response.status === "error" ? { error: response.error } : {}),
+      });
+    }
+
+    activeCache.close();
+    openDatabase(dbPath, (db) => {
+      for (const table of NORMALIZED_GRAPH_TABLES) {
+        const expected = (["packages", "uml"] as const).flatMap((kind) => {
+          const count = persistedGraphs
+            .filter((graph) => graph.kind === kind)
+            .reduce((sum, graph) =>
+              sum + NORMALIZED_TABLE_SPECS[table].expectedRows(graph).length, 0);
+          return count === 0 ? [] : [{ kind, count }];
+        });
+        const statement = db.query<{ kind: "packages" | "uml"; count: number }, [number]>(`
+          SELECT kind, COUNT(*) AS count
+          FROM ${table}
+          WHERE generation_id = ?
+          GROUP BY kind
+          ORDER BY kind
+        `);
+        try {
+          expect(statement.all(generationId), table).toEqual(expected);
+        } finally {
+          statement.finalize();
+        }
+      }
+    });
+    activeCache = new Cache(dbPath);
+
+    const rootGraph = activeCache.readDiagramGraph(generationId, "uml", "");
+    if (rootGraph?.kind !== "uml") throw new Error("root UML graph was not persisted");
+    const originalGraph = structuredClone(rootGraph);
+    const originalResponse = activeCache.readDiagram(generationId, "uml", "");
+    const originalFile = activeCache.readFile(generationId, "root.ts");
+    const originalDefinitions = activeCache.readDefinitions(generationId, "root.ts");
+
+    const rendererFailureGraph = structuredClone(rootGraph);
+    const rendererFailureSettings = rendererFailureGraph.settings;
+    if (rendererFailureSettings === null) throw new Error("fixture UML graph has no settings");
+    rendererFailureGraph.settings = {
+      ...rendererFailureSettings,
+      outFile: "renderer-failure-must-roll-back",
+    };
+    const rendererCall: { graph: DiagramGraph | null } = { graph: null };
+    expect(() => activeCache.writeScope(generationId, {
+      entries: [],
+      diagram: { graph: rendererFailureGraph, outcome: { status: "ready" } },
+      file: {
+        path: "root.ts",
+        rawContent: "renderer failure must roll back",
+        displayContent: "renderer failure must roll back",
+        sourceError: null,
+        formatError: null,
+      },
+      definitions: [],
+    }, (reloaded) => {
+      rendererCall.graph = reloaded;
+      throw new Error("renderer failure");
+    })).toThrow(DiagramMaterializationError);
+    const rendererArgument = rendererCall.graph;
+    if (rendererArgument === null || rendererArgument.kind !== "uml") {
+      throw new Error("renderer did not receive the reloaded UML graph");
+    }
+    expect(rendererArgument).not.toBe(rendererFailureGraph);
+    expect(rendererArgument).toEqual(rendererFailureGraph);
+    expect(activeCache.readDiagramGraph(generationId, "uml", "")).toEqual(originalGraph);
+    expect(activeCache.readDiagram(generationId, "uml", "")).toEqual(originalResponse);
+    expect(activeCache.readFile(generationId, "root.ts")).toEqual(originalFile);
+    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual(originalDefinitions);
+
+    const [rootDefinition] = rootDefinitions;
+    if (rootDefinition === undefined) throw new Error("root definition fixture was not created");
     const invalidDefinition: EditorGotoDefinition = {
-      ...rootDefinitions[0]!,
+      ...rootDefinition,
       key: "invalid-method",
       kind: "method",
       name: "invalid",
       qualifiedName: "SearchNeedleEntity.invalid",
       uml: { scopePath: "root.ts", entityName: "SearchNeedleEntity<T>" },
     };
-    expect(() => cache.writeScope(generationId, {
+    const definitionFailureGraph = structuredClone(rootGraph);
+    const definitionFailureSettings = definitionFailureGraph.settings;
+    if (definitionFailureSettings === null) throw new Error("fixture UML graph has no settings");
+    definitionFailureGraph.settings = {
+      ...definitionFailureSettings,
+      outFile: "definition-failure-must-roll-back",
+    };
+    let definitionRendererCalled = false;
+    expect(() => activeCache.writeScope(generationId, {
       entries: [],
-      diagram: rootDiagram,
+      diagram: { graph: definitionFailureGraph, outcome: { status: "ready" } },
       file: {
         path: "root.ts",
-        rawContent: "transaction must roll back",
-        displayContent: "transaction must roll back",
+        rawContent: "definition failure must roll back",
+        displayContent: "definition failure must roll back",
         sourceError: null,
         formatError: null,
       },
       definitions: [invalidDefinition],
+    }, (reloaded) => {
+      definitionRendererCalled = true;
+      return renderDiagramGraph(reloaded);
     })).toThrow();
-    expect(cache.readFile(generationId, "root.ts")).toEqual(originalFile);
-    expect(cache.readDefinitions(generationId, "root.ts")).toEqual(rootDefinitions);
+    expect(definitionRendererCalled).toBe(true);
+    expect(activeCache.readDiagramGraph(generationId, "uml", "")).toEqual(originalGraph);
+    expect(activeCache.readDiagram(generationId, "uml", "")).toEqual(originalResponse);
+    expect(activeCache.readFile(generationId, "root.ts")).toEqual(originalFile);
+    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual(originalDefinitions);
 
     const replacementContent = "class CacheReplacement {}\n";
     const replacementDefinition: EditorGotoDefinition = {
@@ -973,9 +1379,24 @@ test("preprocesses each visible scope once and serves formatted files and litera
       displayFrom: 6,
       displayTo: 22,
     };
-    cache.writeScope(generationId, {
+    const replacementGraph = structuredClone(rootGraph);
+    replacementGraph.definitions = [{
+      definitionOrdinal: 0,
+      definitionKey: replacementDefinition.key,
+      definitionKind: replacementDefinition.kind,
+      name: replacementDefinition.name,
+      qualifiedName: replacementDefinition.qualifiedName,
+      sourcePath: replacementDefinition.source.path,
+      sourceLine: replacementDefinition.source.line,
+      sourceColumn: replacementDefinition.source.column,
+      umlScopePath: replacementDefinition.uml.scopePath,
+      umlEntityName: replacementDefinition.uml.entityName,
+      umlMemberName: null,
+      umlMemberOccurrence: null,
+    }];
+    activeCache.writeScope(generationId, {
       entries: [],
-      diagram: { ...rootDiagram, definitions: [withoutDisplay([replacementDefinition])[0]!] },
+      diagram: { graph: replacementGraph, outcome: { status: "ready" } },
       file: {
         path: "root.ts",
         rawContent: replacementContent,
@@ -984,33 +1405,358 @@ test("preprocesses each visible scope once and serves formatted files and litera
         formatError: null,
       },
       definitions: [replacementDefinition],
-    });
-    expect(cache.readFile(generationId, "root.ts")).toEqual({
+    }, renderDiagramGraph);
+    expect(activeCache.readFile(generationId, "root.ts")).toEqual({
       path: "root.ts",
       rawContent: replacementContent,
       displayContent: replacementContent,
       sourceError: null,
       formatError: null,
     });
-    expect(cache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
-    expect(cache.searchFiles(generationId, "SearchNeedleEntity.SearchNeedle")).toEqual({
+    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
+    expect(activeCache.searchFiles(
+      generationId,
+      "SearchNeedleEntity.SearchNeedle",
+      false,
+    )).toEqual({
       query: "SearchNeedleEntity.SearchNeedle",
+      caseInsensitive: false,
       files: [],
       definitions: [],
       directories: [],
       renderDirs: [],
     });
-    expect(cache.searchFiles(generationId, "CacheReplacement")).toEqual({
+    expect(activeCache.searchFiles(generationId, "CacheReplacement", false)).toEqual({
       query: "CacheReplacement",
+      caseInsensitive: false,
       files: ["root.ts"],
       definitions: withoutDisplay([replacementDefinition]),
       directories: [""],
       renderDirs: [""],
     });
   } finally {
-    cache.close();
+    activeCache.close();
   }
 }, 30_000);
+
+test("rejects unavailable or inconsistent fallback sources without replacing target rows", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-fallback-");
+  const dbPath = join(root, "fallback.db");
+  const cache = new Cache(dbPath);
+  let activeCache = cache;
+  try {
+    const sourceGenerationId = activeCache.beginGeneration("startup");
+    const targetGenerationId = activeCache.beginGeneration("watch");
+    const sourceGraph = fixtureUmlGraph("source.ts");
+    const targetSourceGraph = fixtureUmlGraph("source.ts");
+    const targetSourceSettings = targetSourceGraph.settings;
+    if (targetSourceSettings === null) throw new Error("fixture UML graph has no settings");
+    targetSourceGraph.settings = { ...targetSourceSettings, outFile: "target-source" };
+    const targetOtherGraph = fixtureUmlGraph("other.ts");
+    const targetOtherSettings = targetOtherGraph.settings;
+    if (targetOtherSettings === null) throw new Error("fixture UML graph has no settings");
+    targetOtherGraph.settings = { ...targetOtherSettings, outFile: "target-other" };
+
+    activeCache.writeScope(sourceGenerationId, {
+      entries: [],
+      diagram: { graph: sourceGraph, outcome: { status: "ready" } },
+      definitions: [],
+    }, renderFixtureGraph);
+    for (const graph of [targetSourceGraph, targetOtherGraph]) {
+      activeCache.writeScope(targetGenerationId, {
+        entries: [],
+        diagram: { graph, outcome: { status: "ready" } },
+        definitions: [],
+      }, renderFixtureGraph);
+    }
+
+    const cases = [
+      {
+        name: "missing generation",
+        scopePath: "source.ts",
+        fallbackSource: {
+          sourceGenerationId: sourceGenerationId + 10_000,
+          kind: "uml" as const,
+          scopePath: "source.ts",
+        },
+      },
+      {
+        name: "scope does not match the source graph",
+        scopePath: "other.ts",
+        fallbackSource: {
+          sourceGenerationId,
+          kind: "uml" as const,
+          scopePath: "other.ts",
+        },
+      },
+    ];
+    for (const { name, scopePath, fallbackSource } of cases) {
+      const beforeGraph = activeCache.readDiagramGraph(targetGenerationId, "uml", scopePath);
+      const beforeResponse = activeCache.readDiagram(targetGenerationId, "uml", scopePath);
+      let rendered = false;
+      expect(() => activeCache.writeScope(targetGenerationId, {
+        entries: [],
+        diagram: {
+          fallbackSource,
+          outcome: { status: "error", error: name },
+        },
+        definitions: [],
+      }, (graph) => {
+        rendered = true;
+        return renderFixtureGraph(graph);
+      }), name).toThrow(DiagramMaterializationError);
+      expect(rendered, name).toBe(false);
+      expect(activeCache.readDiagramGraph(targetGenerationId, "uml", scopePath), name).toEqual(beforeGraph);
+      expect(activeCache.readDiagram(targetGenerationId, "uml", scopePath), name).toEqual(beforeResponse);
+    }
+
+    const beforeDisagreementGraph = activeCache.readDiagramGraph(
+      targetGenerationId,
+      "uml",
+      "source.ts",
+    );
+    const beforeDisagreementResponse = activeCache.readDiagram(
+      targetGenerationId,
+      "uml",
+      "source.ts",
+    );
+    const sourceResponse = activeCache.readDiagram(sourceGenerationId, "uml", "source.ts");
+    if (sourceResponse === null) throw new Error("source response was not persisted");
+    activeCache.close();
+    openDatabase(dbPath, (db) => {
+      db.query<never, [string, number]>(`
+        UPDATE diagrams
+        SET response_json = ?
+        WHERE generation_id = ? AND kind = 'uml' AND scope_path = 'source.ts'
+      `).run(JSON.stringify({ ...sourceResponse, scopePath: "different.ts" }), sourceGenerationId);
+    });
+    activeCache = new Cache(dbPath);
+
+    expect(() => activeCache.writeScope(targetGenerationId, {
+      entries: [],
+      diagram: {
+        fallbackSource: {
+          sourceGenerationId,
+          kind: "uml",
+          scopePath: "source.ts",
+        },
+        outcome: { status: "error", error: "source response disagrees with graph identity" },
+      },
+      definitions: [],
+    }, renderFixtureGraph)).toThrow(DiagramMaterializationError);
+    expect(activeCache.readDiagramGraph(targetGenerationId, "uml", "source.ts")).toEqual(
+      beforeDisagreementGraph,
+    );
+    expect(activeCache.readDiagram(targetGenerationId, "uml", "source.ts")).toEqual(
+      beforeDisagreementResponse,
+    );
+  } finally {
+    activeCache.close();
+  }
+});
+
+test("rejects constrained and domain-invalid graph replacements atomically", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-invalid-graph-");
+  const dbPath = join(root, "invalid-graph.db");
+  const cache = new Cache(dbPath);
+  try {
+    const generationId = cache.beginGeneration("startup");
+    const scopePath = "constraints.ts";
+    const validGraph = fixtureUmlGraph(scopePath);
+    cache.writeScope(generationId, {
+      entries: [],
+      diagram: { graph: validGraph, outcome: { status: "ready" } },
+      file: {
+        path: scopePath,
+        rawContent: "baseline",
+        displayContent: "baseline",
+        sourceError: null,
+        formatError: null,
+      },
+      definitions: [],
+    }, renderFixtureGraph);
+    const baselineGraph = cache.readDiagramGraph(generationId, "uml", scopePath);
+    const baselineResponse = cache.readDiagram(generationId, "uml", scopePath);
+    const baselineFile = cache.readFile(generationId, scopePath);
+
+    const sqlConstraintCases: Array<{
+      name: string;
+      mutate(graph: UmlDiagramGraph): void;
+    }> = [
+      {
+        name: "negative node ordinal",
+        mutate: (graph) => {
+          const [node] = graph.nodes;
+          if (node === undefined) throw new Error("fixture UML graph has no first node");
+          node.nodeOrdinal = -1;
+        },
+      },
+      {
+        name: "duplicate node ordinal",
+        mutate: (graph) => {
+          const [, node] = graph.nodes;
+          if (node === undefined) throw new Error("fixture UML graph has no second node");
+          node.nodeOrdinal = 0;
+        },
+      },
+      {
+        name: "graph-wide duplicate alias",
+        mutate: (graph) => {
+          graph.aliases.push({ nodeId: "b", aliasOrdinal: 0, alias: "AlphaAlias" });
+        },
+      },
+      {
+        name: "nonpositive edge weight",
+        mutate: (graph) => {
+          const [edge] = graph.edges;
+          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
+          edge.weight = 0;
+        },
+      },
+    ];
+    for (const { name, mutate } of sqlConstraintCases) {
+      const graph = structuredClone(validGraph);
+      mutate(graph);
+      let rendererCalled = false;
+      let thrown: unknown;
+      try {
+        cache.writeScope(generationId, {
+          entries: [],
+          diagram: { graph, outcome: { status: "ready" } },
+          file: {
+            path: scopePath,
+            rawContent: name,
+            displayContent: name,
+            sourceError: null,
+            formatError: null,
+          },
+          definitions: [],
+        }, (reloaded) => {
+          rendererCalled = true;
+          return renderFixtureGraph(reloaded);
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, name).toBeInstanceOf(Error);
+      expect(thrown, name).not.toBeInstanceOf(DiagramMaterializationError);
+      expect(rendererCalled, name).toBe(false);
+      expect(cache.readDiagramGraph(generationId, "uml", scopePath), name).toEqual(baselineGraph);
+      expect(cache.readDiagram(generationId, "uml", scopePath), name).toEqual(baselineResponse);
+      expect(cache.readFile(generationId, scopePath), name).toEqual(baselineFile);
+    }
+
+    const domainCases: Array<{
+      name: string;
+      mutate(graph: UmlDiagramGraph): void;
+    }> = [
+      {
+        name: "missing node ordinal",
+        mutate: (graph) => {
+          const [node] = graph.nodes;
+          if (node === undefined) throw new Error("fixture UML graph has no first node");
+          node.nodeOrdinal = 3;
+        },
+      },
+      {
+        name: "package node in a UML graph",
+        mutate: (graph) => {
+          const [node] = graph.nodes;
+          if (node === undefined) throw new Error("fixture UML graph has no first node");
+          node.nodeKind = "package";
+          node.community = null;
+        },
+      },
+      {
+        name: "alias collides with another node ID",
+        mutate: (graph) => {
+          const [alias] = graph.aliases;
+          if (alias === undefined) throw new Error("fixture UML graph has no first alias");
+          alias.alias = "b";
+        },
+      },
+      {
+        name: "noncanonical reversed UML edge",
+        mutate: (graph) => {
+          const [edge] = graph.edges;
+          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
+          edge.sourceNodeId = "b";
+          edge.targetNodeId = "a";
+        },
+      },
+      {
+        name: "relation endpoints differ from the parent edge",
+        mutate: (graph) => {
+          const [relation] = graph.relations;
+          if (relation === undefined) throw new Error("fixture UML graph has no first relation");
+          relation.targetNodeId = "c";
+        },
+      },
+      {
+        name: "relation ordinal starts after zero",
+        mutate: (graph) => {
+          const [relation] = graph.relations;
+          if (relation === undefined) throw new Error("fixture UML graph has no first relation");
+          relation.relationOrdinal = 1;
+        },
+      },
+      {
+        name: "edge weight differs from relation count",
+        mutate: (graph) => {
+          const [edge] = graph.edges;
+          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
+          edge.weight = 2;
+        },
+      },
+      {
+        name: "normal graph has no settings",
+        mutate: (graph) => {
+          graph.settings = null;
+        },
+      },
+      {
+        name: "bare graph retains model rows",
+        mutate: (graph) => {
+          graph.renderMode = "bare";
+        },
+      },
+      {
+        name: "return type IDs exist while presence flag is false",
+        mutate: (graph) => {
+          const [method] = graph.methods;
+          if (method === undefined) throw new Error("fixture UML graph has no first method");
+          method.returnTypeIdsPresent = false;
+        },
+      },
+    ];
+    for (const { name, mutate } of domainCases) {
+      const graph = structuredClone(validGraph);
+      mutate(graph);
+      let rendererCalled = false;
+      expect(() => cache.writeScope(generationId, {
+        entries: [],
+        diagram: { graph, outcome: { status: "ready" } },
+        file: {
+          path: scopePath,
+          rawContent: name,
+          displayContent: name,
+          sourceError: null,
+          formatError: null,
+        },
+        definitions: [],
+      }, (reloaded) => {
+        rendererCalled = true;
+        return renderFixtureGraph(reloaded);
+      }), name).toThrow(DiagramMaterializationError);
+      expect(rendererCalled, name).toBe(false);
+      expect(cache.readDiagramGraph(generationId, "uml", scopePath), name).toEqual(baselineGraph);
+      expect(cache.readDiagram(generationId, "uml", scopePath), name).toEqual(baselineResponse);
+      expect(cache.readFile(generationId, scopePath), name).toEqual(baselineFile);
+    }
+  } finally {
+    cache.close();
+  }
+});
 
 test("labels repeated scope work across startup and watch generations", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-generations-");
@@ -1036,17 +1782,20 @@ test("labels repeated scope work across startup and watch generations", async ()
   const generationIds = [...new Set(progressEvents.map((event) => event.generationId))];
   expect(generationIds).toHaveLength(2);
   const [startupGenerationId, watchGenerationId] = generationIds;
+  if (startupGenerationId === undefined || watchGenerationId === undefined) {
+    throw new Error("startup and watch generation IDs were not recorded");
+  }
   expect(startupGenerationId).not.toBe(watchGenerationId);
   expect(
     Number.isSafeInteger(startupGenerationId) &&
-      startupGenerationId! > 0 &&
+      startupGenerationId > 0 &&
       Number.isSafeInteger(watchGenerationId) &&
-      watchGenerationId! > 0,
+      watchGenerationId > 0,
   ).toBe(true);
 
   for (const [generationId, cause] of [
-    [startupGenerationId!, "startup"],
-    [watchGenerationId!, "watch"],
+    [startupGenerationId, "startup"],
+    [watchGenerationId, "watch"],
   ] as const) {
     const generationEvents = progressEvents.filter((event) => event.generationId === generationId);
     expect([...new Set(generationEvents.map((event) => event.cause))]).toEqual([cause]);
@@ -1071,6 +1820,20 @@ test("labels repeated scope work across startup and watch generations", async ()
       ]);
     }
   }
+
+  await closePreprocessor(preprocessor);
+  openDatabase(join(root, ".explore", "explore.db"), (db) => {
+    const activeGeneration = db.query<{ id: number }, []>(`
+      SELECT CAST(value AS INTEGER) AS id
+      FROM cache_meta
+      WHERE key = 'active_generation'
+    `).get();
+    if (activeGeneration === null) throw new Error("active generation was not persisted");
+    const activeGenerationId = activeGeneration.id;
+    expect(activeGenerationId).toBe(watchGenerationId);
+    expect(normalizedGenerationIds(db, "diagram_graphs")).toEqual([watchGenerationId]);
+    expectOnlyNormalizedGeneration(db, watchGenerationId);
+  });
 }, 30_000);
 
 test("prioritizes a queued definition miss without promoting the incomplete generation", async () => {
@@ -1207,13 +1970,15 @@ test("drains superseded subprocess jobs before discarding their generation", asy
     .filter(({ kind, path }) => kind === "file" && path.endsWith(".ts"))
     .map(({ path }) => path);
   expect(treeFiles).toEqual(sourcePaths);
-  expect(await preprocessor.getDefinition(sourcePaths[0]!, { line: 1, column: 14 })).toEqual({
+  const [firstSourcePath] = sourcePaths;
+  if (firstSourcePath === undefined) throw new Error("bulk source fixture was not created");
+  expect(await preprocessor.getDefinition(firstSourcePath, { line: 1, column: 14 })).toEqual({
     key: '["class","Value0",0,null,null]',
     kind: "class",
     name: "Value0",
     qualifiedName: "Value0",
-    source: { path: sourcePaths[0]!, line: 1, column: 14 },
-    uml: { scopePath: sourcePaths[0]!, entityName: "Value0" },
+    source: { path: firstSourcePath, line: 1, column: 14 },
+    uml: { scopePath: firstSourcePath, entityName: "Value0" },
   });
   await closePreprocessor(preprocessor);
 
@@ -1230,11 +1995,14 @@ test("drains superseded subprocess jobs before discarding their generation", asy
       WHERE key = 'active_generation'
     `).get();
     expect(active?.id).toBe(generations[0]?.id);
+    expect(active).not.toBeNull();
+    if (active === null) throw new Error("active generation was not persisted");
     expect(db.query<{ generation_id: number; count: number }, []>(`
       SELECT generation_id, COUNT(*) AS count
       FROM GotoDef
       GROUP BY generation_id
-    `).all()).toEqual([{ generation_id: active!.id, count: sourcePaths.length }]);
+    `).all()).toEqual([{ generation_id: active.id, count: sourcePaths.length }]);
+    expectOnlyNormalizedGeneration(db, active.id);
   });
 }, 60_000);
 
@@ -1248,17 +2016,30 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   const first = trackedPreprocessor(root, () => undefined, (error) => firstErrors.push(error));
   await first.ready();
   await first.whenIdle();
-  expect((await first.search("initial-cache")).files).toEqual(["app.js"]);
+  expect((await first.search("initial-cache", false)).files).toEqual(["app.js"]);
   expect(firstErrors).toEqual([]);
   await closePreprocessor(first);
 
-  const seeded = openDatabase(dbPath, (db) => {
-    const activeId = db.query<{ id: number }, []>(`
+  const activeId = openDatabase(dbPath, (db) => {
+    const activeGeneration = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
-    `).get()!.id;
-    const orphanId = Number(db.query<never, [number]>(`
-      INSERT INTO generations(state, cause, started_at) VALUES ('building', 'watch', ?)
-    `).run(Date.now()).lastInsertRowid);
+    `).get();
+    if (activeGeneration === null) throw new Error("active generation was not persisted");
+    return activeGeneration.id;
+  });
+  const orphanCache = new Cache(dbPath);
+  let orphanId: number;
+  try {
+    orphanId = orphanCache.beginGeneration("watch");
+    orphanCache.writeScope(orphanId, {
+      entries: [],
+      diagram: { graph: fixtureUmlGraph("orphan.ts"), outcome: { status: "ready" } },
+      definitions: [],
+    }, renderFixtureGraph);
+  } finally {
+    orphanCache.close();
+  }
+  openDatabase(dbPath, (db) => {
     db.query<never, [number]>(`
       INSERT INTO GotoDef(
         generation_id, definition_key, kind, name, qualified_name, source_path,
@@ -1267,64 +2048,109 @@ test("startup recovery removes orphan generations and rebuilds when the active p
       ) VALUES (?, 'orphan-definition', 'class', 'OrphanDefinition', 'OrphanDefinition',
         'orphan.ts', 1, 14, 13, 29, 'orphan.ts', 'OrphanDefinition', NULL, NULL)
     `).run(orphanId);
-    return { activeId, orphanId };
   });
+  const seeded = { activeId, orphanId };
 
-  const recoveryProbe = trackedPreprocessor(root, () => undefined, () => undefined);
+  const recoveryReady: string[] = [];
+  const recoveryProgress: PreprocessProgressEvent[] = [];
+  const recoveryErrors: Error[] = [];
+  const recoveryProbe = trackedPreprocessor(
+    root,
+    () => recoveryReady.push("ready"),
+    (error) => recoveryErrors.push(error),
+    1,
+    (event) => recoveryProgress.push(event),
+  );
   await recoveryProbe.ready();
-  await closePreprocessor(recoveryProbe);
+  await recoveryProbe.whenIdle();
+  expect(recoveryReady).toEqual(["ready"]);
+  expect(recoveryProgress).toEqual([]);
+  expect(recoveryErrors).toEqual([]);
 
   openDatabase(dbPath, (db) => {
-    const generations = db.query<{ id: number; state: string; cause: string }, []>(`
+    expect(db.query<{ id: number; state: string; cause: string }, []>(`
       SELECT id, state, cause FROM generations ORDER BY id
-    `).all();
-    expect(generations.filter(({ state }) => state === "active")).toEqual([
+    `).all()).toEqual([
       { id: seeded.activeId, state: "active", cause: "startup" },
     ]);
-    expect(generations.filter(({ state }) => state === "building")).toHaveLength(1);
-    expect(generations.find(({ state }) => state === "building")?.cause).toBe("startup");
-    expect(generations.some(({ state, cause }) => state === "building" && cause === "watch")).toBe(false);
     expect(db.query<{ count: number }, [number]>(
       "SELECT COUNT(*) AS count FROM GotoDef WHERE generation_id = ?",
     ).get(seeded.orphanId)).toEqual({ count: 0 });
     expect(db.query<{ count: number }, []>(
       "SELECT COUNT(*) AS count FROM goto_def_search WHERE goto_def_search MATCH 'OrphanDefinition'",
     ).get()).toEqual({ count: 0 });
+    for (const table of NORMALIZED_GRAPH_TABLES) {
+      expect(
+        db.query<{ count: number }, [number, string]>(
+          `SELECT COUNT(*) AS count FROM ${table} WHERE generation_id = ? AND scope_path = ?`,
+        ).get(seeded.orphanId, "orphan.ts"),
+      ).toEqual({ count: 0 });
+    }
+    expectOnlyNormalizedGeneration(db, seeded.activeId);
   });
+  await closePreprocessor(recoveryProbe);
 
   await writeFixtureFile(root, "app.js", 'export const state="after-orphan-recovery";\n');
   const secondErrors: Error[] = [];
   const second = trackedPreprocessor(root, () => undefined, (error) => secondErrors.push(error));
   await second.ready();
-  expect((await second.search("initial-cache")).files).toEqual(["app.js"]);
   await second.whenIdle();
-  expect((await second.search("after-orphan-recovery")).files).toEqual(["app.js"]);
+  expect((await second.search("initial-cache", false)).files).toEqual(["app.js"]);
+  expect((await second.search("after-orphan-recovery", false)).files).toEqual([]);
+  expect(secondErrors).toEqual([]);
+  openDatabase(dbPath, (db) => {
+    expect(db.query<{ id: number; state: string; cause: string }, []>(`
+      SELECT id, state, cause FROM generations ORDER BY id
+    `).all()).toEqual([
+      { id: seeded.activeId, state: "active", cause: "startup" },
+    ]);
+  });
+
+  second.rebuild("watch");
+  await second.whenIdle();
+  expect((await second.search("after-orphan-recovery", false)).files).toEqual(["app.js"]);
+  expect((await second.search("initial-cache", false)).files).toEqual([]);
   expect(secondErrors).toEqual([]);
   await closePreprocessor(second);
 
   openDatabase(dbPath, (db) => {
-    const generations = db.query<{ id: number; state: string }, []>(`
-      SELECT id, state FROM generations ORDER BY id
+    const generations = db.query<{ id: number; state: string; cause: string }, []>(`
+      SELECT id, state, cause FROM generations ORDER BY id
     `).all();
     expect(generations).toHaveLength(1);
-    expect(generations[0]?.state).toBe("active");
-    expect(generations[0]?.id).not.toBe(seeded.activeId);
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("watch generation was not promoted");
+    expect(generation).toMatchObject({ state: "active", cause: "watch" });
+    expect(generation.id).not.toBe(seeded.activeId);
+    expectOnlyNormalizedGeneration(db, generation.id);
   });
 
   await writeFixtureFile(root, "app.js", 'export const state="invalid-pointer-rebuilt";\n');
+  const invalidPointerCache = new Cache(dbPath);
+  let invalidPointerOrphanId: number;
+  try {
+    invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch");
+    invalidPointerCache.writeScope(invalidPointerOrphanId, {
+      entries: [],
+      diagram: {
+        graph: fixtureUmlGraph("invalid-pointer-orphan.ts"),
+        outcome: { status: "ready" },
+      },
+      definitions: [],
+    }, renderFixtureGraph);
+  } finally {
+    invalidPointerCache.close();
+  }
   openDatabase(dbPath, (db) => {
     db.query<never, [string]>(`
       UPDATE cache_meta SET value = ? WHERE key = 'active_generation'
     `).run("999999999");
-    db.query<never, [number]>(`
-      INSERT INTO generations(state, cause, started_at) VALUES ('building', 'watch', ?)
-    `).run(Date.now());
   });
 
   const thirdErrors: Error[] = [];
   const third = trackedPreprocessor(root, () => undefined, (error) => thirdErrors.push(error));
   await third.ready();
-  expect((await third.search("invalid-pointer-rebuilt")).files).toEqual(["app.js"]);
+  expect((await third.search("invalid-pointer-rebuilt", false)).files).toEqual(["app.js"]);
   await third.whenIdle();
   expect(thirdErrors).toEqual([]);
   await closePreprocessor(third);
@@ -1334,17 +2160,212 @@ test("startup recovery removes orphan generations and rebuilds when the active p
       SELECT id, state FROM generations ORDER BY id
     `).all();
     expect(generations).toHaveLength(1);
-    expect(generations[0]?.state).toBe("active");
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("active generation was not rebuilt");
+    expect(generation.state).toBe("active");
     const pointer = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
     `).get();
-    expect(pointer?.id).toBe(generations[0]?.id);
+    expect(pointer?.id).toBe(generation.id);
     expect(pointer?.id).not.toBe(999999999);
+    expect(pointer).not.toBeNull();
+    if (pointer === null) throw new Error("active generation pointer was not rebuilt");
     expect(db.query<{ count: number }, [number]>(`
       SELECT COUNT(*) AS count FROM package_snapshots WHERE generation_id = ?
-    `).get(pointer!.id)?.count).toBe(1);
+    `).get(pointer.id)?.count).toBe(1);
     expect(db.query<{ path: string }, [number]>(`
       SELECT path FROM tree_entries WHERE generation_id = ? ORDER BY path
-    `).all(pointer!.id).map(({ path }) => path)).toEqual(["", "app.js", "package.json"]);
+    `).all(pointer.id).map(({ path }) => path)).toEqual(["", "app.js", "package.json"]);
+    expectOnlyNormalizedGeneration(db, pointer.id);
+    for (const table of NORMALIZED_GRAPH_TABLES) {
+      expect(
+        db.query<{ count: number }, [number, string]>(
+          `SELECT COUNT(*) AS count FROM ${table} WHERE generation_id = ? AND scope_path = ?`,
+        ).get(invalidPointerOrphanId, "invalid-pointer-orphan.ts"),
+      ).toEqual({ count: 0 });
+    }
   });
+}, 30_000);
+
+test("defers recovered readiness when a watch rebuild is requested before bootstrap completes", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-recovery-race-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "recovery-race" }));
+  await writeFixtureFile(root, "app.js", 'export const searchable="recovery-race-token";\n');
+
+  const firstErrors: Error[] = [];
+  const first = trackedPreprocessor(root, () => undefined, (error) => firstErrors.push(error));
+  await first.ready();
+  await first.whenIdle();
+  expect((await first.search("recovery-race-token", false)).files).toEqual(["app.js"]);
+  expect(firstErrors).toEqual([]);
+  await closePreprocessor(first);
+
+  const seedId = openDatabase(dbPath, (db) => {
+    const active = db.query<{ id: number }, []>(`
+      SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
+    `).get();
+    if (active === null) throw new Error("seed generation was not persisted");
+    return active.id;
+  });
+
+  const progress: PreprocessProgressEvent[] = [];
+  const readyProgressCounts: number[] = [];
+  const secondErrors: Error[] = [];
+  const second = trackedPreprocessor(
+    root,
+    () => readyProgressCounts.push(progress.length),
+    (error) => secondErrors.push(error),
+    1,
+    (event) => progress.push(event),
+  );
+  second.rebuild("watch");
+  await second.ready();
+  await second.whenIdle();
+
+  expect(secondErrors).toEqual([]);
+  expect(readyProgressCounts).toHaveLength(1);
+  expect(readyProgressCounts[0]).toBeGreaterThan(0);
+  await closePreprocessor(second);
+
+  openDatabase(dbPath, (db) => {
+    const generations = db.query<{ id: number; state: string; cause: string }, []>(`
+      SELECT id, state, cause FROM generations ORDER BY id
+    `).all();
+    expect(generations).toHaveLength(1);
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("watch generation was not promoted");
+    expect(generation).toMatchObject({ state: "active", cause: "watch" });
+    expect(generation.id).not.toBe(seedId);
+    expectOnlyNormalizedGeneration(db, generation.id);
+  });
+}, 30_000);
+
+test("recovers named cache tables and retries queued database work for runtime loads and stores", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-schema-retry-");
+  const dbPath = join(root, ".explore", "explore.db");
+  const expectedPackages = [{
+    name: "runtime-recovery",
+    path: "",
+    dependencies: [],
+  }];
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "runtime-recovery" }));
+  await writeFixtureFile(
+    root,
+    "app.ts",
+    "export class RuntimeRecoveryNeedle { locate() { return 1; } }\n",
+  );
+
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  expect(await preprocessor.getPackages()).toEqual(expectedPackages);
+  expect(await preprocessor.getDefinition("app.ts", { line: 1, column: 14 })).toEqual({
+    key: '["class","RuntimeRecoveryNeedle",0,null,null]',
+    kind: "class",
+    name: "RuntimeRecoveryNeedle",
+    qualifiedName: "RuntimeRecoveryNeedle",
+    source: { path: "app.ts", line: 1, column: 14 },
+    uml: { scopePath: "app.ts", entityName: "RuntimeRecoveryNeedle" },
+  });
+
+  const startupGenerationId = openDatabase(dbPath, (db) => {
+    const generation = db.query<{ id: number }, []>(`
+      SELECT id FROM generations WHERE state = 'active'
+    `).get();
+    if (generation === null) throw new Error("startup generation was not promoted");
+    db.run("DROP TABLE GotoDef");
+    return generation.id;
+  });
+
+  expect(await preprocessor.search("RuntimeRecoveryNeedle", false)).toEqual({
+    query: "RuntimeRecoveryNeedle",
+    caseInsensitive: false,
+    files: ["app.ts"],
+    definitions: [],
+    directories: [""],
+    renderDirs: [""],
+  });
+  expect(errors).toEqual([]);
+
+  openDatabase(dbPath, (db) => {
+    expectSearchSchema(
+      db,
+      "GotoDef",
+      "goto_def_search",
+      ["goto_def_ai", "goto_def_au", "goto_def_bd", "goto_def_bu"],
+    );
+  });
+
+  openDatabase(dbPath, (db) => db.run("DROP TABLE files"));
+  const filesRepairSearch = await preprocessor.search("RuntimeRecoveryNeedle", false);
+  expect(filesRepairSearch.files).toEqual([]);
+  expect(filesRepairSearch.definitions).toEqual([]);
+  expect(errors).toEqual([]);
+
+  openDatabase(dbPath, (db) => {
+    expectSearchSchema(
+      db,
+      "files",
+      "file_search",
+      ["files_ai", "files_au", "files_bd", "files_bu"],
+    );
+    expect(db.query<{ id: number; state: string; cause: string }, []>(`
+      SELECT id, state, cause FROM generations ORDER BY id
+    `).all()).toEqual([
+      { id: startupGenerationId, state: "active", cause: "startup" },
+    ]);
+    const snapshot = db.query<{ generation_id: number; packages_json: string }, []>(`
+      SELECT generation_id, packages_json FROM package_snapshots
+    `).get();
+    expect(snapshot?.generation_id).toBe(startupGenerationId);
+    expect(JSON.parse(snapshot?.packages_json ?? "null")).toEqual(expectedPackages);
+  });
+
+  openDatabase(dbPath, (db) => db.run("DROP TABLE package_snapshots"));
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+
+  expect(await preprocessor.getPackages()).toEqual(expectedPackages);
+  expect(errors).toEqual([]);
+  openDatabase(dbPath, (db) => {
+    const generations = db.query<{ id: number; state: string; cause: string }, []>(`
+      SELECT id, state, cause FROM generations ORDER BY id
+    `).all();
+    expect(generations).toHaveLength(1);
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("watch generation was not promoted");
+    expect(generation).toMatchObject({ state: "active", cause: "watch" });
+    expect(generation.id).not.toBe(startupGenerationId);
+
+    const snapshot = db.query<{ generation_id: number; packages_json: string }, []>(`
+      SELECT generation_id, packages_json FROM package_snapshots
+    `).get();
+    expect(snapshot?.generation_id).toBe(generation.id);
+    expect(JSON.parse(snapshot?.packages_json ?? "null")).toEqual(expectedPackages);
+    expect(db.query<{ path: string }, []>(`
+      SELECT files.path AS path
+      FROM file_search
+      JOIN files ON file_search.rowid = files.id
+      WHERE file_search MATCH 'RuntimeRecoveryNeedle'
+      ORDER BY files.path
+    `).all()).toEqual([{ path: "app.ts" }]);
+    expect(db.query<{ definition_key: string }, []>(`
+      SELECT GotoDef.definition_key
+      FROM goto_def_search
+      JOIN GotoDef ON goto_def_search.rowid = GotoDef.id
+      WHERE goto_def_search MATCH 'RuntimeRecoveryNeedle'
+        AND GotoDef.kind = 'class'
+      ORDER BY GotoDef.definition_key
+    `).all()).toEqual([
+      { definition_key: '["class","RuntimeRecoveryNeedle",0,null,null]' },
+    ]);
+    expectOnlyNormalizedGeneration(db, generation.id);
+  });
+  await closePreprocessor(preprocessor);
 }, 30_000);

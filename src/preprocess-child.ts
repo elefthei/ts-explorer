@@ -3,12 +3,17 @@ import { basename, join } from "node:path";
 import { format, formatWithCursor } from "prettier";
 import {
   Cache,
-  type CacheDiagramResponse,
+  type CacheDiagramInput,
   type CacheFileWrite,
-  type CacheGotoDefinitionWrite,
+  DiagramMaterializationError,
 } from "./cache.ts";
+import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
-import { buildPackageDiagram, discoverPackages } from "./packages.ts";
+import {
+  discoverPackages,
+  extractPackageDiagramGraph,
+  renderPackageDiagramGraph,
+} from "./packages.ts";
 import { ensureRegularFile, normalizeRelativePath, PathError, resolveInside } from "./paths.ts";
 import type {
   PreprocessCause,
@@ -24,8 +29,9 @@ import type {
 } from "./preprocess-protocol.ts";
 import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
 import { buildTree, readDirectoryEntries } from "./tree.ts";
-import type { DiagramKind, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
-import { buildUmlDiagrams } from "./uml.ts";
+import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
+import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
+import { renderUmlDiagramGraph } from "./uml/render.ts";
 
 
 class PreprocessRequestError extends Error {
@@ -47,6 +53,12 @@ let state: PreprocessState | undefined;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram {
+  return graph.kind === "packages"
+    ? renderPackageDiagramGraph(graph)
+    : renderUmlDiagramGraph(graph);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -189,6 +201,7 @@ function parseRequest(value: unknown): PreprocessRequest {
         type,
         generationId: requireSafeInteger(value.generationId, "generationId"),
         query: requireString(value.query, "query"),
+        caseInsensitive: requireBoolean(value.caseInsensitive, "caseInsensitive"),
       };
     case "discard-generation": {
       if (value.mode !== "delete" && value.mode !== "failed") {
@@ -226,38 +239,26 @@ async function resolveValidatedPath(preprocessState: PreprocessState, relativePa
   return resolveInside(preprocessState.sourceDir, normalized, true);
 }
 
-function emptyDiagram(kind: DiagramKind, scopePath: string, dsl: string): CacheDiagramResponse {
-  return {
-    kind,
-    scopePath,
-    status: "ready",
-    dsl,
-    dsls: [dsl],
-    packageNodes: [],
-    definitions: [],
-    externalUsers: [],
-    localUsers: [],
-  };
-}
-
-function errorDiagram(
-  scopePath: string,
-  message: string,
-  previous: CacheDiagramResponse | null,
-): CacheDiagramResponse {
-  const fallback = previous ?? emptyDiagram("uml", scopePath, "classDiagram");
-  return {
-    kind: "uml",
-    scopePath,
-    status: "error",
-    dsl: fallback.dsl,
-    dsls: fallback.dsls,
-    packageNodes: fallback.packageNodes,
-    definitions: fallback.definitions,
-    externalUsers: fallback.externalUsers,
-    localUsers: fallback.localUsers,
-    error: message,
-  };
+function failedDiagramInput(
+  preprocessState: PreprocessState,
+  generationId: number,
+  graph: DiagramGraph,
+  error: string,
+): CacheDiagramInput {
+  const activeGenerationId = preprocessState.cache.getActiveGenerationId();
+  return activeGenerationId === null || activeGenerationId === generationId
+    ? {
+      graph,
+      outcome: { status: "error", error },
+    }
+    : {
+      fallbackSource: {
+        sourceGenerationId: activeGenerationId,
+        kind: graph.kind,
+        scopePath: graph.scopePath,
+      },
+      outcome: { status: "error", error },
+    };
 }
 
 async function discoverAndPersist(
@@ -265,92 +266,73 @@ async function discoverAndPersist(
   generationId: number,
 ): Promise<{ packages: PackageInfo[] }> {
   let packages: PackageInfo[];
-  let diagram: CacheDiagramResponse;
+  let diagram: CacheDiagramInput;
   try {
     packages = [...await discoverPackages(preprocessState.sourceDir)].map((pkg) => ({
       name: pkg.name,
       path: normalizeRelativePath(pkg.path),
       dependencies: [...pkg.dependencies],
     }));
-    const built = buildPackageDiagram(packages);
     diagram = {
-      ...emptyDiagram("packages", "", built.dsl),
-      packageNodes: built.packageNodes,
+      graph: extractPackageDiagramGraph(packages),
+      outcome: { status: "ready" },
     };
   } catch (error) {
     packages = [];
-    let previous: CacheDiagramResponse | null = null;
-    try {
-      const activeGenerationId = preprocessState.cache.getActiveGenerationId();
-      if (activeGenerationId !== null && activeGenerationId !== generationId) {
-        previous = preprocessState.cache.readDiagram(activeGenerationId, "packages", "");
-      }
-    } catch {
-      previous = null;
-    }
-    const fallback = previous ?? emptyDiagram("packages", "", "flowchart LR");
-    diagram = {
-      kind: "packages",
-      scopePath: "",
-      status: "error",
-      dsl: fallback.dsl,
-      dsls: fallback.dsls,
-      packageNodes: fallback.packageNodes,
-      definitions: fallback.definitions,
-      externalUsers: fallback.externalUsers,
-      localUsers: fallback.localUsers,
-      error: errorMessage(error),
-    };
+    diagram = failedDiagramInput(
+      preprocessState,
+      generationId,
+      extractPackageDiagramGraph([], "bare"),
+      errorMessage(error),
+    );
   }
-  preprocessState.cache.writeDiscovery(generationId, packages, diagram);
+  preprocessState.cache.writeDiscovery(
+    generationId,
+    packages,
+    diagram,
+    renderDiagramGraph,
+  );
   return { packages };
 }
 
-async function buildScopeDiagram(
+async function extractScopeDiagram(
   preprocessState: PreprocessState,
   generationId: number,
   scopePath: string,
   shouldBuild: boolean,
   packages: readonly PackageInfo[],
-): Promise<CacheDiagramResponse> {
-  if (!shouldBuild) return emptyDiagram("uml", scopePath, "classDiagram");
-  try {
-    const uml = await buildUmlDiagrams(preprocessState.sourceDir, scopePath, packages);
+): Promise<CacheDiagramInput> {
+  if (!shouldBuild) {
     return {
-      kind: "uml",
-      scopePath,
-      status: "ready",
-      dsl: uml.dsl,
-      dsls: uml.dsls,
-      packageNodes: [],
-      definitions: uml.definitions,
-      externalUsers: uml.externalUsers,
-      localUsers: uml.localUsers,
+      graph: bareUmlDiagramGraph(scopePath),
+      outcome: { status: "ready" },
+    };
+  }
+  try {
+    return {
+      graph: await extractUmlDiagramGraph(preprocessState.sourceDir, scopePath, packages),
+      outcome: { status: "ready" },
     };
   } catch (error) {
-    let previous: CacheDiagramResponse | null = null;
-    try {
-      const activeGenerationId = preprocessState.cache.getActiveGenerationId();
-      if (activeGenerationId !== null && activeGenerationId !== generationId) {
-        previous = preprocessState.cache.readDiagram(activeGenerationId, "uml", scopePath);
-      }
-    } catch {
-      previous = null;
-    }
-    return errorDiagram(scopePath, errorMessage(error), previous);
+    return failedDiagramInput(
+      preprocessState,
+      generationId,
+      bareUmlDiagramGraph(scopePath),
+      errorMessage(error),
+    );
   }
 }
 
 type PreprocessedFile = {
   file: CacheFileWrite;
-  definitions: CacheGotoDefinitionWrite[];
+  definitions: EditorGotoDefinition[];
 };
 
 function indexDisplayDefinitions(
   path: string,
   displayContent: string | null,
   rawDefinitions: readonly GotoDefinition[],
-): CacheGotoDefinitionWrite[] {
+): EditorGotoDefinition[] {
   if (displayContent === null || rawDefinitions.length === 0) return [];
   const displaySpans = new Map(
     parseDefinitionSpans(path, displayContent).map((definition) => [definition.key, definition]),
@@ -483,7 +465,7 @@ async function preprocessScope(
   const shouldBuildUml = isDirectoryScope
     || (isTypeScriptPath(scope.path) && !isDeclarationPath(scope.path));
   const resource = scope.path ? `./${scope.path}` : ".";
-  const buildDiagram = () => buildScopeDiagram(
+  const extractDiagram = () => extractScopeDiagram(
     preprocessState,
     generationId,
     scope.path,
@@ -491,8 +473,33 @@ async function preprocessScope(
     packages,
   );
   const diagram = shouldBuildUml
-    ? await runPhase(generationId, cause, "uml", resource, buildDiagram)
-    : await buildDiagram();
+    ? await runPhase(generationId, cause, "uml", resource, extractDiagram)
+    : await extractDiagram();
+  const rawDefinitions = "graph" in diagram
+    && diagram.outcome.status === "ready"
+    && diagram.graph.kind === "uml"
+    ? diagram.graph.definitions.map((definition) => ({
+      key: definition.definitionKey,
+      kind: definition.definitionKind,
+      name: definition.name,
+      qualifiedName: definition.qualifiedName,
+      source: {
+        path: definition.sourcePath,
+        line: definition.sourceLine,
+        column: definition.sourceColumn,
+      },
+      uml: {
+        scopePath: definition.umlScopePath,
+        entityName: definition.umlEntityName,
+        ...(definition.umlMemberName === null
+          ? {}
+          : { memberName: definition.umlMemberName }),
+        ...(definition.umlMemberOccurrence === null
+          ? {}
+          : { memberOccurrence: definition.umlMemberOccurrence }),
+      },
+    }))
+    : [];
   const processedFile = isDirectoryScope
     ? undefined
     : isSourcePath(scope.path)
@@ -504,20 +511,41 @@ async function preprocessScope(
         () => preprocessFile(
           absolutePath,
           scope.path,
-          diagram.status === "ready" ? diagram.definitions : [],
+          rawDefinitions,
         ),
       )
       : await preprocessFile(
         absolutePath,
         scope.path,
-        diagram.status === "ready" ? diagram.definitions : [],
+        rawDefinitions,
       );
-  preprocessState.cache.writeScope(generationId, {
-    entries: [ownEntry, ...children],
-    diagram,
+  const entries = [ownEntry, ...children];
+  const persistScope = (
+    nextDiagram: CacheDiagramInput,
+    definitions: readonly EditorGotoDefinition[],
+  ) => preprocessState.cache.writeScope(generationId, {
+    entries,
+    diagram: nextDiagram,
     file: processedFile?.file,
-    definitions: processedFile?.definitions ?? [],
-  });
+    definitions,
+  }, renderDiagramGraph);
+  try {
+    persistScope(diagram, processedFile?.definitions ?? []);
+  } catch (error) {
+    if (
+      !(error instanceof DiagramMaterializationError)
+      || !("graph" in diagram)
+      || diagram.outcome.status !== "ready"
+      || diagram.graph.kind !== "uml"
+      || diagram.graph.renderMode !== "normal"
+    ) throw error;
+    persistScope(failedDiagramInput(
+      preprocessState,
+      generationId,
+      bareUmlDiagramGraph(scope.path),
+      errorMessage(error),
+    ), []);
+  }
   return {
     children: children.map((child) => ({
       path: child.path,
@@ -693,7 +721,14 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
         ),
       );
     case "search":
-      return success(request, preprocessState.cache.searchFiles(request.generationId, request.query));
+      return success(
+        request,
+        preprocessState.cache.searchFiles(
+          request.generationId,
+          request.query,
+          request.caseInsensitive,
+        ),
+      );
     case "promote-generation":
       preprocessState.cache.promoteGeneration(request.generationId);
       return success(request, null);
@@ -715,8 +750,9 @@ function failure(id: number, error: unknown): PreprocessFailure {
   };
 }
 
-const sendToParent = process.send?.bind(process);
-if (!sendToParent) throw new Error("preprocess child requires an IPC channel");
+const sendToParent = process.send?.bind(process) ?? (() => {
+  throw new Error("preprocess child requires an IPC channel");
+})();
 
 function sendMessage(message: PreprocessResponse | PreprocessProgressEvent): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -731,7 +767,7 @@ function sendMessage(message: PreprocessResponse | PreprocessProgressEvent): Pro
     };
     process.once("disconnect", onDisconnect);
     try {
-      sendToParent!(message, (error: Error | null) => settle(error));
+      sendToParent(message, (error: Error | null) => settle(error));
     } catch (error) {
       settle(error instanceof Error ? error : new Error(String(error)));
     }
@@ -769,7 +805,21 @@ async function processMessage(value: unknown): Promise<void> {
     request = parseRequest(value);
     response = await handleRequest(request);
   } catch (error) {
-    response = failure(request?.id ?? readRequestId(value), error);
+    let responseError = error;
+    if (request?.type !== "init" && state) {
+      try {
+        const recoveredTable = state.cache.repairTableForSchemaError(error);
+        if (recoveredTable) {
+          responseError = new PreprocessRequestError(
+            "SCHEMA_RETRY",
+            `recovered cache table ${recoveredTable}; retry request`,
+          );
+        }
+      } catch (recoveryError) {
+        responseError = recoveryError;
+      }
+    }
+    response = failure(request?.id ?? readRequestId(value), responseError);
   }
 
   try {

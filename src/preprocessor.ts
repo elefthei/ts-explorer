@@ -48,7 +48,8 @@ interface QueueJob {
   readonly generationId?: number;
   readonly deferred: Deferred<unknown>;
   readonly finished: Deferred<void>;
-  crashRetries: number;
+  retriedAfterCrash: boolean;
+  retriedAfterSchemaRepair: boolean;
   cancelled: boolean;
 }
 
@@ -154,8 +155,7 @@ function asError(value: unknown): Error {
 
 function findTreeKind(tree: TreeNode, path: string): "directory" | "file" | undefined {
   const stack = [tree];
-  while (stack.length) {
-    const node = stack.pop()!;
+  for (let node = stack.pop(); node; node = stack.pop()) {
     if (node.path === path) return node.kind;
     if (node.children) stack.push(...node.children);
   }
@@ -231,8 +231,14 @@ export class Preprocessor {
     return this.dedupe("read-packages", () => this.readPackagesAcrossGenerations());
   }
   
-  public search(query: string): Promise<Omit<SearchResponse, "version">> {
-    return this.dedupe(`search:${query}`, () => this.readStable<"search">({ type: "search", query }));
+  public search(
+    query: string,
+    caseInsensitive: boolean,
+  ): Promise<Omit<SearchResponse, "version">> {
+    return this.dedupe(
+      `search:${caseInsensitive ? "i" : "s"}:${query}`,
+      () => this.readStable<"search">({ type: "search", query, caseInsensitive }),
+    );
   }
   
   public getDiagram(
@@ -680,7 +686,8 @@ export class Preprocessor {
       generationId,
       deferred,
       finished,
-      crashRetries: 0,
+      retriedAfterCrash: false,
+      retriedAfterSchemaRepair: false,
       cancelled: false,
     };
     if (this.closed) {
@@ -713,13 +720,15 @@ export class Preprocessor {
   }
   
   private nextJob(): QueueJob | undefined {
-    while (this.interactiveQueue.length) {
-      const job = this.interactiveQueue.shift()!;
+    let job = this.interactiveQueue.shift();
+    while (job) {
       if (!job.cancelled) return job;
+      job = this.interactiveQueue.shift();
     }
-    while (this.backgroundQueue.length) {
-      const job = this.backgroundQueue.shift()!;
+    job = this.backgroundQueue.shift();
+    while (job) {
       if (!job.cancelled) return job;
+      job = this.backgroundQueue.shift();
     }
     return undefined;
   }
@@ -752,6 +761,14 @@ export class Preprocessor {
     }
     if (completed) job.finished.resolve(undefined);
   }
+
+  private requeueJobForRetry(slot: SubprocessSlot, job: QueueJob): void {
+    this.finishSlotJob(slot, job, false);
+    job.state = "queued";
+    this.resetPriorityRequestsForJob(job);
+    this.queueFor(job.priority).unshift(job);
+    this.dispatch();
+  }
   
   private runJob(slot: SubprocessSlot, job: QueueJob): void {
     job.state = "processing";
@@ -763,6 +780,18 @@ export class Preprocessor {
       if (!job.cancelled) job.deferred.resolve(value);
       this.dispatch();
     }).catch(async (error) => {
+      if (
+        error instanceof PreprocessorError
+        && error.code === "SCHEMA_RETRY"
+        && !job.retriedAfterSchemaRepair
+        && !job.cancelled
+        && !this.closed
+      ) {
+        job.retriedAfterSchemaRepair = true;
+        this.requeueJobForRetry(slot, job);
+        return;
+      }
+
       if (error instanceof SubprocessExitedError) {
         if (job.cancelled || this.closed) {
           if (slot.retirement) await slot.retirement;
@@ -775,15 +804,11 @@ export class Preprocessor {
           }
           return;
         }
-        if (job.crashRetries === 0) {
-          job.crashRetries = 1;
+        if (!job.retriedAfterCrash) {
+          job.retriedAfterCrash = true;
           try {
             await this.ensureSlotRecovery(slot);
-            this.finishSlotJob(slot, job, false);
-            job.state = "queued";
-            this.resetPriorityRequestsForJob(job);
-            this.queueFor(job.priority).unshift(job);
-            this.dispatch();
+            this.requeueJobForRetry(slot, job);
             return;
           } catch (recoveryError) {
             error = new SubprocessExitedError(
@@ -823,7 +848,10 @@ export class Preprocessor {
   ): void {
     for (const queue of [this.interactiveQueue, this.backgroundQueue]) {
       for (let index = queue.length - 1; index >= 0; index -= 1) {
-        const job = queue[index]!;
+        const job = queue[index];
+        if (!job) {
+          throw new PreprocessorError("INTERNAL", "preprocessor queue is inconsistent");
+        }
         if (job.generationId !== generationId) continue;
         queue.splice(index, 1);
         job.cancelled = true;
@@ -989,7 +1017,10 @@ export class Preprocessor {
       if (generation.superseded || generation.failed) return;
       this.activeGenerationId = generation.id;
       this.latestBuildError = undefined;
-      if (this.building === generation) this.building = undefined;
+      if (this.building === generation) {
+        this.building = undefined;
+        this.buildingSignal = createDeferred<void>();
+      }
       generation.promoted.resolve(undefined);
       this.idleDeferred.resolve(undefined);
       this.watchRebuilding = false;
@@ -1113,8 +1144,18 @@ export class Preprocessor {
       if (this.closed) throw this.closedError();
       this.poolReady = true;
       this.dispatch();
-      await this.beginGeneration("startup");
+      if (this.activeGenerationId === null) {
+        await this.beginGeneration("startup");
+      }
       this.readyDeferred.resolve(undefined);
+      if (
+        this.activeGenerationId !== null
+        && !this.watchRebuilding
+        && !this.watchRequested
+      ) {
+        this.idleDeferred.resolve(undefined);
+        this.resolveReadyCallback();
+      }
     } catch (error) {
       const failure = asError(error);
       this.readyDeferred.reject(failure);
