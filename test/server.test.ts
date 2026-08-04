@@ -900,6 +900,55 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       });
     }
 
+    const fastDefinitionHit = await fetch(
+      `${base}/api/definition?path=${encodeURIComponent(indexedPath)}&name=runSecond`
+        + `&qualifiedName=${encodeURIComponent("IndexedService.runSecond")}`,
+    );
+    expect(fastDefinitionHit.status).toBe(200);
+    expect(await fastDefinitionHit.json()).toEqual({
+      version: tree.version,
+      definition: { path: indexedPath, line: 3, column: 1 },
+    });
+    const fastDefinitionMiss = await fetch(
+      `${base}/api/definition?path=${encodeURIComponent(indexedPath)}&name=runThird`
+        + `&qualifiedName=${encodeURIComponent("IndexedService.runThird")}`,
+    );
+    expect(fastDefinitionMiss.status).toBe(200);
+    expect(await fastDefinitionMiss.json()).toEqual({
+      version: tree.version,
+      definition: null,
+    });
+
+    for (const invalidDefinitionLookup of [
+      {
+        name: "missing qualified name",
+        query: `path=${encodeURIComponent(indexedPath)}&name=runFirst`,
+        status: 422,
+        error: "path, name, and qualifiedName are required",
+      },
+      {
+        name: "empty name",
+        query: `path=${encodeURIComponent(indexedPath)}&name=&qualifiedName=IndexedService`,
+        status: 422,
+        error: "name and qualifiedName must not be empty",
+      },
+      {
+        name: "escaping path",
+        query: `path=${encodeURIComponent("../indexed-service.ts")}`
+          + "&name=IndexedService&qualifiedName=IndexedService",
+        status: 403,
+        error: "path escapes the source root",
+      },
+    ]) {
+      const response = await fetch(`${base}/api/definition?${invalidDefinitionLookup.query}`);
+      expect(response.status, invalidDefinitionLookup.name).toBe(
+        invalidDefinitionLookup.status,
+      );
+      expect(await response.json(), invalidDefinitionLookup.name).toEqual({
+        error: invalidDefinitionLookup.error,
+      });
+    }
+
     const indexedFileResponse = await fetch(
       `${base}/api/file?path=${encodeURIComponent(indexedPath)}`,
     );

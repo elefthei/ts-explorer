@@ -1,6 +1,7 @@
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { LRUCache } from "lru-cache";
 import { normalizeRelativePath } from "./paths.ts";
 import {
   isPreprocessProgressEvent,
@@ -22,6 +23,7 @@ import type {
   PreprocessPriorityStatus,
   SearchResponse,
   TreeNode,
+  UmlSourceLocation,
 } from "./types.ts";
 
 type RequestType = PreprocessRequest["type"];
@@ -33,6 +35,18 @@ type QueuedRequest = RequestMap[RequestType];
 type QueuePriority = "interactive" | "background";
 type QueueJobState = "queued" | "processing" | "done";
 type SlotState = "new" | "initializing" | "idle" | "busy" | "dead" | "closing" | "closed";
+
+// Point reads of a generation's immutable rows. `search` is deliberately absent: it is the one read
+// whose recovery from a runtime table drop is observable (a repeated identical query must re-reach
+// the child so `repairTableForSchemaError` runs and the repaired, empty result surfaces).
+const CACHEABLE_REQUEST_TYPES: Partial<Record<RequestType, true>> = {
+  "read-tree": true,
+  "read-packages": true,
+  "read-diagram": true,
+  "read-file": true,
+  "read-definition": true,
+  "lookup-definition": true,
+};
 
 interface Deferred<Value> {
   readonly promise: Promise<Value>;
@@ -180,6 +194,7 @@ export class Preprocessor {
   private readonly interactiveQueue: QueueJob[] = [];
   private readonly backgroundQueue: QueueJob[] = [];
   private readonly queryDedupe = new Map<string, Promise<unknown>>();
+  private readonly ipcCache = new LRUCache<string, object>({ max: 512, ttl: 30_000 });
   private readonly generations = new Map<number, GenerationState>();
   private readonly priorityRequests = new Map<number, PriorityRequest>();
   private readonly priorityRequestByResource = new Map<string, PriorityRequest>();
@@ -297,6 +312,35 @@ export class Preprocessor {
     return this.dedupe(
       `read-definition:${normalizedPath}:${location.line}:${location.column}`,
       () => this.readDefinitionAcrossGenerations(normalizedPath, location),
+    );
+  }
+  
+  public lookupDefinition(
+    path: string,
+    name: string,
+    qualifiedName: string,
+  ): Promise<UmlSourceLocation | null> {
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRelativePath(path);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!name || !qualifiedName) {
+      return Promise.reject(
+        new PreprocessorError("INVALID_INPUT", "name and qualifiedName are required"),
+      );
+    }
+    return this.dedupe(
+      `lookup-definition:${normalizedPath}:${qualifiedName}:${name}`,
+      async () => {
+        await this.readyDeferred.promise;
+        if (this.closed) throw this.closedError();
+        return this.enqueueCachedRequest<"lookup-definition">(
+          { type: "lookup-definition", path: normalizedPath, name, qualifiedName },
+          "interactive",
+        );
+      },
     );
   }
 
@@ -704,6 +748,22 @@ export class Preprocessor {
     };
   }
   
+  private async enqueueCachedRequest<Type extends RequestType>(
+    request: RequestFor<Type>,
+    priority: QueuePriority,
+    generationId?: number,
+  ): Promise<PreprocessResultMap[Type]> {
+    if (!CACHEABLE_REQUEST_TYPES[request.type]) {
+      return this.enqueueRequest<Type>(request, priority, generationId).promise;
+    }
+    const key = JSON.stringify(request);
+    const cached = this.ipcCache.get(key);
+    if (cached !== undefined) return cached as PreprocessResultMap[Type];
+    const value = await this.enqueueRequest<Type>(request, priority, generationId).promise;
+    if (value !== null && typeof value === "object") this.ipcCache.set(key, value);
+    return value;
+  }
+  
   private repositionQueuedJob(job: QueueJob): void {
     if (job.cancelled || job.state !== "queued") return;
     let index = this.backgroundQueue.indexOf(job);
@@ -788,6 +848,7 @@ export class Preprocessor {
         && !this.closed
       ) {
         job.retriedAfterSchemaRepair = true;
+        this.ipcCache.clear();
         this.requeueJobForRetry(slot, job);
         return;
       }
@@ -998,6 +1059,19 @@ export class Preprocessor {
     }).finally(() => this.mutationFinished(generation));
   }
   
+  private enqueueDefinitionIndex(generation: GenerationState): void {
+    generation.pendingMutations += 1;
+    const indexed = this.enqueueRequest<"index-definitions">(
+      { type: "index-definitions", generationId: generation.id, cause: generation.cause },
+      "background",
+      generation.id,
+    ).promise;
+    void indexed.catch((error) => {
+      if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
+      this.failGeneration(generation, asError(error), false);
+    }).finally(() => this.mutationFinished(generation));
+  }
+  
   private maybeSchedulePromotion(generation: GenerationState): void {
     if (
       generation.superseded ||
@@ -1025,6 +1099,7 @@ export class Preprocessor {
       this.idleDeferred.resolve(undefined);
       this.watchRebuilding = false;
       this.queryDedupe.clear();
+      this.ipcCache.clear();
       this.resolveReadyCallback();
     }).catch((error) => {
       if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
@@ -1053,6 +1128,7 @@ export class Preprocessor {
     this.building = generation;
     this.latestBuildError = undefined;
     this.buildingSignal.resolve(undefined);
+    this.enqueueDefinitionIndex(generation);
     this.enqueueDiscovery(generation);
     return generation;
   }
@@ -1062,6 +1138,7 @@ export class Preprocessor {
   ): Promise<void> {
     if (generation.superseded || generation.failed) return;
     generation.superseded = true;
+    this.ipcCache.clear();
     const error = new SupersededGenerationError();
     this.removeQueuedGenerationJobs(generation.id, error);
     this.rejectScopeWaiters(generation, error);
@@ -1196,10 +1273,10 @@ export class Preprocessor {
         continue;
       }
       if (this.activeGenerationId !== null) {
-        return this.enqueueRequest<Type>(
+        return this.enqueueCachedRequest<Type>(
           { ...request, generationId: this.activeGenerationId } as RequestFor<Type>,
           "interactive",
-        ).promise;
+        );
       }
       const generation = await this.awaitBuildingGeneration();
       try {
@@ -1226,19 +1303,19 @@ export class Preprocessor {
         continue;
       }
       if (this.activeGenerationId !== null) {
-        return this.enqueueRequest<"read-packages">(
+        return this.enqueueCachedRequest<"read-packages">(
           { type: "read-packages", generationId: this.activeGenerationId },
           "interactive",
-        ).promise;
+        );
       }
       const generation = await this.awaitBuildingGeneration();
       try {
         await generation.discovered.promise;
-        return await this.enqueueRequest<"read-packages">(
+        return await this.enqueueCachedRequest<"read-packages">(
           { type: "read-packages", generationId: generation.id },
           "interactive",
           generation.id,
-        ).promise;
+        );
       } catch (error) {
         if (error instanceof SupersededGenerationError) continue;
         throw error;
@@ -1251,10 +1328,10 @@ export class Preprocessor {
     if (path === "") return "directory";
     if (this.activeGenerationId === null) return undefined;
     try {
-      const tree = await this.enqueueRequest<"read-tree">(
+      const tree = await this.enqueueCachedRequest<"read-tree">(
         { type: "read-tree", generationId: this.activeGenerationId },
         "interactive",
-      ).promise;
+      );
       return findTreeKind(tree, path);
     } catch {
       return undefined;
@@ -1320,11 +1397,11 @@ export class Preprocessor {
       const record = await this.prioritizeScope(generation, scopePath);
       if (record) await record.promise;
     }
-    return this.enqueueRequest<"read-diagram">(
+    return this.enqueueCachedRequest<"read-diagram">(
       { type: "read-diagram", generationId: generation.id, kind, scopePath },
       "interactive",
       generation.id,
-    ).promise;
+    );
   }
   
   private async readDiagramAcrossGenerations(
@@ -1346,10 +1423,10 @@ export class Preprocessor {
       const selectedGenerationId = this.activeGenerationId;
       if (selectedGenerationId !== null) {
         try {
-          return await this.enqueueRequest<"read-diagram">(
+          return await this.enqueueCachedRequest<"read-diagram">(
             { type: "read-diagram", generationId: selectedGenerationId, kind, scopePath },
             "interactive",
-          ).promise;
+          );
         } catch (error) {
           if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
           if (this.activeGenerationId !== selectedGenerationId) continue;
@@ -1373,7 +1450,7 @@ export class Preprocessor {
     location: { line: number; column: number },
   ): Promise<GotoDefinition | null> {
     const read = (generationId: number, generation?: GenerationState) =>
-      this.enqueueRequest<"read-definition">(
+      this.enqueueCachedRequest<"read-definition">(
         {
           type: "read-definition",
           generationId,
@@ -1383,7 +1460,7 @@ export class Preprocessor {
         },
         "interactive",
         generation?.id,
-      ).promise;
+      );
   
     await this.readyDeferred.promise;
     while (!this.closed) {
@@ -1665,11 +1742,11 @@ export class Preprocessor {
   ): Promise<FileResponse> {
     const record = await this.prioritizeScope(generation, path, "file");
     if (record) await record.promise;
-    return this.enqueueRequest<"read-file">(
+    return this.enqueueCachedRequest<"read-file">(
       { type: "read-file", generationId: generation.id, path, ...(location ? { location } : {}) },
       "interactive",
       generation.id,
-    ).promise;
+    );
   }
   
   private async readFileAcrossGenerations(
@@ -1691,10 +1768,10 @@ export class Preprocessor {
       const selectedGenerationId = this.activeGenerationId;
       if (selectedGenerationId !== null) {
         try {
-          return await this.enqueueRequest<"read-file">(
+          return await this.enqueueCachedRequest<"read-file">(
             { type: "read-file", generationId: selectedGenerationId, path, ...(location ? { location } : {}) },
             "interactive",
-          ).promise;
+          );
         } catch (error) {
           if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
           if (this.activeGenerationId !== selectedGenerationId) continue;
@@ -1726,6 +1803,7 @@ export class Preprocessor {
     for (const promise of this.queryDedupe.values()) {
       void promise.catch(() => undefined);
     }
+    this.ipcCache.clear();
     for (const queue of [this.interactiveQueue, this.backgroundQueue]) {
       for (const job of queue.splice(0)) {
         job.cancelled = true;
@@ -1784,6 +1862,7 @@ export class Preprocessor {
     this.watchRequested = true;
     this.latestBuildError = undefined;
     this.queryDedupe.clear();
+    this.ipcCache.clear();
     if (this.idleDeferred.settled) this.idleDeferred = createDeferred<void>();
     if (!this.watchLoop) {
       this.watchLoop = this.runWatchLoop();

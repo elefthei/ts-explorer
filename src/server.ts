@@ -206,6 +206,20 @@ export class ExplorerServer {
         }
         return Response.json(await this.store.getDefinition(path, location));
       }
+      if (url.pathname === "/api/definition" && request.method === "GET") {
+        const path = url.searchParams.get("path");
+        const name = url.searchParams.get("name");
+        const qualifiedName = url.searchParams.get("qualifiedName");
+        if (path === null || name === null || qualifiedName === null) {
+          throw new InputError("path, name, and qualifiedName are required");
+        }
+        if (name === "" || qualifiedName === "") {
+          throw new InputError("name and qualifiedName must not be empty");
+        }
+        return Response.json(
+          await this.store.lookupDefinition(path, name, qualifiedName),
+        );
+      }
       if (url.pathname === "/api/file" && request.method === "GET") {
         return Response.json(
           await this.store.readFile(

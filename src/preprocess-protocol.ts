@@ -6,6 +6,7 @@ import type {
   PackageInfo,
   SearchResponse,
   TreeNode,
+  UmlSourceLocation,
 } from "./types.ts";
 
 export type PreprocessErrorCode =
@@ -41,6 +42,12 @@ export type PreprocessRequest =
   | { id: number; type: "discover-packages"; generationId: number }
   | {
     id: number;
+    type: "index-definitions";
+    generationId: number;
+    cause: PreprocessCause;
+  }
+  | {
+    id: number;
     type: "preprocess-scope";
     generationId: number;
     cause: PreprocessCause;
@@ -73,6 +80,13 @@ export type PreprocessRequest =
   }
   | {
     id: number;
+    type: "lookup-definition";
+    path: string;
+    name: string;
+    qualifiedName: string;
+  }
+  | {
+    id: number;
     type: "search";
     generationId: number;
     query: string;
@@ -91,12 +105,14 @@ export type PreprocessResultMap = {
   init: { activeGenerationId: number | null };
   "begin-generation": { generationId: number };
   "discover-packages": { packages: PackageInfo[] };
+  "index-definitions": { definitionCount: number };
   "preprocess-scope": { children: PreprocessScope[] };
   "read-tree": TreeNode;
   "read-packages": PackageInfo[];
   "read-diagram": Omit<DiagramResponse, "version">;
   "read-file": FileResponse;
   "read-definition": GotoDefinition | null;
+  "lookup-definition": UmlSourceLocation | null;
   search: Omit<SearchResponse, "version">;
   "promote-generation": null;
   "discard-generation": null;
@@ -126,7 +142,7 @@ export type PreprocessResponse = PreprocessSuccess | PreprocessFailure;
 
 export type PreprocessProgressEvent = {
   event: "start" | "done";
-  component: "uml" | "code";
+  component: "uml" | "code" | "definitions";
   resource: string;
   generationId: number;
   cause: PreprocessCause;
@@ -150,7 +166,8 @@ export function isPreprocessProgressEvent(value: unknown): value is PreprocessPr
     isRecord(value) &&
     Object.keys(value).length === 5 &&
     (value.event === "start" || value.event === "done") &&
-    (value.component === "uml" || value.component === "code") &&
+    (value.component === "uml" || value.component === "code" ||
+      value.component === "definitions") &&
     typeof value.resource === "string" &&
     typeof value.generationId === "number" &&
     Number.isSafeInteger(value.generationId) &&

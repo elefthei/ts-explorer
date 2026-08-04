@@ -19,10 +19,11 @@ import type {
   PackageInfo,
   SearchResponse,
   TreeNode,
+  UmlSourceLocation,
 } from "./types.ts";
 import { validateUmlDiagramGraph } from "./uml/render.ts";
 
-const CACHE_SCHEMA_VERSION = 3;
+const CACHE_SCHEMA_VERSION = 4;
 
 export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
@@ -57,6 +58,15 @@ export type CacheFileWrite = {
   displayContent: string | null;
   sourceError: string | null;
   formatError: string | null;
+};
+
+export type DefinitionIndexWrite = {
+  path: string;
+  name: string;
+  qualifiedName: string;
+  kind: GotoDefinitionKind;
+  line: number;
+  column: number;
 };
 
 
@@ -100,6 +110,11 @@ type GotoDefinitionRow = {
   uml_entity_name: string;
   uml_member_name: string | null;
   uml_member_occurrence: number | null;
+};
+type DefinitionIndexRow = {
+  source_path: string;
+  source_line: number;
+  source_column: number;
 };
 type SchemaObjectRow = { name: string };
 type GraphIdentity = [generationId: number, kind: DiagramKind, scopePath: string];
@@ -206,6 +221,12 @@ type CacheStatements = {
   markGenerationFailed: Statement<never, [number, number]>;
   optimizeSearch: Statement<never, []>;
   optimizeGotoDefinitionSearch: Statement<never, []>;
+  deleteGenerationDefinitionIndex: Statement<never, [number]>;
+  insertDefinitionIndex: Statement<
+    never,
+    [number, string, string, string, GotoDefinitionKind, number, number]
+  >;
+  selectDefinitionIndexEntry: Statement<DefinitionIndexRow, [string, string, string]>;
 };
 
 type ImmediateTransaction<Args extends unknown[], Result = void> = {
@@ -1151,6 +1172,20 @@ const CACHE_SCHEMA_OBJECTS = [
       INSERT INTO goto_def_search(rowid, name, qualified_name)
       VALUES (NEW.id, NEW.name, NEW.qualified_name);
     END`,
+  },
+  {
+    name: "DefinitionIndex",
+    kind: "table",
+    createSql: `CREATE TABLE DefinitionIndex (
+      generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+      source_path TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qualified_name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('class','interface','enum','type','method')),
+      source_line INTEGER NOT NULL CHECK (source_line > 0),
+      source_column INTEGER NOT NULL CHECK (source_column > 0),
+      PRIMARY KEY (generation_id, source_path, name, source_line, source_column)
+    )`,
   },
 ] as const satisfies readonly CacheSchemaObject[];
 
@@ -2939,6 +2974,9 @@ private readonly deleteInactiveGeneration!: CacheStatements["deleteInactiveGener
 private readonly markGenerationFailed!: CacheStatements["markGenerationFailed"];
 private readonly optimizeSearch!: CacheStatements["optimizeSearch"];
 private readonly optimizeGotoDefinitionSearch!: CacheStatements["optimizeGotoDefinitionSearch"];
+private readonly deleteGenerationDefinitionIndex!: CacheStatements["deleteGenerationDefinitionIndex"];
+private readonly insertDefinitionIndex!: CacheStatements["insertDefinitionIndex"];
+private readonly selectDefinitionIndexEntry!: CacheStatements["selectDefinitionIndexEntry"];
 private readonly statements!: Array<{ finalize(): void }>;
 private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
 private readonly discoveryTransaction!: ImmediateTransaction<
@@ -2948,6 +2986,9 @@ private readonly discoveryTransaction!: ImmediateTransaction<
 private readonly scopeTransaction!: ImmediateTransaction<
   [number, CacheScopeWrite, DiagramRenderer],
   CacheDiagramResponse
+>;
+private readonly definitionIndexTransaction!: ImmediateTransaction<
+  [number, readonly DefinitionIndexWrite[]]
 >;
 private readonly promotionTransaction!: ImmediateTransaction<[number]>;
 private readonly cleanupTransaction!: ImmediateTransaction<[number]>;
@@ -3099,6 +3140,38 @@ constructor(dbPath: string) {
       uml_member_name,
       uml_member_occurrence
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const deleteGenerationDefinitionIndex = db.query<never, [number]>(`
+    DELETE FROM DefinitionIndex WHERE generation_id = ?
+  `);
+  const insertDefinitionIndex = db.query<never, [
+    number,
+    string,
+    string,
+    string,
+    GotoDefinitionKind,
+    number,
+    number,
+  ]>(`
+    INSERT INTO DefinitionIndex(
+      generation_id,
+      source_path,
+      name,
+      qualified_name,
+      kind,
+      source_line,
+      source_column
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const selectDefinitionIndexEntry = db.query<DefinitionIndexRow, [string, string, string]>(`
+    SELECT source_path, source_line, source_column
+    FROM DefinitionIndex
+    WHERE generation_id = (SELECT MAX(generation_id) FROM DefinitionIndex)
+      AND source_path = ?
+      AND name = ?
+      AND qualified_name = ?
+    ORDER BY source_line, source_column
+    LIMIT 1
   `);
   const selectTreeEntries = db.query<TreeRow, [number]>(`
     SELECT path, name, kind, viewable
@@ -3282,6 +3355,9 @@ constructor(dbPath: string) {
     markGenerationFailed,
     optimizeSearch,
     optimizeGotoDefinitionSearch,
+    deleteGenerationDefinitionIndex,
+    insertDefinitionIndex,
+    selectDefinitionIndexEntry,
     ...graphStore.statements,
   ];
   this.selectRawActiveGeneration = selectRawActiveGeneration;
@@ -3318,6 +3394,9 @@ constructor(dbPath: string) {
   this.markGenerationFailed = markGenerationFailed;
   this.optimizeSearch = optimizeSearch;
   this.optimizeGotoDefinitionSearch = optimizeGotoDefinitionSearch;
+  this.deleteGenerationDefinitionIndex = deleteGenerationDefinitionIndex;
+  this.insertDefinitionIndex = insertDefinitionIndex;
+  this.selectDefinitionIndexEntry = selectDefinitionIndexEntry;
   this.graphStore = graphStore;
   this.statements = statements;
 
@@ -3563,6 +3642,23 @@ constructor(dbPath: string) {
     }
     return response;
   });
+  this.definitionIndexTransaction = db.transaction((
+    generationId: number,
+    definitions: readonly DefinitionIndexWrite[],
+  ) => {
+    this.deleteGenerationDefinitionIndex.run(generationId);
+    for (const definition of definitions) {
+      this.insertDefinitionIndex.run(
+        generationId,
+        definition.path,
+        definition.name,
+        definition.qualifiedName,
+        definition.kind,
+        definition.line,
+        definition.column,
+      );
+    }
+  });
   this.promotionTransaction = db.transaction((generationId: number) => {
     const result = this.markGenerationActive.run(Date.now(), generationId);
     if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
@@ -3727,6 +3823,28 @@ readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
   return this.selectDefinitions
     .all(generationId, normalizeRelativePath(path))
     .map(toEditorGotoDefinition);
+}
+
+writeDefinitionIndex(
+  generationId: number,
+  definitions: readonly DefinitionIndexWrite[],
+): void {
+  this.definitionIndexTransaction.immediate(generationId, definitions);
+}
+
+lookupDefinition(
+  path: string,
+  name: string,
+  qualifiedName: string,
+): UmlSourceLocation | null {
+  const row = this.selectDefinitionIndexEntry.get(
+    normalizeRelativePath(path),
+    name,
+    qualifiedName,
+  );
+  return row
+    ? { path: row.source_path, line: row.source_line, column: row.source_column }
+    : null;
 }
 
 searchFiles(

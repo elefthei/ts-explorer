@@ -31,7 +31,7 @@ export async function readDirectoryEntries(
     .sort(compareTreeNodes);
 }
 
-async function collectTreeEntries(
+export async function collectTreeEntries(
   sourceDir: string,
   scopePath: string,
 ): Promise<TreeNode[]> {

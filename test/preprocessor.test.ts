@@ -969,7 +969,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 3,
+      user_version: 4,
     });
     expect(db.query<{
       name: string;
@@ -2367,5 +2367,138 @@ test("recovers named cache tables and retries queued database work for runtime l
     ]);
     expectOnlyNormalizedGeneration(db, generation.id);
   });
+  await closePreprocessor(preprocessor);
+}, 30_000);
+
+test("indexes every definition before UML extraction and disambiguates lookups by qualified name", async () => {
+  const root = await temporaryRoot("ts-explorer-definition-index-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "definition-index" }));
+  await writeFixtureFile(
+    root,
+    "root.ts",
+    [
+      "export class Alpha {",
+      "  run(): void {}",
+      "}",
+      "export interface Beta {",
+      "  run(): void;",
+      "}",
+      "",
+    ].join("\n"),
+  );
+
+  const errors: Error[] = [];
+  const progressEvents: PreprocessProgressEvent[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+    1,
+    (event) => progressEvents.push(event),
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  expect(errors).toEqual([]);
+
+  expect(openDatabase(dbPath, (db) =>
+    db.query<{
+      source_path: string;
+      name: string;
+      qualified_name: string;
+      kind: string;
+      source_line: number;
+      source_column: number;
+    }, []>(`
+      SELECT source_path, name, qualified_name, kind, source_line, source_column
+      FROM DefinitionIndex
+      ORDER BY source_line, source_column
+    `).all())).toEqual([
+    {
+      source_path: "root.ts",
+      name: "Alpha",
+      qualified_name: "Alpha",
+      kind: "class",
+      source_line: 1,
+      source_column: 14,
+    },
+    {
+      source_path: "root.ts",
+      name: "run",
+      qualified_name: "Alpha.run",
+      kind: "method",
+      source_line: 2,
+      source_column: 3,
+    },
+    {
+      source_path: "root.ts",
+      name: "Beta",
+      qualified_name: "Beta",
+      kind: "interface",
+      source_line: 4,
+      source_column: 18,
+    },
+    {
+      source_path: "root.ts",
+      name: "run",
+      qualified_name: "Beta.run",
+      kind: "method",
+      source_line: 5,
+      source_column: 3,
+    },
+  ]);
+
+  expect(await preprocessor.lookupDefinition("root.ts", "run", "Beta.run")).toEqual({
+    path: "root.ts",
+    line: 5,
+    column: 3,
+  });
+  expect(await preprocessor.lookupDefinition("root.ts", "run", "Alpha.run")).toEqual({
+    path: "root.ts",
+    line: 2,
+    column: 3,
+  });
+  expect(await preprocessor.lookupDefinition("root.ts", "Gamma", "Gamma")).toBeNull();
+
+  const definitionsDone = progressEvents.findIndex(
+    (event) => event.component === "definitions" && event.event === "done",
+  );
+  const firstUmlStart = progressEvents.findIndex(
+    (event) => event.component === "uml" && event.event === "start",
+  );
+  expect(definitionsDone).toBeGreaterThanOrEqual(0);
+  expect(firstUmlStart).toBeGreaterThan(definitionsDone);
+
+  await closePreprocessor(preprocessor);
+}, 30_000);
+
+test("serves repeated read-only requests from memory and drops them when a rebuild promotes", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-ipc-cache-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "ipc-cache" }));
+  await writeFixtureFile(root, "app.ts", "export const cached = 1;\n");
+
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  expect((await preprocessor.readFile("app.ts")).content).toBe("export const cached = 1;\n");
+
+  expect(openDatabase(dbPath, (db) =>
+    db.query<never, [string]>(`
+      UPDATE files SET display_content = ? WHERE path = 'app.ts'
+    `).run("export const tampered = 2;\n").changes)).toBe(1);
+  expect((await preprocessor.readFile("app.ts")).content).toBe("export const cached = 1;\n");
+
+  await writeFixtureFile(root, "app.ts", "export const rebuilt = 3;\n");
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+  expect((await preprocessor.readFile("app.ts")).content).toBe("export const rebuilt = 3;\n");
+  expect(errors).toEqual([]);
+
   await closePreprocessor(preprocessor);
 }, 30_000);

@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { join, resolve } from "node:path";
 import {
+  browserOpenCommand,
+  browserUrl,
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
@@ -13,6 +15,7 @@ test("parses explicit directory, host, and port options", () => {
     sourceDir: resolve(directory),
     host: "0.0.0.0",
     port: 4242,
+    open: true,
   });
 });
 
@@ -21,6 +24,7 @@ test("resolves the current directory while retaining host and port defaults", ()
     sourceDir: resolve("."),
     host: "127.0.0.1",
     port: 8080,
+    open: true,
   });
 });
 
@@ -30,6 +34,28 @@ test("requires --dir", () => {
 
 test("rejects the legacy --source option", () => {
   expect(() => parseCliOptions(["--dir", ".", "--source", "."])).toThrow("Unknown argument: source");
+});
+
+test("disables the browser launch with --no-open", () => {
+  expect(parseCliOptions(["--dir", ".", "--no-open"])?.open).toBe(false);
+});
+
+test("browses the loopback address when bound to a wildcard host", () => {
+  expect(browserUrl("0.0.0.0", 8080)).toBe("http://127.0.0.1:8080");
+  expect(browserUrl("::", 8080)).toBe("http://127.0.0.1:8080");
+});
+
+test("browses the bound host and actual port", () => {
+  expect(browserUrl("127.0.0.1", 4242)).toBe("http://127.0.0.1:4242");
+  expect(browserUrl("::1", 4242)).toBe("http://[::1]:4242");
+});
+
+test.each([
+  ["win32", { command: "cmd", args: ["/c", "start", "", "http://127.0.0.1:8080"] }],
+  ["darwin", { command: "open", args: ["http://127.0.0.1:8080"] }],
+  ["linux", { command: "xdg-open", args: ["http://127.0.0.1:8080"] }],
+] as const)("builds the %s browser launch command", (platform, expected) => {
+  expect(browserOpenCommand("http://127.0.0.1:8080", platform)).toEqual(expected);
 });
 
 test.each(["0", "65536", "1.5"])("rejects invalid port %s", (port) => {

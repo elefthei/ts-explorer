@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import yargs from "yargs/yargs";
@@ -10,6 +11,12 @@ type CliOptions = {
   sourceDir: string;
   host: string;
   port: number;
+  open: boolean;
+};
+
+export type BrowserOpenCommand = {
+  command: string;
+  args: readonly string[];
 };
 
 export function formatSyncProgress(event: PreprocessProgressEvent): string {
@@ -49,6 +56,11 @@ export function parseCliOptions(args: string[]): CliOptions | null {
       default: 8080,
       describe: "Port to listen on",
     })
+    .option("open", {
+      type: "boolean",
+      default: true,
+      describe: "Open the explorer in the default browser (--no-open to disable)",
+    })
     .strict()
     .version(false)
     .help()
@@ -61,7 +73,12 @@ export function parseCliOptions(args: string[]): CliOptions | null {
   if (!Number.isInteger(parsed.port) || parsed.port < 1 || parsed.port > 65535) {
     throw new Error("port must be an integer between 1 and 65535");
   }
-  return { sourceDir: resolve(expandHome(parsed.dir)), host: parsed.host, port: parsed.port };
+  return {
+    sourceDir: resolve(expandHome(parsed.dir)),
+    host: parsed.host,
+    port: parsed.port,
+    open: parsed.open,
+  };
 }
 
 async function validateSourceDir(sourceDir: string): Promise<void> {
@@ -73,13 +90,42 @@ async function validateSourceDir(sourceDir: string): Promise<void> {
   }
 }
 
+export function browserUrl(host: string, port: number): string {
+  const target = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  return `http://${target.includes(":") ? `[${target}]` : target}:${port}`;
+}
+
+export function browserOpenCommand(url: string, platform: NodeJS.Platform): BrowserOpenCommand {
+  if (platform === "win32") return { command: "cmd", args: ["/c", "start", "", url] };
+  if (platform === "darwin") return { command: "open", args: [url] };
+  return { command: "xdg-open", args: [url] };
+}
+
+function openBrowser(url: string): void {
+  const { command, args } = browserOpenCommand(url, process.platform);
+  try {
+    const child = Bun.spawn([command, ...args], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    child.unref();
+  } catch (error) {
+    console.error(
+      `could not open a browser at ${url}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 if (import.meta.main) {
   try {
     const options = parseCliOptions(process.argv.slice(2));
     if (options) {
       await validateSourceDir(options.sourceDir);
       const server = await ExplorerServer.start({
-        ...options,
+        sourceDir: options.sourceDir,
+        host: options.host,
+        port: options.port,
         onSyncProgress(event) {
           console.log(formatSyncProgress(event));
         },
@@ -87,7 +133,9 @@ if (import.meta.main) {
           console.log(formatWatchInvalidation(paths, events, version));
         },
       });
-      console.log(`TS explorer listening at http://${options.host}:${server.port}`);
+      const url = browserUrl(options.host, server.port);
+      console.log(`TS explorer listening at ${url}`);
+      if (options.open) openBrowser(url);
       const shutdown = async () => {
         await server.stop();
         process.exit(0);

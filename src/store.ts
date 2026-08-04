@@ -3,6 +3,7 @@ import { Preprocessor } from "./preprocessor.ts";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import { readTree } from "./tree.ts";
 import type {
+  DefinitionLookupResponse,
   DiagramKind,
   DiagramResponse,
   FileResponse,
@@ -133,6 +134,18 @@ export class ExplorerStore {
     const requestedVersion = this.version;
     const definition = await this.fromPreprocessor(() =>
       this.preprocessor.getDefinition(relativePath, location),
+    );
+    return { version: requestedVersion, definition };
+  }
+
+  async lookupDefinition(
+    relativePath: string,
+    name: string,
+    qualifiedName: string,
+  ): Promise<DefinitionLookupResponse> {
+    const requestedVersion = this.version;
+    const definition = await this.fromPreprocessor(() =>
+      this.preprocessor.lookupDefinition(relativePath, name, qualifiedName),
     );
     return { version: requestedVersion, definition };
   }

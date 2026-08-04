@@ -13,6 +13,7 @@
         "codemirror": "6.0.2",
         "graphology": "0.26.0",
         "graphology-communities-louvain": "2.0.2",
+        "lru-cache": "11.5.2",
         "mermaid": "11.16.0",
         "prettier": "3.9.5",
         "ts-morph": "22.0.0",
@@ -397,6 +398,8 @@
     "layout-base": ["layout-base@1.0.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/layout-base/-/layout-base-1.0.2.tgz", {}, "sha1-EpHilog8Miqd1MXdggY3IbU+JuI="],
 
     "lodash-es": ["lodash-es@4.18.1", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/lodash-es/-/lodash-es-4.18.1.tgz", {}, "sha1-uWLuuA2dmDqQC/NClh+3QYyhCx0="],
+
+    "lru-cache": ["lru-cache@11.5.2", "https://pkgs.dev.azure.com/msr-central/_packaging/msr/npm/registry/lru-cache/-/lru-cache-11.5.2.tgz", {}, "sha1-AOFmZckMYg+6FKPDaHMql2ST92A="],
 
     "marked": ["marked@16.4.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/marked/-/marked-16.4.2.tgz", { "bin": { "marked": "bin/marked.js" } }, "sha1-SVmmS+bEhvDbdGfq184ojeVCkKM="],
 

@@ -70,6 +70,11 @@ export type GotoDefinitionLookupResponse = {
   definition: GotoDefinition | null;
 };
 
+export type DefinitionLookupResponse = {
+  version: number;
+  definition: UmlSourceLocation | null;
+};
+
 
 export type UmlExternalUserKind =
   | "method"

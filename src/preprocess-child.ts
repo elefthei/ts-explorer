@@ -5,6 +5,7 @@ import {
   Cache,
   type CacheDiagramInput,
   type CacheFileWrite,
+  type DefinitionIndexWrite,
   DiagramMaterializationError,
 } from "./cache.ts";
 import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
@@ -28,7 +29,7 @@ import type {
   PreprocessErrorCode,
 } from "./preprocess-protocol.ts";
 import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
-import { buildTree, readDirectoryEntries } from "./tree.ts";
+import { buildTree, collectTreeEntries, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
 import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
 import { renderUmlDiagramGraph } from "./uml/render.ts";
@@ -157,6 +158,13 @@ function parseRequest(value: unknown): PreprocessRequest {
     case "read-packages":
     case "promote-generation":
       return { id, type, generationId: requireSafeInteger(value.generationId, "generationId") };
+    case "index-definitions":
+      return {
+        id,
+        type,
+        generationId: requireSafeInteger(value.generationId, "generationId"),
+        cause: parseCause(value.cause),
+      };
     case "preprocess-scope":
       return {
         id,
@@ -194,6 +202,14 @@ function parseRequest(value: unknown): PreprocessRequest {
         path: normalizeRelativePath(requireString(value.path, "path")),
         line: requireSafeInteger(value.line, "line"),
         column: requireSafeInteger(value.column, "column"),
+      };
+    case "lookup-definition":
+      return {
+        id,
+        type,
+        path: normalizeRelativePath(requireString(value.path, "path")),
+        name: requireString(value.name, "name"),
+        qualifiedName: requireString(value.qualifiedName, "qualifiedName"),
       };
     case "search":
       return {
@@ -293,6 +309,48 @@ async function discoverAndPersist(
     renderDiagramGraph,
   );
   return { packages };
+}
+
+const DEFINITION_INDEX_READ_BATCH = 64;
+
+async function indexDefinitions(
+  preprocessState: PreprocessState,
+  generationId: number,
+): Promise<{ definitionCount: number }> {
+  const files = (await collectTreeEntries(preprocessState.sourceDir, "")).filter((entry) =>
+    entry.kind === "file"
+    && isTypeScriptPath(entry.path)
+    && !isDeclarationPath(entry.path)
+  );
+  const definitions: DefinitionIndexWrite[] = [];
+  for (let start = 0; start < files.length; start += DEFINITION_INDEX_READ_BATCH) {
+    const batch = files.slice(start, start + DEFINITION_INDEX_READ_BATCH);
+    const contents = await Promise.all(batch.map(async (entry) => {
+      try {
+        const text = new TextDecoder("utf-8", { fatal: true })
+          .decode(await readFileBytes(join(preprocessState.sourceDir, entry.path)));
+        return text.includes("\0") ? null : text;
+      } catch {
+        return null;
+      }
+    }));
+    for (const [index, entry] of batch.entries()) {
+      const content = contents[index];
+      if (!content) continue;
+      for (const span of parseDefinitionSpans(entry.path, content)) {
+        definitions.push({
+          path: entry.path,
+          name: span.name,
+          qualifiedName: span.qualifiedName,
+          kind: span.kind,
+          line: span.line,
+          column: span.column,
+        });
+      }
+    }
+  }
+  preprocessState.cache.writeDefinitionIndex(generationId, definitions);
+  return { definitionCount: definitions.length };
 }
 
 async function extractScopeDiagram(
@@ -655,6 +713,17 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
       });
     case "discover-packages":
       return success(request, await discoverAndPersist(preprocessState, request.generationId));
+    case "index-definitions":
+      return success(
+        request,
+        await runPhase(
+          request.generationId,
+          request.cause,
+          "definitions",
+          ".",
+          () => indexDefinitions(preprocessState, request.generationId),
+        ),
+      );
     case "preprocess-scope":
       return success(
         request,
@@ -718,6 +787,15 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
           request.path,
           request.line,
           request.column,
+        ),
+      );
+    case "lookup-definition":
+      return success(
+        request,
+        preprocessState.cache.lookupDefinition(
+          request.path,
+          request.name,
+          request.qualifiedName,
         ),
       );
     case "search":

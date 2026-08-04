@@ -5,6 +5,7 @@ import { EditorSelection, EditorState } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type {
+  DefinitionLookupResponse,
   EditorGotoDefinition,
   GotoDefinition,
   GotoDefinitionLookupResponse,
@@ -601,6 +602,8 @@ function editorDefinitionDecorations(file:FileResponse){
         "data-source-path":definition.source.path,
         "data-source-line":String(definition.source.line),
         "data-source-column":String(definition.source.column),
+        "data-definition-name":definition.name,
+        "data-qualified-name":definition.qualifiedName,
       },
     }).range(definition.displayFrom,definition.displayTo)];
   }),true);
@@ -609,10 +612,10 @@ function editorDefinitionHandlers(){
   const activate=(event:Event):boolean=>{
     const link=event.target instanceof Element?event.target.closest(".editor-definition-link"):null;
     if(!link)return false;
-    const source=sourceFromLink(link);
-    if(!source)return false;
+    const target=editorTargetFromLink(link);
+    if(!target)return false;
     event.preventDefault();
-    void navigateToDefinition(source,"editor");
+    void navigateToEditorDefinition(target);
     return true;
   };
   return EditorView.domEventHandlers({
@@ -728,6 +731,41 @@ async function navigateToDefinition(
     setStatus(message,true);
   }finally{
     if(definitionContextCurrent(context))setDefinitionLoading(view,false);
+  }
+}
+type EditorDefinitionTarget={path:string;name:string;qualifiedName:string};
+function editorTargetFromLink(link:Element):EditorDefinitionTarget|undefined{
+  const data=(link as HTMLElement).dataset;
+  if(!data.sourcePath||!data.definitionName||!data.qualifiedName)return undefined;
+  return{path:data.sourcePath,name:data.definitionName,qualifiedName:data.qualifiedName};
+}
+async function lookupEditorDefinition(target:EditorDefinitionTarget):Promise<DefinitionLookupResponse>{
+  const query=new URLSearchParams({
+    path:target.path,
+    name:target.name,
+    qualifiedName:target.qualifiedName,
+  });
+  return api<DefinitionLookupResponse>(`/api/definition?${query}`);
+}
+async function navigateToEditorDefinition(target:EditorDefinitionTarget):Promise<void>{
+  const context:DefinitionNavigationContext={
+    definitionToken:definitionRequests.next(),
+    diagramToken:diagramRequests.next(),
+    editorToken:editorRequests.next(),
+  };
+  try{
+    const response=await lookupEditorDefinition(target);
+    if(!definitionContextCurrent(context))return;
+    const location=response.definition;
+    if(!location)throw new Error("Definition not found");
+    await openFile(location.path,location,context);
+  }catch(error){
+    if(!definitionContextCurrent(context))return;
+    const message=error instanceof Error?error.message:String(error);
+    showError(message);
+    setStatus(message,true);
+  }finally{
+    if(definitionContextCurrent(context))setDefinitionLoading("editor",false);
   }
 }
 async function reloadOpenFile():Promise<void>{if(!state.file)return;const path=state.file.path;const activeView=state.activeView;await openFile(path);if(activeView!=="editor")activateView(activeView);}
