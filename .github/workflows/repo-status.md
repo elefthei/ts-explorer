@@ -13,6 +13,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 max-ai-credits: 400
 
