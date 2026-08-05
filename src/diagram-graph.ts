@@ -30,12 +30,9 @@ type DiagramRelationKind =
   | "local-user"
   | "external-user";
 
-type UmlEntityKind = "class" | "interface" | "enum" | "type";
+export type UmlEntityKind = "class" | "interface" | "enum" | "type";
 type UmlCategoryKind = "interface" | "type" | "enum" | "abstract" | "concrete";
-type UmlUserKind = UmlExternalUserKind;
 type UmlSettingLineKind = "nomnoml" | "mermaid";
-type UmlHeritageClauseType = 0 | 1;
-type UmlAssociationType = 0;
 
 type UmlEntityOccurrence = {
   declarationOrdinal: number;
@@ -48,7 +45,7 @@ type UmlHeritageFields = {
   clauseTypeId: string;
   className: string;
   classTypeId: string;
-  clauseType: UmlHeritageClauseType;
+  clauseType: 0 | 1;
 };
 
 type UmlDependencyFields = {
@@ -181,7 +178,7 @@ export type UmlDiagramGraph = DiagramGraphBase & {
     bTypeId: string;
     bName: string;
     bMultiplicity: "0..*" | null;
-    associationType: UmlAssociationType;
+    associationType: 0;
     inherited: boolean;
   }[];
   categories: {
@@ -204,7 +201,7 @@ export type UmlDiagramGraph = DiagramGraphBase & {
     path: string;
     line: number;
     column: number;
-    userKind: UmlUserKind;
+    userKind: UmlExternalUserKind;
     ownerEntityId: string | null;
   }[];
   externalUsers: {
@@ -213,7 +210,7 @@ export type UmlDiagramGraph = DiagramGraphBase & {
     navigationNodeId: string;
     label: string;
     scopePath: string;
-    userKind: UmlUserKind;
+    userKind: UmlExternalUserKind;
   }[];
   localUserTargets: UmlUserTarget[];
   externalUserTargets: UmlUserTarget[];

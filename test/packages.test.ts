@@ -5,6 +5,7 @@ import { Cache } from "../src/cache.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
+  renderPackageDiagramGraph,
 } from "../src/packages.ts";
 import type { PackageInfo } from "../src/types.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
@@ -211,6 +212,59 @@ test("materializes a bare package error graph without topology rows", async () =
     error: "package discovery failed",
     ...rendered,
   });
+});
+
+test("rejects malformed package graphs before rendering", () => {
+  const valid = extractPackageDiagramGraph([
+    { name: "a", path: "packages/a", dependencies: ["b"] },
+    { name: "b", path: "packages/b", dependencies: [] },
+  ]);
+  const cases: Array<{
+    name: string;
+    mutate(graph: ReturnType<typeof extractPackageDiagramGraph>): void;
+  }> = [
+    {
+      name: "duplicate node ID",
+      mutate: (graph) => {
+        const [first, second] = graph.nodes;
+        if (!first || !second) throw new Error("fixture package graph needs two nodes");
+        second.nodeId = first.nodeId;
+      },
+    },
+    {
+      name: "unnormalized package path",
+      mutate: (graph) => {
+        const [row] = graph.packageNodes;
+        if (!row) throw new Error("fixture package graph needs a model row");
+        row.packagePath = "packages//a";
+      },
+    },
+    {
+      name: "edge with a missing endpoint",
+      mutate: (graph) => {
+        const [edge] = graph.edges;
+        if (!edge) throw new Error("fixture package graph needs an edge");
+        edge.targetNodeId = "missing";
+      },
+    },
+    {
+      name: "mismatched relation",
+      mutate: (graph) => {
+        const [relation] = graph.relations;
+        if (!relation) throw new Error("fixture package graph needs a relation");
+        relation.targetNodeId = "p0";
+      },
+    },
+  ];
+
+  for (const { name, mutate } of cases) {
+    const graph = structuredClone(valid);
+    mutate(graph);
+    expect(
+      () => renderPackageDiagramGraph(graph),
+      name,
+    ).toThrow(/^Invalid package diagram graph:/);
+  }
 });
 
 test("preserves ordered directed dependencies including package self-edges", async () => {

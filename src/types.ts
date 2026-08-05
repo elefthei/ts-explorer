@@ -18,7 +18,6 @@ export type PackageDiagramNode = {
   path: string;
 };
 
-type ExplorerStatus = "ready" | "error";
 export type DiagramKind = "packages" | "uml";
 
 export type PreprocessPriorityStatus = "queued" | "processing" | "done";
@@ -115,7 +114,7 @@ export type DiagramResponse = {
   kind: DiagramKind;
   scopePath: string;
   version: number;
-  status: ExplorerStatus;
+  status: "ready" | "error";
   dsl: string;
   dsls: string[];
   packageNodes: PackageDiagramNode[];

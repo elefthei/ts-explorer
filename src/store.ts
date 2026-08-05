@@ -9,6 +9,7 @@ import type {
   FileResponse,
   GotoDefinitionLookupResponse,
   PackageInfo,
+  PreprocessControlRequest,
   PreprocessPriorityResponse,
   SearchResponse,
   TreeNode,
@@ -150,12 +151,12 @@ export class ExplorerStore {
     return { version: requestedVersion, definition };
   }
 
-  prioritize(resource: string): Promise<PreprocessPriorityResponse> {
-    return this.fromPreprocessor(() => this.preprocessor.prioritize(resource));
-  }
-
-  poll(requestId: number): Promise<PreprocessPriorityResponse> {
-    return this.fromPreprocessor(() => this.preprocessor.poll(requestId));
+  control(request: PreprocessControlRequest): Promise<PreprocessPriorityResponse> {
+    return this.fromPreprocessor(() =>
+      request.action === "prioritize"
+        ? this.preprocessor.prioritize(request.resource)
+        : this.preprocessor.poll(request.requestId)
+    );
   }
 
   applyWatchBatch(paths: string[], events: WatchEventName[]): void {

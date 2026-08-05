@@ -14,10 +14,11 @@ import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type RenderedDiagram,
   type UmlDiagramGraph,
+  type UmlEntityKind,
 } from "../diagram-graph.ts";
 import { hydrateUmlGraph, type UmlGraph } from "./graph.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
-import { STYLE_DEFS, escapeMermaidLabel, mermaidEntityId, mermaidEntityLabel } from "./mermaid.ts";
+import { STYLE_DEFS, escapeMermaidLabel, mermaidEntityId } from "./mermaid.ts";
 import type {
   CategoryMap,
   ExternalUserNode,
@@ -25,7 +26,6 @@ import type {
   UmlDependency,
 } from "./model.ts";
 
-type UmlEntityKind = UmlDiagramGraph["entities"][number]["entityKind"];
 
 function cloneWith<T extends object>(value: T, overrides: Partial<T>): T {
   return Object.assign(Object.create(Object.getPrototypeOf(value)) as T, value, overrides);
@@ -117,7 +117,7 @@ function renderUmlDsl(
         presentNames.add(entity.name);
         const entityId = mermaidEntityId(entity.name);
         if (entityId === entity.name || labeledEntityIds.has(entityId)) continue;
-        entityLabels += `\nclass ${entityId}["${mermaidEntityLabel(entity.name)}"]`;
+        entityLabels += `\nclass ${entityId}["${escapeMermaidLabel(entity.name.replaceAll("<", "⟨").replaceAll(">", "⟩"))}"]`;
         labeledEntityIds.add(entityId);
       }
     }
@@ -892,14 +892,6 @@ function hydrateModel(record: UmlDiagramGraph) {
     );
   }
 
-  for (const declaration of record.declarations) {
-    if (!declaration.memberAssociationsPresent) {
-      const unexpected = record.memberAssociations.some(
-        (association) => association.declarationOrdinal === declaration.declarationOrdinal,
-      );
-      if (unexpected) throw new Error(`Unexpected UML member associations: ${declaration.declarationOrdinal}`);
-    }
-  }
 
   assertOrderedOrdinals(record.categories, () => "categories", (category) => category.categoryOrdinal, "UML category");
   const categories: CategoryMap = new Map();
@@ -1084,9 +1076,10 @@ export function renderUmlDiagramGraph(record: UmlDiagramGraph): RenderedDiagram 
   assertString(record.scopePath, "UML scope path", true);
   if (record.renderMode === "bare") {
     assertBareUmlGraph(record);
+    const dsl = "classDiagram\n  direction LR";
     return {
-      dsl: "classDiagram",
-      dsls: ["classDiagram"],
+      dsl,
+      dsls: [dsl],
       packageNodes: [],
       definitions: [],
       externalUsers: [],

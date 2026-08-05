@@ -2,6 +2,7 @@ import { UndirectedGraph } from "graphology";
 import louvain from "graphology-communities-louvain";
 import type { FileDeclaration } from "tsuml2/dist/core/model";
 import type { UmlDiagramGraph } from "../diagram-graph.ts";
+import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
 import type {
   ExternalUserNode,
   LocalUserNode,
@@ -143,10 +144,11 @@ function createUmlGraph(
   const entityIds = new Map<string, string>();
 
   for (const declaration of declarations) {
-    for (const entity of declaration.classes) registerEntity(graph, entityIds, entity.id, entity.name);
-    for (const entity of declaration.interfaces) registerEntity(graph, entityIds, entity.id, entity.name);
-    for (const entity of declaration.enums) registerEntity(graph, entityIds, entity.id, entity.name);
-    for (const entity of declaration.types) registerEntity(graph, entityIds, entity.id, entity.name);
+    for (const descriptor of UML_ENTITY_COLLECTIONS) {
+      for (const entity of descriptor.entities(declaration)) {
+        registerEntity(graph, entityIds, entity.id, entity.name);
+      }
+    }
   }
 
   for (const local of localUserNodes) {

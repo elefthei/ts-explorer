@@ -28,6 +28,7 @@ import type {
   SourceLocation,
   PreprocessErrorCode,
 } from "./preprocess-protocol.ts";
+import { isRecord } from "./preprocess-protocol.ts";
 import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
 import { buildTree, collectTreeEntries, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
@@ -62,9 +63,6 @@ function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram {
     : renderUmlDiagramGraph(graph);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function readRequestId(value: unknown): number {
   if (!isRecord(value)) return -1;

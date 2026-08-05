@@ -7,17 +7,6 @@ import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import type { WatchEventName } from "./types.ts";
 import { ExplorerServer } from "./server.ts";
 
-type CliOptions = {
-  sourceDir: string;
-  host: string;
-  port: number;
-  open: boolean;
-};
-
-export type BrowserOpenCommand = {
-  command: string;
-  args: readonly string[];
-};
 
 export function formatSyncProgress(event: PreprocessProgressEvent): string {
   return `[sync] ${event.event} ${event.component} ${event.resource} generation=${event.generationId} cause=${event.cause}`;
@@ -37,7 +26,7 @@ function expandHome(value: string): string {
   return value;
 }
 
-export function parseCliOptions(args: string[]): CliOptions | null {
+export function parseCliOptions(args: string[]) {
   const parsed = yargs(args)
     .scriptName("ts-explorer")
     .usage("$0 [options]")
@@ -95,7 +84,7 @@ export function browserUrl(host: string, port: number): string {
   return `http://${target.includes(":") ? `[${target}]` : target}:${port}`;
 }
 
-export function browserOpenCommand(url: string, platform: NodeJS.Platform): BrowserOpenCommand {
+export function browserOpenCommand(url: string, platform: NodeJS.Platform) {
   if (platform === "win32") return { command: "cmd", args: ["/c", "start", "", url] };
   if (platform === "darwin") return { command: "open", args: [url] };
   return { command: "xdg-open", args: [url] };

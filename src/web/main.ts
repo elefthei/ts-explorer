@@ -8,16 +8,19 @@ import { classHighlighter } from "@lezer/highlight";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
-  EditorGotoDefinition,
+  DiagramResponse,
+  FileResponse,
   GotoDefinition,
   GotoDefinitionLookupResponse,
   PackageDiagramNode,
   PreprocessControlRequest,
   PreprocessPriorityResponse,
   SearchResponse,
+  TreeNode,
   UmlExternalUser,
   UmlLocalUser,
   UmlSourceLocation,
+  WatchMessage,
 } from "../types.ts";
 import {
   adjacentTreeRowIndex,
@@ -35,10 +38,6 @@ import {
   type ViewportState,
 } from "./diagram-interactions.ts";
 
-type TreeNode={name:string;path:string;kind:"directory"|"file";children?:TreeNode[];viewable?:boolean};
-type Diagram={kind:"packages"|"uml";scopePath:string;version:number;status:"ready"|"error";dsl:string;dsls:string[];packageNodes:PackageDiagramNode[];definitions:GotoDefinition[];externalUsers:UmlExternalUser[];localUsers:UmlLocalUser[];error?:string};
-type FileResponse={path:string;content:string;definitions:EditorGotoDefinition[];cursorOffset?:number};
-type WatchMessage={type:"changed";version:number;paths:string[];events:string[]}|{type:"cache-ready";version:number}|{type:"watch-error";version:number;error:string};
 function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
 const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
 const ZOOM_IN_FACTOR=1.25;
@@ -122,8 +121,21 @@ function parseMethodName(text:string):string{const normalized=text.trim().replac
 function sourceFromLink(link:Element):UmlSourceLocation|undefined{const data=(link as HTMLElement).dataset;const line=Number(data.sourceLine);const column=Number(data.sourceColumn);if(!data.sourcePath||!Number.isInteger(line)||!Number.isInteger(column))return undefined;return{path:data.sourcePath,line,column};}
 function makeSourceLink(element:Element,location:UmlSourceLocation,label:string):void{element.classList.add("uml-source-link");element.setAttribute("role","link");element.setAttribute("tabindex","0");element.setAttribute("aria-label",`Open ${label} in editor`);const data=(element as HTMLElement).dataset;data.sourcePath=location.path;data.sourceLine=String(location.line);data.sourceColumn=String(location.column);}
 function decoratePackageNodes(root:Element,packageNodes:readonly PackageDiagramNode[]):void{const byId=new Map(packageNodes.map((pkg)=>[pkg.nodeId,pkg]));for(const node of root.querySelectorAll<SVGGElement>("g.node")){const nodeId=packageNodeIdFromNodeId(node.id);if(!nodeId)continue;const pkg=byId.get(nodeId);if(!pkg)continue;node.classList.add("package-link");node.setAttribute("role","link");node.setAttribute("tabindex","0");node.setAttribute("aria-label",`Open ${pkg.name} UML`);node.dataset.packageName=pkg.name;node.dataset.scopePath=pkg.path;}}
-function decorateUmlLocalUsers(root:Element,localUsers:readonly UmlLocalUser[]):void{const byId=new Map(localUsers.map((user)=>[user.nodeId,user]));for(const node of root.querySelectorAll<SVGGElement>("g.node")){const nodeId=localUserIdFromNodeId(node.id);if(!nodeId)continue;const local=byId.get(nodeId);if(!local)continue;const title=node.querySelector(".label-group .label, .classTitle");if(title)makeSourceLink(title,local,local.label);}}
-function decorateUmlExternalUsers(root:Element,externalUsers:readonly UmlExternalUser[]):void{const byId=new Map(externalUsers.map((user)=>[user.nodeId,user]));for(const node of root.querySelectorAll<SVGGElement>("g.node")){const nodeId=externalUserIdFromNodeId(node.id);if(!nodeId)continue;const external=byId.get(nodeId);if(!external)continue;const title=node.querySelector(".label-group .label, .classTitle");if(!title)continue;title.classList.add("uml-external-link");title.setAttribute("role","link");title.setAttribute("tabindex","0");title.setAttribute("aria-label","Open external user UML");(title as HTMLElement).dataset.scopePath=external.scopePath;}}
+function decorateUmlUsers(root:Element,localUsers:readonly UmlLocalUser[],externalUsers:readonly UmlExternalUser[]):void{
+  const localById=new Map(localUsers.map((user)=>[user.nodeId,user]));
+  const externalById=new Map(externalUsers.map((user)=>[user.nodeId,user]));
+  for(const node of root.querySelectorAll<SVGGElement>("g.node")){
+    const localId=localUserIdFromNodeId(node.id);
+    const local=localId?localById.get(localId):undefined;
+    if(local){const title=node.querySelector(".label-group .label, .classTitle");if(title)makeSourceLink(title,local,local.label);continue;}
+    const externalId=externalUserIdFromNodeId(node.id);
+    const external=externalId?externalById.get(externalId):undefined;
+    if(!external)continue;
+    const title=node.querySelector(".label-group .label, .classTitle");
+    if(!title)continue;
+    title.classList.add("uml-external-link");title.setAttribute("role","link");title.setAttribute("tabindex","0");title.setAttribute("aria-label","Open external user UML");(title as HTMLElement).dataset.scopePath=external.scopePath;
+  }
+}
 function bareDiagramName(name:string):string{const generic=name.search(/[<~]/);return generic===-1?name:name.slice(0,generic);}
 function compareDefinitions(left:GotoDefinition,right:GotoDefinition):number{return left.source.path.localeCompare(right.source.path)||left.source.line-right.source.line||left.source.column-right.source.column||left.key.localeCompare(right.key);}
 function makeDefinitionLink(element:Element,definition:GotoDefinition,label:string):void{element.classList.add("uml-definition-link");element.setAttribute("role","link");element.setAttribute("tabindex","0");element.setAttribute("aria-label",`Open ${label} UML definition`);const data=(element as HTMLElement).dataset;data.sourcePath=definition.source.path;data.sourceLine=String(definition.source.line);data.sourceColumn=String(definition.source.column);}
@@ -273,7 +285,7 @@ function loadTree():Promise<void>{
 type UmlScopeRenderResult={nextFrameIndex:number;complete:boolean};
 async function renderUmlScope(
   scope:string,
-  diagram:Diagram,
+  diagram:DiagramResponse,
   holder:HTMLElement,
   renderToken:number,
   directoryIndex:number,
@@ -294,8 +306,7 @@ async function renderUmlScope(
       if(!isCurrent())return{nextFrameIndex,complete:false};
       frame.innerHTML=rendered.svg;
       decorateUmlDefinitions(frame,diagram.definitions);
-      decorateUmlExternalUsers(frame,diagram.externalUsers);
-      decorateUmlLocalUsers(frame,diagram.localUsers);
+      decorateUmlUsers(frame,diagram.localUsers,diagram.externalUsers);
     }catch(error){
       if(!isCurrent())return{nextFrameIndex,complete:false};
       const message=error instanceof Error?error.message:String(error);
@@ -320,7 +331,7 @@ async function loadDiagram(
   if(isCurrent())setDiagramLoading(state.mode==="uml",showLoading);
   try{
     const query=new URLSearchParams({kind:state.mode,path:state.scope});
-    const diagram=await api<Diagram>(`/api/diagram?${query}`);
+    const diagram=await api<DiagramResponse>(`/api/diagram?${query}`);
     if(!isCurrent())return;
     state.version=diagram.version;
     $("#dsl-content").textContent=diagram.dsl;
@@ -362,8 +373,7 @@ async function loadDiagram(
       holder.innerHTML=rendered.svg;
       decoratePackageNodes(holder,diagram.packageNodes);
       decorateUmlDefinitions(holder,diagram.definitions);
-      decorateUmlExternalUsers(holder,diagram.externalUsers);
-      decorateUmlLocalUsers(holder,diagram.localUsers);
+      decorateUmlUsers(holder,diagram.localUsers,diagram.externalUsers);
       applySearchHighlights();
       viewport.apply();
       if(focus&&!focusUmlDefinition(focus)){
@@ -436,9 +446,9 @@ async function renderSearchDiagrams(renderDirs:readonly string[],searchToken:num
   try{
     for(const [directoryIndex,renderDir] of renderDirs.entries()){
       const scope=renderDir||".";
-      let diagram:Diagram;
+      let diagram:DiagramResponse;
       try{
-        diagram=await api<Diagram>(`/api/diagram?kind=uml&path=${encodeURIComponent(renderDir)}`);
+        diagram=await api<DiagramResponse>(`/api/diagram?kind=uml&path=${encodeURIComponent(renderDir)}`);
         if(!isCurrent())return;
       }catch(error){
         if(!isCurrent())return;
@@ -807,18 +817,27 @@ const diagramStage=$("#diagram-stage");
 const dragState={pointerId:null as number|null,startX:0,startY:0,lastX:0,lastY:0,moved:false,suppressClick:false};
 function zoomAtStageCenter(factor:number):void{const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(factor,rect.width/2,rect.height/2);}
 function finishDrag(event:PointerEvent,suppressClick:boolean):void{if(dragState.pointerId!==event.pointerId)return;if(diagramStage.hasPointerCapture(event.pointerId))diagramStage.releasePointerCapture(event.pointerId);const moved=dragState.moved;dragState.pointerId=null;dragState.moved=false;diagramStage.classList.remove("dragging");if(moved&&suppressClick){dragState.suppressClick=true;setTimeout(()=>{dragState.suppressClick=false;},0);}}
-function onDiagramSourceClick(event:MouseEvent):void{const link=event.target instanceof Element?event.target.closest(".uml-source-link"):null;if(!link)return;if(dragState.suppressClick){event.preventDefault();return;}const source=sourceFromLink(link);if(source){event.preventDefault();void openSource(source);}}
-function onDiagramDefinitionClick(event:MouseEvent):void{const link=event.target instanceof Element?event.target.closest(".uml-definition-link"):null;if(!link)return;if(dragState.suppressClick){event.preventDefault();return;}const source=sourceFromLink(link);if(source){event.preventDefault();void navigateToDefinition(source,"uml");}}
-function onDiagramDefinitionKeydown(event:KeyboardEvent):void{if(event.key!=="Enter"&&event.key!==" ")return;const link=event.target instanceof Element?event.target.closest(".uml-definition-link"):null;if(!link)return;const source=sourceFromLink(link);if(source){event.preventDefault();void navigateToDefinition(source,"uml");}}
-function onDiagramSourceKeydown(event:KeyboardEvent):void{if(event.key!=="Enter"&&event.key!==" ")return;const link=event.target instanceof Element?event.target.closest(".uml-source-link"):null;if(!link)return;const source=sourceFromLink(link);if(source){event.preventDefault();void openSource(source);}}
 function externalScopeFromLink(link:Element):string|undefined{const scopePath=(link as HTMLElement).dataset.scopePath;return scopePath||undefined;}
-function openExternalUml(scopePath:string):void{void selectScope({name:scopePath.split("/").at(-1)??scopePath,path:scopePath,kind:"file"});}
-function onDiagramExternalClick(event:MouseEvent):void{const link=event.target instanceof Element?event.target.closest(".uml-external-link"):null;if(!link)return;if(dragState.suppressClick){event.preventDefault();return;}const scopePath=externalScopeFromLink(link);if(scopePath){event.preventDefault();openExternalUml(scopePath);}}
-function onDiagramExternalKeydown(event:KeyboardEvent):void{if(event.key!=="Enter"&&event.key!==" ")return;const link=event.target instanceof Element?event.target.closest(".uml-external-link"):null;if(!link)return;const scopePath=externalScopeFromLink(link);if(scopePath){event.preventDefault();openExternalUml(scopePath);}}
 function packageFromLink(link:Element):{name:string;path:string}|undefined{const data=(link as HTMLElement).dataset;if(!Object.hasOwn(data,"packageName")||!Object.hasOwn(data,"scopePath"))return undefined;return{name:data.packageName??"",path:data.scopePath??""};}
-function openPackageUml(pkg:{name:string;path:string}):void{void selectScope({name:pkg.name,path:pkg.path,kind:"directory"},"uml");}
-function onDiagramPackageClick(event:MouseEvent):void{const link=event.target instanceof Element?event.target.closest(".package-link"):null;if(!link)return;if(dragState.suppressClick){event.preventDefault();return;}const pkg=packageFromLink(link);if(pkg){event.preventDefault();openPackageUml(pkg);}}
-function onDiagramPackageKeydown(event:KeyboardEvent):void{if(event.key!=="Enter"&&event.key!==" ")return;const link=event.target instanceof Element?event.target.closest(".package-link"):null;if(!link)return;const pkg=packageFromLink(link);if(pkg){event.preventDefault();openPackageUml(pkg);}}
+function activateDiagramLink(event:MouseEvent|KeyboardEvent):void{
+  if(event instanceof KeyboardEvent&&event.key!=="Enter"&&event.key!==" ")return;
+  const link=event.target instanceof Element?event.target.closest(".uml-definition-link, .uml-source-link, .uml-external-link, .package-link"):null;
+  if(!link)return;
+  let activate:(()=>void)|undefined;
+  if(link.matches(".uml-definition-link")){
+    const source=sourceFromLink(link);if(source)activate=()=>{void navigateToDefinition(source,"uml");};
+  }else if(link.matches(".uml-source-link")){
+    const source=sourceFromLink(link);if(source)activate=()=>{void openSource(source);};
+  }else if(link.matches(".uml-external-link")){
+    const scopePath=externalScopeFromLink(link);if(scopePath)activate=()=>{void selectScope({name:scopePath.split("/").at(-1)??scopePath,path:scopePath,kind:"file"});};
+  }else{
+    const pkg=packageFromLink(link);if(pkg)activate=()=>{void selectScope({name:pkg.name,path:pkg.path,kind:"directory"},"uml");};
+  }
+  if(!activate)return;
+  event.preventDefault();
+  if(event instanceof MouseEvent&&dragState.suppressClick)return;
+  activate();
+}
 const tree=$("#tree");
 function scrollTreeRowIntoView(row:HTMLButtonElement):void{
   const treeRect=tree.getBoundingClientRect();
@@ -855,14 +874,8 @@ diagramStage.addEventListener("pointerdown",(event)=>{if(diagramStage.getAttribu
 diagramStage.addEventListener("pointermove",(event)=>{if(dragState.pointerId!==event.pointerId)return;if(!dragState.moved){if(!hasPassedDragThreshold(dragState.startX,dragState.startY,event.clientX,event.clientY))return;dragState.moved=true;diagramStage.setPointerCapture(event.pointerId);diagramStage.classList.add("dragging");}panViewport(viewport,event.clientX-dragState.lastX,event.clientY-dragState.lastY);dragState.lastX=event.clientX;dragState.lastY=event.clientY;viewport.apply();});
 window.addEventListener("pointerup",(event)=>finishDrag(event,true));
 window.addEventListener("pointercancel",(event)=>finishDrag(event,false));
-$("#svg-holder").addEventListener("click",onDiagramDefinitionClick);
-$("#svg-holder").addEventListener("keydown",onDiagramDefinitionKeydown);
-$("#svg-holder").addEventListener("click",onDiagramSourceClick);
-$("#svg-holder").addEventListener("keydown",onDiagramSourceKeydown);
-$("#svg-holder").addEventListener("click",onDiagramExternalClick);
-$("#svg-holder").addEventListener("keydown",onDiagramExternalKeydown);
-$("#svg-holder").addEventListener("click",onDiagramPackageClick);
-$("#svg-holder").addEventListener("keydown",onDiagramPackageKeydown);
+$("#svg-holder").addEventListener("click",activateDiagramLink);
+$("#svg-holder").addEventListener("keydown",activateDiagramLink);
 await loadTree();
 connect();
 void loadDiagram().catch((error)=>{

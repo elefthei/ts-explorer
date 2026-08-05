@@ -1,7 +1,5 @@
 import type { FileDeclaration } from "tsuml2/dist/core/model";
-import type { UmlDiagramGraph } from "../diagram-graph.ts";
-
-type UmlEntityKind = UmlDiagramGraph["entities"][number]["entityKind"];
+import type { UmlEntityKind } from "../diagram-graph.ts";
 
 type UmlEntityCollectionDescriptor =
   | {

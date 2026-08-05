@@ -9,6 +9,7 @@ import {
   type UmlDiagramGraph,
 } from "./diagram-graph.ts";
 import { normalizeRelativePath } from "./paths.ts";
+import { validatePackageDiagramGraph } from "./packages.ts";
 import { buildSearchScopes } from "./search.ts";
 import type {
   DiagramKind,
@@ -163,11 +164,7 @@ type CacheStatements = {
   selectRawActiveGeneration: Statement<MetaRow, []>;
   selectActiveGeneration: Statement<ActiveGenerationRow, []>;
   deleteActivePointer: Statement<never, []>;
-  deleteGotoDefsExceptGeneration: Statement<never, [number]>;
-  deleteAllGotoDefs: Statement<never, []>;
-  deleteFilesExceptGeneration: Statement<never, [number]>;
   deleteGenerationsExcept: Statement<never, [number]>;
-  deleteAllFiles: Statement<never, []>;
   deleteAllGenerations: Statement<never, []>;
   insertGeneration: Statement<never, ["startup" | "watch", number]>;
   upsertPackages: Statement<never, [number, string]>;
@@ -215,8 +212,6 @@ type CacheStatements = {
   selectScanDefinitionCandidates: Statement<GotoDefinitionRow, [number]>;
   markGenerationActive: Statement<never, [number, number]>;
   upsertActivePointer: Statement<never, [string]>;
-  deleteGenerationFiles: Statement<never, [number]>;
-  deleteGenerationGotoDefs: Statement<never, [number]>;
   deleteInactiveGeneration: Statement<never, [number]>;
   markGenerationFailed: Statement<never, [number, number]>;
   optimizeSearch: Statement<never, []>;
@@ -1300,13 +1295,6 @@ function toGotoDefinition(row: GotoDefinitionRow): GotoDefinition {
   };
 }
 
-function toEditorGotoDefinition(row: GotoDefinitionRow): EditorGotoDefinition {
-  return {
-    ...toGotoDefinition(row),
-    displayFrom: row.display_from,
-    displayTo: row.display_to,
-  };
-}
 
 type PreparedGraphStore = {
   statements: Array<{ finalize(): void }>;
@@ -2769,114 +2757,6 @@ function assertGraphIdentity(
   }
 }
 
-function recordKey(...parts: Array<string | number>): string {
-  return JSON.stringify(parts);
-}
-
-function assertString(value: unknown, description: string, allowEmpty = false): void {
-  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
-    throw new Error(`Invalid ${description}`);
-  }
-}
-
-
-function validatePackageGraph(graph: PackageDiagramGraph): void {
-  if (graph.aliases.length) throw new Error("Package graphs cannot contain aliases");
-  const nodes = new Map<string, PackageDiagramGraph["nodes"][number]>();
-  for (const [ordinal, node] of graph.nodes.entries()) {
-    if (node.nodeOrdinal !== ordinal || nodes.has(node.nodeId)) {
-      throw new Error("Invalid package node ordering or identity");
-    }
-    if (
-      (node.nodeKind !== "package" && node.nodeKind !== "placeholder")
-      || node.community !== null
-    ) {
-      throw new Error(`Invalid package node: ${node.nodeId}`);
-    }
-    assertString(node.nodeId, "package node ID");
-    assertString(node.name, "package node name");
-    nodes.set(node.nodeId, node);
-  }
-  const packageRows = new Map<string, string | null>();
-  for (const row of graph.packageNodes) {
-    if (!nodes.has(row.nodeId) || packageRows.has(row.nodeId)) {
-      throw new Error(`Invalid package model node: ${row.nodeId}`);
-    }
-    if (
-      row.packagePath !== null
-      && normalizeRelativePath(row.packagePath) !== row.packagePath
-    ) {
-      throw new Error(`Package graph path is not normalized: ${row.packagePath}`);
-    }
-    packageRows.set(row.nodeId, row.packagePath);
-  }
-  if (packageRows.size !== nodes.size) throw new Error("Missing package model node");
-  if (graph.renderMode === "bare") {
-    if (nodes.size || graph.edges.length || graph.relations.length || packageRows.size) {
-      throw new Error("Bare package graph contains rows");
-    }
-    return;
-  }
-  if (!nodes.size) throw new Error("Normal package graph is empty");
-  const placeholders = [...nodes.values()].filter((node) => node.nodeKind === "placeholder");
-  if (placeholders.length) {
-    const placeholder = placeholders[0];
-    if (!placeholder) throw new Error("Invalid package placeholder graph");
-    if (
-      placeholders.length !== 1
-      || nodes.size !== 1
-      || placeholder.nodeId !== "source"
-      || placeholder.name !== "No workspace packages"
-      || packageRows.get("source") !== null
-      || graph.edges.length
-      || graph.relations.length
-    ) {
-      throw new Error("Invalid package placeholder graph");
-    }
-    return;
-  }
-  for (const [nodeId, path] of packageRows) {
-    if (nodes.get(nodeId)?.nodeKind !== "package" || path === null) {
-      throw new Error(`Invalid package path for node: ${nodeId}`);
-    }
-  }
-  const edges = new Map<number, PackageDiagramGraph["edges"][number]>();
-  const endpointPairs = new Set<string>();
-  for (const [ordinal, edge] of graph.edges.entries()) {
-    const pair = recordKey(edge.sourceNodeId, edge.targetNodeId);
-    if (
-      edge.edgeOrdinal !== ordinal
-      || edge.edgeKind !== "package-dependency"
-      || !edge.directed
-      || edge.weight !== 1
-      || !nodes.has(edge.sourceNodeId)
-      || !nodes.has(edge.targetNodeId)
-      || endpointPairs.has(pair)
-    ) {
-      throw new Error(`Invalid package edge: ${edge.edgeOrdinal}`);
-    }
-    endpointPairs.add(pair);
-    edges.set(edge.edgeOrdinal, edge);
-  }
-  if (graph.relations.length !== graph.edges.length) {
-    throw new Error("Package edge relation count mismatch");
-  }
-  const related = new Set<number>();
-  for (const relation of graph.relations) {
-    const edge = edges.get(relation.edgeOrdinal);
-    if (
-      !edge
-      || relation.relationOrdinal !== 0
-      || relation.relationKind !== "package-dependency"
-      || relation.sourceNodeId !== edge.sourceNodeId
-      || relation.targetNodeId !== edge.targetNodeId
-      || related.has(relation.edgeOrdinal)
-    ) {
-      throw new Error(`Invalid package relation: ${relation.edgeOrdinal}`);
-    }
-    related.add(relation.edgeOrdinal);
-  }
-}
 
 function validateUmlGraph(graph: UmlDiagramGraph): void {
   validateUmlDiagramGraph(graph);
@@ -2895,7 +2775,7 @@ function validateUmlGraph(graph: UmlDiagramGraph): void {
 
 function validateLoadedGraph(graph: DiagramGraph): void {
   assertGraphIdentity(graph, graph.kind, graph.scopePath);
-  if (graph.kind === "packages") validatePackageGraph(graph);
+  if (graph.kind === "packages") validatePackageDiagramGraph(graph);
   else validateUmlGraph(graph);
 }
 
@@ -2943,11 +2823,7 @@ private readonly graphStore!: PreparedGraphStore;
 private readonly selectRawActiveGeneration!: CacheStatements["selectRawActiveGeneration"];
 private readonly selectActiveGeneration!: CacheStatements["selectActiveGeneration"];
 private readonly deleteActivePointer!: CacheStatements["deleteActivePointer"];
-private readonly deleteGotoDefsExceptGeneration!: CacheStatements["deleteGotoDefsExceptGeneration"];
-private readonly deleteAllGotoDefs!: CacheStatements["deleteAllGotoDefs"];
-private readonly deleteFilesExceptGeneration!: CacheStatements["deleteFilesExceptGeneration"];
 private readonly deleteGenerationsExcept!: CacheStatements["deleteGenerationsExcept"];
-private readonly deleteAllFiles!: CacheStatements["deleteAllFiles"];
 private readonly deleteAllGenerations!: CacheStatements["deleteAllGenerations"];
 private readonly insertGeneration!: CacheStatements["insertGeneration"];
 private readonly upsertPackages!: CacheStatements["upsertPackages"];
@@ -2968,8 +2844,6 @@ private readonly selectIndexedDefinitionCandidates!: CacheStatements["selectInde
 private readonly selectScanDefinitionCandidates!: CacheStatements["selectScanDefinitionCandidates"];
 private readonly markGenerationActive!: CacheStatements["markGenerationActive"];
 private readonly upsertActivePointer!: CacheStatements["upsertActivePointer"];
-private readonly deleteGenerationFiles!: CacheStatements["deleteGenerationFiles"];
-private readonly deleteGenerationGotoDefs!: CacheStatements["deleteGenerationGotoDefs"];
 private readonly deleteInactiveGeneration!: CacheStatements["deleteInactiveGeneration"];
 private readonly markGenerationFailed!: CacheStatements["markGenerationFailed"];
 private readonly optimizeSearch!: CacheStatements["optimizeSearch"];
@@ -2991,8 +2865,6 @@ private readonly definitionIndexTransaction!: ImmediateTransaction<
   [number, readonly DefinitionIndexWrite[]]
 >;
 private readonly promotionTransaction!: ImmediateTransaction<[number]>;
-private readonly cleanupTransaction!: ImmediateTransaction<[number]>;
-private readonly discardTransaction!: ImmediateTransaction<[number]>;
 private closed = false;
 
 constructor(dbPath: string) {
@@ -3054,17 +2926,9 @@ constructor(dbPath: string) {
   const deleteActivePointer = db.query<never, []>(`
     DELETE FROM cache_meta WHERE key = 'active_generation'
   `);
-  const deleteGotoDefsExceptGeneration = db.query<never, [number]>(`
-    DELETE FROM GotoDef WHERE generation_id <> ?
-  `);
-  const deleteAllGotoDefs = db.query<never, []>("DELETE FROM GotoDef");
-  const deleteFilesExceptGeneration = db.query<never, [number]>(`
-    DELETE FROM files WHERE generation_id <> ?
-  `);
   const deleteGenerationsExcept = db.query<never, [number]>(`
     DELETE FROM generations WHERE id <> ?
   `);
-  const deleteAllFiles = db.query<never, []>("DELETE FROM files");
   const deleteAllGenerations = db.query<never, []>("DELETE FROM generations");
   const insertGeneration = db.query<never, ["startup" | "watch", number]>(`
     INSERT INTO generations(state, cause, started_at)
@@ -3298,12 +3162,6 @@ constructor(dbPath: string) {
     VALUES ('active_generation', ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
-  const deleteGenerationFiles = db.query<never, [number]>(`
-    DELETE FROM files WHERE generation_id = ?
-  `);
-  const deleteGenerationGotoDefs = db.query<never, [number]>(`
-    DELETE FROM GotoDef WHERE generation_id = ?
-  `);
   const deleteInactiveGeneration = db.query<never, [number]>(`
     DELETE FROM generations WHERE id = ? AND state <> 'active'
   `);
@@ -3324,11 +3182,7 @@ constructor(dbPath: string) {
     selectRawActiveGeneration,
     selectActiveGeneration,
     deleteActivePointer,
-    deleteGotoDefsExceptGeneration,
-    deleteFilesExceptGeneration,
     deleteGenerationsExcept,
-    deleteAllGotoDefs,
-    deleteAllFiles,
     deleteAllGenerations,
     insertGeneration,
     upsertPackages,
@@ -3349,8 +3203,6 @@ constructor(dbPath: string) {
     selectScanDefinitionCandidates,
     markGenerationActive,
     upsertActivePointer,
-    deleteGenerationGotoDefs,
-    deleteGenerationFiles,
     deleteInactiveGeneration,
     markGenerationFailed,
     optimizeSearch,
@@ -3363,11 +3215,7 @@ constructor(dbPath: string) {
   this.selectRawActiveGeneration = selectRawActiveGeneration;
   this.selectActiveGeneration = selectActiveGeneration;
   this.deleteActivePointer = deleteActivePointer;
-  this.deleteGotoDefsExceptGeneration = deleteGotoDefsExceptGeneration;
-  this.deleteAllGotoDefs = deleteAllGotoDefs;
-  this.deleteFilesExceptGeneration = deleteFilesExceptGeneration;
   this.deleteGenerationsExcept = deleteGenerationsExcept;
-  this.deleteAllFiles = deleteAllFiles;
   this.deleteAllGenerations = deleteAllGenerations;
   this.insertGeneration = insertGeneration;
   this.upsertPackages = upsertPackages;
@@ -3388,8 +3236,6 @@ constructor(dbPath: string) {
   this.selectScanDefinitionCandidates = selectScanDefinitionCandidates;
   this.markGenerationActive = markGenerationActive;
   this.upsertActivePointer = upsertActivePointer;
-  this.deleteGenerationFiles = deleteGenerationFiles;
-  this.deleteGenerationGotoDefs = deleteGenerationGotoDefs;
   this.deleteInactiveGeneration = deleteInactiveGeneration;
   this.markGenerationFailed = markGenerationFailed;
   this.optimizeSearch = optimizeSearch;
@@ -3404,13 +3250,9 @@ constructor(dbPath: string) {
   this.recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
     if (activeGenerationId === null) {
       this.deleteActivePointer.run();
-      this.deleteAllGotoDefs.run();
-      this.deleteAllFiles.run();
       this.deleteAllGenerations.run();
       return;
     }
-    this.deleteGotoDefsExceptGeneration.run(activeGenerationId);
-    this.deleteFilesExceptGeneration.run(activeGenerationId);
     this.deleteGenerationsExcept.run(activeGenerationId);
   });
   const materializeDiagram = (
@@ -3664,16 +3506,6 @@ constructor(dbPath: string) {
     if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
     this.upsertActivePointer.run(String(generationId));
   });
-  this.cleanupTransaction = db.transaction((generationId: number) => {
-    this.deleteGotoDefsExceptGeneration.run(generationId);
-    this.deleteFilesExceptGeneration.run(generationId);
-    this.deleteGenerationsExcept.run(generationId);
-  });
-  this.discardTransaction = db.transaction((generationId: number) => {
-    this.deleteGenerationGotoDefs.run(generationId);
-    this.deleteGenerationFiles.run(generationId);
-    this.deleteInactiveGeneration.run(generationId);
-  });
 
   } catch (error) {
     try {
@@ -3822,7 +3654,11 @@ readDefinition(
 readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
   return this.selectDefinitions
     .all(generationId, normalizeRelativePath(path))
-    .map(toEditorGotoDefinition);
+    .map((row) => ({
+      ...toGotoDefinition(row),
+      displayFrom: row.display_from,
+      displayTo: row.display_to,
+    }));
 }
 
 writeDefinitionIndex(
@@ -3900,7 +3736,7 @@ searchFiles(
 
 promoteGeneration(generationId: number): void {
   this.promotionTransaction.immediate(generationId);
-  this.cleanupTransaction.immediate(generationId);
+  this.deleteGenerationsExcept.run(generationId);
   this.optimizeSearch.run();
   this.optimizeGotoDefinitionSearch.run();
 }
@@ -3909,7 +3745,7 @@ discardGeneration(generationId: number): void {
   if (this.selectActiveGeneration.get()?.id === generationId) {
     throw new Error(`cannot discard active generation ${generationId}`);
   }
-  this.discardTransaction.immediate(generationId);
+  this.deleteInactiveGeneration.run(generationId);
 }
 
 failGeneration(generationId: number): void {

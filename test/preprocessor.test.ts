@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import mermaid from "mermaid";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -817,16 +818,23 @@ test("preprocesses each visible scope once and serves formatted files and litera
     scopePath: "packages/a",
     definitions: [],
   });
-  expect(await preprocessor.getDiagram("uml", "packages/b/index.js")).toEqual({
+  const untrackedJavaScriptDiagram = await preprocessor.getDiagram(
+    "uml",
+    "packages/b/index.js",
+  );
+  expect(untrackedJavaScriptDiagram).toEqual({
     kind: "uml",
     scopePath: "packages/b/index.js",
     status: "ready",
-    dsl: "classDiagram",
-    dsls: ["classDiagram"],
+    dsl: "classDiagram\n  direction LR",
+    dsls: ["classDiagram\n  direction LR"],
     packageNodes: [],
     definitions: [],
     externalUsers: [],
     localUsers: [],
+  });
+  expect(await mermaid.parse(untrackedJavaScriptDiagram.dsl)).toMatchObject({
+    diagramType: "class",
   });
 
   expect(await preprocessor.readFile("root.ts")).toEqual({

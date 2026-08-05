@@ -33,7 +33,6 @@ type RequestMap = {
 type RequestFor<Type extends RequestType> = RequestMap[Type];
 type QueuedRequest = RequestMap[RequestType];
 type QueuePriority = "interactive" | "background";
-type QueueJobState = "queued" | "processing" | "done";
 type SlotState = "new" | "initializing" | "idle" | "busy" | "dead" | "closing" | "closed";
 
 // Point reads of a generation's immutable rows. `search` is deliberately absent: it is the one read
@@ -58,7 +57,7 @@ interface Deferred<Value> {
 interface QueueJob {
   readonly request: QueuedRequest;
   priority: QueuePriority;
-  state: QueueJobState;
+  state: "queued" | "processing";
   readonly generationId?: number;
   readonly deferred: Deferred<unknown>;
   readonly finished: Deferred<void>;
@@ -268,7 +267,13 @@ export class Preprocessor {
     }
     return this.dedupe(
       `read-diagram:${kind}:${normalizedScopePath}`,
-      () => this.readDiagramAcrossGenerations(kind, normalizedScopePath),
+      () => this.readAcrossGenerations(
+        (generationId) => this.enqueueCachedRequest<"read-diagram">(
+          { type: "read-diagram", generationId, kind, scopePath: normalizedScopePath },
+          "interactive",
+        ),
+        (generation) => this.readPriorityDiagram(generation, kind, normalizedScopePath),
+      ),
     );
   }
   
@@ -285,7 +290,13 @@ export class Preprocessor {
     const locationKey = location ? `${location.line}:${location.column}` : "";
     return this.dedupe(
       `read-file:${path}:${locationKey}`,
-      () => this.readFileAcrossGenerations(path, location),
+      () => this.readAcrossGenerations(
+        (generationId) => this.enqueueCachedRequest<"read-file">(
+          { type: "read-file", generationId, path, ...(location ? { location } : {}) },
+          "interactive",
+        ),
+        (generation) => this.readPriorityFile(generation, path, location),
+      ),
     );
   }
   
@@ -366,16 +377,10 @@ export class Preprocessor {
     }
   }
   
-  private completePriorityRequest(request: PriorityRequest): void {
+  private settlePriorityRequest(request: PriorityRequest, error?: Error): void {
     if (request.error || request.status === "done") return;
-    request.status = "done";
-    request.job = undefined;
-    this.releasePriorityResource(request);
-  }
-  
-  private failPriorityRequest(request: PriorityRequest, error: unknown): void {
-    if (request.error || request.status === "done") return;
-    request.error = asError(error);
+    if (error) request.error = error;
+    else request.status = "done";
     request.job = undefined;
     this.releasePriorityResource(request);
   }
@@ -835,7 +840,6 @@ export class Preprocessor {
     slot.state = "busy";
     slot.current = job;
     void this.sendToSlot(slot, job.request).then((value) => {
-      job.state = "done";
       this.finishSlotJob(slot, job);
       if (!job.cancelled) job.deferred.resolve(value);
       this.dispatch();
@@ -1039,34 +1043,16 @@ export class Preprocessor {
     this.enqueueScope(generation, { path: "", kind: "directory" }, "background", true);
   }
   
-  private enqueueDiscovery(generation: GenerationState): void {
+  private trackGenerationMutation<Result>(
+    generation: GenerationState,
+    mutation: Promise<Result>,
+    onSuccess?: (result: Result) => void,
+  ): void {
     generation.pendingMutations += 1;
-    const discovery = this.enqueueRequest<"discover-packages">(
-      { type: "discover-packages", generationId: generation.id },
-      "background",
-      generation.id,
-    ).promise;
-    void discovery.then((result) => {
+    void mutation.then((result) => {
       if (generation.superseded || generation.failed) return;
-      const packages = result.packages.map((pkg) => ({ ...pkg, path: normalizeRelativePath(pkg.path) }));
-      generation.packages = packages;
-      generation.discoveryComplete = true;
-      generation.discovered.resolve(packages);
-      this.seedTraversal(generation, packages);
+      onSuccess?.(result);
     }).catch((error) => {
-      if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
-      this.failGeneration(generation, asError(error), false);
-    }).finally(() => this.mutationFinished(generation));
-  }
-  
-  private enqueueDefinitionIndex(generation: GenerationState): void {
-    generation.pendingMutations += 1;
-    const indexed = this.enqueueRequest<"index-definitions">(
-      { type: "index-definitions", generationId: generation.id, cause: generation.cause },
-      "background",
-      generation.id,
-    ).promise;
-    void indexed.catch((error) => {
       if (generation.superseded || generation.failed || error instanceof SupersededGenerationError) return;
       this.failGeneration(generation, asError(error), false);
     }).finally(() => this.mutationFinished(generation));
@@ -1128,8 +1114,27 @@ export class Preprocessor {
     this.building = generation;
     this.latestBuildError = undefined;
     this.buildingSignal.resolve(undefined);
-    this.enqueueDefinitionIndex(generation);
-    this.enqueueDiscovery(generation);
+    const definitionIndex = this.enqueueRequest<"index-definitions">(
+      { type: "index-definitions", generationId: generation.id, cause: generation.cause },
+      "background",
+      generation.id,
+    ).promise;
+    this.trackGenerationMutation(generation, definitionIndex);
+    const discovery = this.enqueueRequest<"discover-packages">(
+      { type: "discover-packages", generationId: generation.id },
+      "background",
+      generation.id,
+    ).promise;
+    this.trackGenerationMutation(generation, discovery, (discoveryResult) => {
+      const packages = discoveryResult.packages.map((pkg) => ({
+        ...pkg,
+        path: normalizeRelativePath(pkg.path),
+      }));
+      generation.packages = packages;
+      generation.discoveryComplete = true;
+      generation.discovered.resolve(packages);
+      this.seedTraversal(generation, packages);
+    });
     return generation;
   }
   
@@ -1404,39 +1409,36 @@ export class Preprocessor {
     );
   }
   
-  private async readDiagramAcrossGenerations(
-    kind: DiagramKind,
-    scopePath: string,
-  ): Promise<Omit<DiagramResponse, "version">> {
+  private async readAcrossGenerations<Value>(
+    readActive: (generationId: number) => Promise<Value>,
+    readBuilding: (generation: GenerationState) => Promise<Value>,
+  ): Promise<Value> {
     await this.readyDeferred.promise;
     while (!this.closed) {
       if (this.watchRebuilding) {
         const generation = await this.awaitBuildingGeneration();
         try {
-          return await this.readPriorityDiagram(generation, kind, scopePath);
+          return await readBuilding(generation);
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
         }
       }
-  
+
       const selectedGenerationId = this.activeGenerationId;
       if (selectedGenerationId !== null) {
         try {
-          return await this.enqueueCachedRequest<"read-diagram">(
-            { type: "read-diagram", generationId: selectedGenerationId, kind, scopePath },
-            "interactive",
-          );
+          return await readActive(selectedGenerationId);
         } catch (error) {
           if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
           if (this.activeGenerationId !== selectedGenerationId) continue;
           if (!this.building) throw error;
         }
       }
-  
+
       const generation = await this.awaitBuildingGeneration();
       try {
-        return await this.readPriorityDiagram(generation, kind, scopePath);
+        return await readBuilding(generation);
       } catch (error) {
         if (error instanceof SupersededGenerationError) continue;
         throw error;
@@ -1582,7 +1584,7 @@ export class Preprocessor {
         fallbackActiveGenerationId,
       )
     ) return false;
-    this.completePriorityRequest(request);
+    this.settlePriorityRequest(request);
     return true;
   }
   
@@ -1626,7 +1628,7 @@ export class Preprocessor {
           try {
             await read.promise;
             if (!this.activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
-            this.completePriorityRequest(request);
+            this.settlePriorityRequest(request);
             return;
           } catch (error) {
             if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
@@ -1666,7 +1668,7 @@ export class Preprocessor {
       }
       if (this.closed && !this.isTerminalPriorityRequest(request)) throw this.closedError();
     } catch (error) {
-      this.failPriorityRequest(request, error);
+      this.settlePriorityRequest(request, asError(error));
     }
   }
   
@@ -1749,46 +1751,6 @@ export class Preprocessor {
     );
   }
   
-  private async readFileAcrossGenerations(
-    path: string,
-    location?: { line: number; column: number },
-  ): Promise<FileResponse> {
-    await this.readyDeferred.promise;
-    while (!this.closed) {
-      if (this.watchRebuilding) {
-        const generation = await this.awaitBuildingGeneration();
-        try {
-          return await this.readPriorityFile(generation, path, location);
-        } catch (error) {
-          if (error instanceof SupersededGenerationError) continue;
-          throw error;
-        }
-      }
-  
-      const selectedGenerationId = this.activeGenerationId;
-      if (selectedGenerationId !== null) {
-        try {
-          return await this.enqueueCachedRequest<"read-file">(
-            { type: "read-file", generationId: selectedGenerationId, path, ...(location ? { location } : {}) },
-            "interactive",
-          );
-        } catch (error) {
-          if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
-          if (this.activeGenerationId !== selectedGenerationId) continue;
-          if (!this.building) throw error;
-        }
-      }
-  
-      const generation = await this.awaitBuildingGeneration();
-      try {
-        return await this.readPriorityFile(generation, path, location);
-      } catch (error) {
-        if (error instanceof SupersededGenerationError) continue;
-        throw error;
-      }
-    }
-    throw this.closedError();
-  }
   
   private async closeSubprocesses(): Promise<void> {
     const error = this.closedError();

@@ -2,9 +2,9 @@ import { access, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parseProject, TsUML2Settings } from "tsuml2";
 import {
+  Enum,
   TypeAlias,
   type Clazz,
-  type Enum,
   type FileDeclaration,
   type HeritageClause,
   type Interface,
@@ -12,6 +12,7 @@ import {
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type UmlDiagramGraph,
+  type UmlEntityKind,
 } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
 import { resolveInside } from "./paths.ts";
@@ -33,7 +34,6 @@ import {
 import type { CategoryMap, UmlReference } from "./uml/model.ts";
 import { analyzeUmlTypes } from "./uml/usage.ts";
 
-type UmlEntityKind = UmlDiagramGraph["entities"][number]["entityKind"];
 const CATEGORY_ENTITY_COLLECTIONS = [
   UML_ENTITY_COLLECTIONS[1],
   UML_ENTITY_COLLECTIONS[3],
@@ -210,11 +210,11 @@ function serializeHeritageClause(
   };
 }
 
-function serializeStructuredEntity(
+function serializeEntity(
   declarationOrdinal: number,
-  entityKind: Exclude<UmlEntityKind, "enum">,
+  entityKind: UmlEntityKind,
   entityOrdinal: number,
-  entity: Clazz | Interface | TypeAlias,
+  entity: Clazz | Interface | TypeAlias | Enum,
   rows: UmlModelRows,
 ): void {
   rows.entities.push({
@@ -223,6 +223,18 @@ function serializeStructuredEntity(
     entityOrdinal,
     nodeId: entity.id,
   });
+  if (entity instanceof Enum) {
+    for (const [itemOrdinal, value] of entity.items.entries()) {
+      rows.enumItems.push({
+        declarationOrdinal,
+        entityKind,
+        entityOrdinal,
+        itemOrdinal,
+        value,
+      });
+    }
+    return;
+  }
   for (const [propertyOrdinal, property] of entity.properties.entries()) {
     rows.properties.push({
       declarationOrdinal,
@@ -278,29 +290,6 @@ function serializeStructuredEntity(
   }
 }
 
-function serializeEnumEntity(
-  declarationOrdinal: number,
-  entityOrdinal: number,
-  entity: Enum,
-  rows: UmlModelRows,
-): void {
-  rows.entities.push({
-    declarationOrdinal,
-    entityKind: "enum",
-    entityOrdinal,
-    nodeId: entity.id,
-  });
-  for (const [itemOrdinal, value] of entity.items.entries()) {
-    rows.enumItems.push({
-      declarationOrdinal,
-      entityKind: "enum",
-      entityOrdinal,
-      itemOrdinal,
-      value,
-    });
-  }
-}
-
 function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlModelRows {
   const rows = emptyUmlModelRows();
   for (const [declarationOrdinal, declaration] of declarations.entries()) {
@@ -316,13 +305,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
     for (const descriptor of UML_ENTITY_COLLECTIONS) {
       if (descriptor.structured) {
         for (const [entityOrdinal, entity] of descriptor.entities(declaration).entries()) {
-          serializeStructuredEntity(
-            declarationOrdinal,
-            descriptor.kind,
-            entityOrdinal,
-            entity,
-            rows,
-          );
+          serializeEntity(declarationOrdinal, descriptor.kind, entityOrdinal, entity, rows);
           heritageOwners.set(entity.heritageClauses, {
             entityKind: descriptor.kind,
             entityOrdinal,
@@ -330,7 +313,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
         }
       } else {
         for (const [entityOrdinal, entity] of descriptor.entities(declaration).entries()) {
-          serializeEnumEntity(declarationOrdinal, entityOrdinal, entity, rows);
+          serializeEntity(declarationOrdinal, descriptor.kind, entityOrdinal, entity, rows);
         }
       }
     }

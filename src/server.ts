@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import type { Server, ServerWebSocket } from "bun";
 import { ExplorerStore, InputError } from "./store.ts";
 import { PathError } from "./paths.ts";
-import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
+import { isRecord, type PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import type { PreprocessControlRequest, WatchEventName, WatchMessage } from "./types.ts";
 
 type ServerOptions = {
@@ -48,7 +48,7 @@ export class ExplorerServer {
       return explorerServer;
     } catch (error) {
       try {
-        await explorerServer.cleanupFailedStart();
+        await explorerServer.stop();
       } catch {
         // Preserve the original startup failure.
       }
@@ -189,11 +189,7 @@ export class ExplorerServer {
       if (url.pathname === "/api/preprocess" && request.method === "POST") {
         const control =
           await ExplorerServer.parsePreprocessControlRequest(request);
-        return Response.json(
-          control.action === "prioritize"
-            ? await this.store.prioritize(control.resource)
-            : await this.store.poll(control.requestId),
-        );
+        return Response.json(await this.store.control(control));
       }
       if (
         url.pathname === "/api/goto-definition" &&
@@ -256,13 +252,6 @@ export class ExplorerServer {
     this.clients.delete(socket);
   }
 
-  private async cleanupFailedStart(): Promise<void> {
-    try {
-      await this.store.close();
-    } finally {
-      if (this.server) await this.server.stop(true);
-    }
-  }
 
   private static jsonError(error: unknown): Response {
     const status =
@@ -298,11 +287,6 @@ export class ExplorerServer {
     return { line, column };
   }
 
-  private static isRecord(
-    value: unknown,
-  ): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
 
   private static async parsePreprocessControlRequest(
     request: Request,
@@ -314,7 +298,7 @@ export class ExplorerServer {
       throw new InputError("request body must be valid JSON");
     }
     if (
-      !ExplorerServer.isRecord(value) ||
+      !isRecord(value) ||
       typeof value.action !== "string"
     ) {
       throw new InputError(

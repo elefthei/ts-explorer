@@ -21,9 +21,6 @@ export function mermaidEntityId(name: string): string {
   return bareUmlName(name).replace("{", "#123;").replace("}", "#125;");
 }
 
-export function mermaidEntityLabel(name: string): string {
-  return escapeMermaidLabel(name.replaceAll("<", "⟨").replaceAll(">", "⟩"));
-}
 
 export function escapeMermaidLabel(label: string): string {
   return label.replaceAll("&", "&amp;").replaceAll('"', "&quot;");

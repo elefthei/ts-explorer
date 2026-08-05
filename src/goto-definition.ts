@@ -21,12 +21,6 @@ export type ParsedDefinitionSpan = {
   to: number;
 };
 
-function scriptKind(path: string): ts.ScriptKind {
-  if (path.endsWith(".tsx")) return ts.ScriptKind.TSX;
-  if (path.endsWith(".mts")) return ts.ScriptKind.TS;
-  if (path.endsWith(".cts")) return ts.ScriptKind.TS;
-  return ts.ScriptKind.TS;
-}
 
 function entityKind(node: ts.Statement): ParsedEntityKind | undefined {
   if (ts.isClassDeclaration(node)) return "class";
@@ -83,7 +77,7 @@ export function parseDefinitionSpans(path: string, content: string): ParsedDefin
     content,
     ts.ScriptTarget.Latest,
     true,
-    scriptKind(path),
+    path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
   );
   const entityOccurrences = new Map<string, number>();
   const memberOccurrences = new Map<string, number>();

@@ -643,15 +643,17 @@ export function analyzeUmlTypes(
         const existing = categories.get(source.name);
         if (existing) existing.category = "abstract";
       }
-      const methods = declaration.getMethods();
-      for (const method of methods) collectDependencies(method.getReturnType(), source, new Set());
+      for (const method of declaration.getMethods()) {
+        collectDependencies(method.getReturnType(), source, new Set());
+      }
     }
 
     for (const declaration of sourceFile.getInterfaces()) {
       const source = registerReferenceDeclaration(declaration);
       if (!source) continue;
-      const methods = declaration.getMethods();
-      for (const method of methods) collectDependencies(method.getReturnType(), source, new Set());
+      for (const method of declaration.getMethods()) {
+        collectDependencies(method.getReturnType(), source, new Set());
+      }
     }
 
     for (const declaration of sourceFile.getTypeAliases()) {

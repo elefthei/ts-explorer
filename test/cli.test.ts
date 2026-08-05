@@ -54,7 +54,7 @@ test.each([
   ["win32", { command: "cmd", args: ["/c", "start", "", "http://127.0.0.1:8080"] }],
   ["darwin", { command: "open", args: ["http://127.0.0.1:8080"] }],
   ["linux", { command: "xdg-open", args: ["http://127.0.0.1:8080"] }],
-] as const)("builds the %s browser launch command", (platform, expected) => {
+] satisfies [NodeJS.Platform, { command: string; args: string[] }][])("builds the %s browser launch command", (platform, expected) => {
   expect(browserOpenCommand("http://127.0.0.1:8080", platform)).toEqual(expected);
 });
 

@@ -5,6 +5,7 @@ import {
   type PackageDiagramGraph,
   type RenderedDiagram,
 } from "./diagram-graph.ts";
+import { normalizeRelativePath } from "./paths.ts";
 import type { PackageDiagramNode, PackageInfo } from "./types.ts";
 
 function toPosix(path: string): string {
@@ -151,7 +152,9 @@ function invalidPackageGraph(detail: string): never {
   throw new Error(`Invalid package diagram graph: ${detail}`);
 }
 
-export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedDiagram {
+export function validatePackageDiagramGraph(
+  graph: PackageDiagramGraph,
+): ReadonlyMap<string, string | null> {
   if (graph.kind !== "packages") invalidPackageGraph(`unexpected kind ${String(graph.kind)}`);
   if (graph.scopePath !== "") invalidPackageGraph("package scope path must be empty");
   if (graph.formatVersion !== DIAGRAM_GRAPH_FORMAT_VERSION) {
@@ -162,29 +165,108 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedD
   }
   if (graph.aliases.length) invalidPackageGraph("package graphs cannot contain aliases");
 
-  const nodeIds = new Set<string>();
+  const nodes = new Map<string, PackageDiagramGraph["nodes"][number]>();
   for (const [index, node] of graph.nodes.entries()) {
     if (node.nodeOrdinal !== index) invalidPackageGraph("node ordinals must be contiguous and ordered");
-    if (nodeIds.has(node.nodeId)) invalidPackageGraph(`duplicate node ${node.nodeId}`);
+    if (typeof node.nodeId !== "string" || !node.nodeId) invalidPackageGraph("package node ID must be nonempty");
+    if (nodes.has(node.nodeId)) invalidPackageGraph(`duplicate node ${node.nodeId}`);
+    if (typeof node.name !== "string" || !node.name) invalidPackageGraph(`package node ${node.nodeId} has an empty name`);
     if (node.nodeKind !== "package" && node.nodeKind !== "placeholder") {
-      invalidPackageGraph(`unexpected node kind ${node.nodeKind}`);
+      invalidPackageGraph(`unexpected node kind ${String(node.nodeKind)}`);
     }
     if (node.community !== null) invalidPackageGraph(`package node ${node.nodeId} has a community`);
-    nodeIds.add(node.nodeId);
+    nodes.set(node.nodeId, node);
   }
 
   const packageRows = new Map<string, string | null>();
   for (const row of graph.packageNodes) {
+    if (typeof row.nodeId !== "string" || !row.nodeId || !nodes.has(row.nodeId)) {
+      invalidPackageGraph(`package row has missing node ${String(row.nodeId)}`);
+    }
     if (packageRows.has(row.nodeId)) invalidPackageGraph(`duplicate package row ${row.nodeId}`);
-    if (!nodeIds.has(row.nodeId)) invalidPackageGraph(`package row has missing node ${row.nodeId}`);
+    if (row.packagePath !== null) {
+      let normalizedPath: string;
+      try {
+        normalizedPath = normalizeRelativePath(row.packagePath);
+      } catch {
+        invalidPackageGraph(`package path is not normalized: ${String(row.packagePath)}`);
+      }
+      if (normalizedPath !== row.packagePath) {
+        invalidPackageGraph(`package path is not normalized: ${row.packagePath}`);
+      }
+    }
     packageRows.set(row.nodeId, row.packagePath);
   }
-  if (packageRows.size !== graph.nodes.length) invalidPackageGraph("each node must have one package row");
+  if (packageRows.size !== nodes.size) invalidPackageGraph("each node must have one package row");
 
   if (graph.renderMode === "bare") {
-    if (graph.nodes.length || graph.edges.length || graph.relations.length || graph.packageNodes.length) {
+    if (nodes.size || graph.edges.length || graph.relations.length || packageRows.size) {
       invalidPackageGraph("bare package graph must be empty");
     }
+    return packageRows;
+  }
+
+  if (!nodes.size) invalidPackageGraph("normal package graph must contain a package or placeholder");
+  const placeholders = [...nodes.values()].filter((node) => node.nodeKind === "placeholder");
+  if (placeholders.length) {
+    const placeholder = placeholders[0];
+    if (
+      placeholders.length !== 1
+      || nodes.size !== 1
+      || placeholder?.nodeId !== "source"
+      || placeholder.name !== "No workspace packages"
+      || packageRows.get("source") !== null
+      || graph.edges.length
+      || graph.relations.length
+    ) {
+      invalidPackageGraph("normal empty graph must contain only the source placeholder");
+    }
+  } else {
+    for (const [nodeId, packagePath] of packageRows) {
+      if (nodes.get(nodeId)?.nodeKind !== "package" || packagePath === null) {
+        invalidPackageGraph(`package node ${nodeId} has no package path`);
+      }
+    }
+  }
+
+  const edges = new Map<number, PackageDiagramGraph["edges"][number]>();
+  const edgeKeys = new Set<string>();
+  for (const [index, edge] of graph.edges.entries()) {
+    if (edge.edgeOrdinal !== index) invalidPackageGraph("edge ordinals must be contiguous and ordered");
+    if (edge.edgeKind !== "package-dependency" || !edge.directed || edge.weight !== 1) {
+      invalidPackageGraph(`invalid package edge ${edge.edgeOrdinal}`);
+    }
+    if (!nodes.has(edge.sourceNodeId) || !nodes.has(edge.targetNodeId)) {
+      invalidPackageGraph(`edge ${edge.edgeOrdinal} has a missing endpoint`);
+    }
+    const edgeKey = JSON.stringify([edge.sourceNodeId, edge.targetNodeId]);
+    if (edgeKeys.has(edgeKey)) invalidPackageGraph(`duplicate package edge ${edge.edgeOrdinal}`);
+    edgeKeys.add(edgeKey);
+    edges.set(edge.edgeOrdinal, edge);
+  }
+
+  if (graph.relations.length !== graph.edges.length) {
+    invalidPackageGraph("each package edge must have one relation");
+  }
+  for (const [index, relation] of graph.relations.entries()) {
+    const edge = edges.get(relation.edgeOrdinal);
+    if (
+      relation.edgeOrdinal !== index
+      || !edge
+      || relation.relationOrdinal !== 0
+      || relation.relationKind !== "package-dependency"
+      || relation.sourceNodeId !== edge.sourceNodeId
+      || relation.targetNodeId !== edge.targetNodeId
+    ) {
+      invalidPackageGraph(`invalid relation for edge ${relation.edgeOrdinal}`);
+    }
+  }
+  return packageRows;
+}
+
+export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedDiagram {
+  const packageRows = validatePackageDiagramGraph(graph);
+  if (graph.renderMode === "bare") {
     const dsl = "flowchart LR";
     return {
       dsl,
@@ -194,65 +276,6 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedD
       externalUsers: [],
       localUsers: [],
     };
-  }
-
-  if (!graph.nodes.length) invalidPackageGraph("normal package graph must contain a package or placeholder");
-  const placeholders = graph.nodes.filter((node) => node.nodeKind === "placeholder");
-  if (placeholders.length) {
-    const placeholder = placeholders[0];
-    if (!placeholder) invalidPackageGraph("normal empty graph must contain only the source placeholder");
-    if (
-      placeholders.length !== 1
-      || graph.nodes.length !== 1
-      || placeholder.nodeId !== "source"
-      || placeholder.name !== "No workspace packages"
-      || packageRows.get(placeholder.nodeId) !== null
-      || graph.edges.length
-      || graph.relations.length
-    ) {
-      invalidPackageGraph("normal empty graph must contain only the source placeholder");
-    }
-  } else {
-    for (const node of graph.nodes) {
-      if (packageRows.get(node.nodeId) === null) {
-        invalidPackageGraph(`package node ${node.nodeId} has no package path`);
-      }
-    }
-  }
-
-  const edges = new Map<number, (typeof graph.edges)[number]>();
-  const edgeKeys = new Set<string>();
-  for (const [index, edge] of graph.edges.entries()) {
-    if (edge.edgeOrdinal !== index) invalidPackageGraph("edge ordinals must be contiguous and ordered");
-    if (edge.edgeKind !== "package-dependency" || !edge.directed || edge.weight !== 1) {
-      invalidPackageGraph(`invalid package edge ${edge.edgeOrdinal}`);
-    }
-    if (!nodeIds.has(edge.sourceNodeId) || !nodeIds.has(edge.targetNodeId)) {
-      invalidPackageGraph(`edge ${edge.edgeOrdinal} has a missing endpoint`);
-    }
-    const edgeKey = `${edge.sourceNodeId}\0${edge.targetNodeId}`;
-    if (edgeKeys.has(edgeKey)) invalidPackageGraph(`duplicate package edge ${edge.edgeOrdinal}`);
-    edgeKeys.add(edgeKey);
-    edges.set(edge.edgeOrdinal, edge);
-  }
-
-  if (graph.relations.length !== graph.edges.length) {
-    invalidPackageGraph("each package edge must have one relation");
-  }
-  const relatedEdges = new Set<number>();
-  for (const relation of graph.relations) {
-    const edge = edges.get(relation.edgeOrdinal);
-    if (
-      !edge
-      || relation.relationOrdinal !== 0
-      || relation.relationKind !== "package-dependency"
-      || relation.sourceNodeId !== edge.sourceNodeId
-      || relation.targetNodeId !== edge.targetNodeId
-      || relatedEdges.has(relation.edgeOrdinal)
-    ) {
-      invalidPackageGraph(`invalid relation for edge ${relation.edgeOrdinal}`);
-    }
-    relatedEdges.add(relation.edgeOrdinal);
   }
 
   const lines = ["flowchart LR"];
