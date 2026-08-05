@@ -54,6 +54,8 @@ type TestResource = {
   cleanupPromise?: Promise<void>;
 };
 
+type PrintCounterWindow = Window & { printCalls?: number };
+
 class OutputTail {
   private bytes = Buffer.alloc(0);
 
@@ -1781,6 +1783,74 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     await expect(definitionResult).toHaveCount(0);
     await expect(matchedTreeRow).toHaveCount(0);
     await expect(searchInput).toHaveAttribute("aria-invalid", "true");
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("prints the open file with light syntax colors", async ({ browser }) => {
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-print-e2e-"));
+    resource.fixtureRoot = fixtureRoot;
+    await writeFile(
+      join(fixtureRoot, "index.ts"),
+      [
+        "export class PrintableWidget {",
+        '  label(): string { return "printable"; }',
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    await page.addInitScript(() => {
+      const counter: PrintCounterWindow = window;
+      counter.printCalls = 0;
+      window.print = () => {
+        counter.printCalls = (counter.printCalls ?? 0) + 1;
+      };
+    });
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await withBound(watch.cacheReady, 45_000, "print fixture cache-ready version 0");
+
+    await expect(page.locator("#editor-print")).toBeHidden();
+    await page.locator('.tree-row[data-tree-path="index.ts"]').click();
+    await expect(page.locator("#editor-path")).toHaveText("index.ts");
+    await expect(page.locator("#editor-print")).toBeVisible();
+
+    await page.locator("#editor-print").click();
+    const printCalls = await page.evaluate(() => {
+      const counter: PrintCounterWindow = window;
+      return counter.printCalls;
+    });
+    expect(printCalls).toBe(1);
+
+    await page.emulateMedia({ media: "print" });
+    const printStyles = await page.evaluate(() => {
+      const read = (selector: string, property: "color" | "backgroundColor" | "display") => {
+        const element = document.querySelector(selector);
+        return element ? getComputedStyle(element)[property] : null;
+      };
+      return {
+        keyword: read(".cm-content .tok-keyword", "color"),
+        editor: read("#editor-panel .cm-editor", "backgroundColor"),
+        topbar: read(".topbar", "display"),
+        sidebar: read("#sidebar", "display"),
+        close: read("#editor-close", "display"),
+      };
+    });
+    expect(printStyles).toEqual({
+      keyword: "rgb(215, 58, 73)",
+      editor: "rgb(255, 255, 255)",
+      topbar: "none",
+      sidebar: "none",
+      close: "none",
+    });
+    await page.emulateMedia({ media: null });
   } finally {
     await cleanupResource(resource);
   }

@@ -284,11 +284,12 @@ async function openWatch(base: string): Promise<WatchClient> {
 }
 
 
-function assertReadOnlyNavigationAssets(html: string, mainScript: string): void {
+function assertReadOnlyNavigationAssets(html: string, mainScript: string, styleSheet: string): void {
   expect(html).toMatch(
     /\bid\s*=\s*["']packages-mode["'][\s\S]*\bid\s*=\s*["']uml-mode["'][\s\S]*\bid\s*=\s*["']editor-mode["']/i,
   );
   expect(html).toMatch(/\bid\s*=\s*["']editor-close["']/i);
+  expect(html).toMatch(/\bid\s*=\s*["']editor-print["']/i);
   expect(html).not.toMatch(/\bid\s*=\s*["'](?:save-file|format-file|conflict-banner)["']/i);
   expect(html).not.toMatch(/\b(?:Save|Format|conflict)\b/i);
 
@@ -316,6 +317,12 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string): void 
   expect(mainScript).toContain("Read-only preprocessed source");
   expect(mainScript).not.toContain("/api/file/format");
   expect(mainScript).not.toMatch(/\bMod-s\b|method\s*:\s*["']PUT["']|conflict-banner/);
+  expect(mainScript).toContain("window.print()");
+  expect(mainScript).toMatch(/forceParsing\s*\(/);
+
+  expect(styleSheet).toContain("@media print");
+  expect(styleSheet).toMatch(/#editor-panel \.tok-keyword\{color:#d73a49\}/);
+  expect(styleSheet).toMatch(/body:has\(#editor-content:not\(\[hidden\]\)\) \.workspace\{display:block/);
 
   expect(mainScript).toContain("/api/goto-definition?");
   expect(mainScript).toContain("/api/preprocess");
@@ -555,7 +562,10 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     const mainResponse = await fetch(`${base}/main.js`);
     expect(mainResponse.status).toBe(200);
     const mainScript = await mainResponse.text();
-    assertReadOnlyNavigationAssets(html, mainScript);
+    const styleResponse = await fetch(`${base}/style.css`);
+    expect(styleResponse.status).toBe(200);
+    const styleSheet = await styleResponse.text();
+    assertReadOnlyNavigationAssets(html, mainScript, styleSheet);
 
     const tree = await withTimeout(
       fetch(`${base}/api/tree`).then(async (response) => {

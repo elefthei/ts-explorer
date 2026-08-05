@@ -3,6 +3,8 @@ import { basicSetup, EditorView } from "codemirror";
 import { Decoration } from "@codemirror/view";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
+import { forceParsing, syntaxHighlighting } from "@codemirror/language";
+import { classHighlighter } from "@lezer/highlight";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
@@ -41,6 +43,7 @@ function $<T extends Element = HTMLInputElement>(selector:string):T{const elemen
 const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
+const PRINT_PARSE_BUDGET_MS=5_000;
 const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
 const diagramRequests=new RequestSequence();
 const searchRequests=new RequestSequence();
@@ -590,6 +593,11 @@ function destroyEditor(invalidate=true):void{
   $("#editor-empty").hidden=false;
 }
 function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
+function printEditor():void{
+  if(!state.view)return;
+  forceParsing(state.view,state.view.state.doc.length,PRINT_PARSE_BUDGET_MS);
+  window.print();
+}
 function editorDefinitionDecorations(file:FileResponse){
   return Decoration.set(file.definitions.flatMap((definition)=>{
     if(definition.displayFrom<0||definition.displayTo>file.content.length||definition.displayFrom>=definition.displayTo)return[];
@@ -655,6 +663,7 @@ async function openFile(
       basicSetup,
       javascript({typescript,jsx}),
       oneDark,
+      syntaxHighlighting(classHighlighter),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       EditorView.decorations.of(editorDefinitionDecorations(file)),
@@ -840,7 +849,7 @@ nodeSearch.onkeydown=(event)=>{if(event.key!=="Enter")return;event.preventDefaul
 nodeSearch.oninput=()=>{if(nodeSearch.value!=="")return;clearSearch();};
 $("#packages-mode").onclick=()=>void selectScope({name:"Packages",path:"",kind:"directory"},"packages");
 $("#uml-mode").onclick=()=>void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");
-$("#editor-mode").onclick=()=>{definitionRequests.next();diagramRequests.next();activateView("editor");};$("#tree-filter").oninput=renderTree;$("#zoom-in").onclick=()=>zoomAtStageCenter(ZOOM_IN_FACTOR);$("#zoom-out").onclick=()=>zoomAtStageCenter(ZOOM_OUT_FACTOR);$("#zoom-reset").onclick=()=>viewport.reset();$("#legend-toggle").onclick=()=>{$("#legend").hidden=!$("#legend").hidden;};$("#sidebar-toggle").onclick=toggleSidebar;$("#editor-close").onclick=()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);};
+$("#editor-mode").onclick=()=>{definitionRequests.next();diagramRequests.next();activateView("editor");};$("#tree-filter").oninput=renderTree;$("#zoom-in").onclick=()=>zoomAtStageCenter(ZOOM_IN_FACTOR);$("#zoom-out").onclick=()=>zoomAtStageCenter(ZOOM_OUT_FACTOR);$("#zoom-reset").onclick=()=>viewport.reset();$("#legend-toggle").onclick=()=>{$("#legend").hidden=!$("#legend").hidden;};$("#sidebar-toggle").onclick=toggleSidebar;$("#editor-close").onclick=()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);};$("#editor-print").onclick=printEditor;
 diagramStage.addEventListener("wheel",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true")return;event.preventDefault();const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(event.deltaY>0?ZOOM_OUT_FACTOR:ZOOM_IN_FACTOR,event.clientX-rect.left,event.clientY-rect.top);},{passive:false});
 diagramStage.addEventListener("pointerdown",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true"||event.button!==0||dragState.pointerId!==null)return;dragState.pointerId=event.pointerId;dragState.startX=dragState.lastX=event.clientX;dragState.startY=dragState.lastY=event.clientY;dragState.moved=false;});
 diagramStage.addEventListener("pointermove",(event)=>{if(dragState.pointerId!==event.pointerId)return;if(!dragState.moved){if(!hasPassedDragThreshold(dragState.startX,dragState.startY,event.clientX,event.clientY))return;dragState.moved=true;diagramStage.setPointerCapture(event.pointerId);diagramStage.classList.add("dragging");}panViewport(viewport,event.clientX-dragState.lastX,event.clientY-dragState.lastY);dragState.lastX=event.clientX;dragState.lastY=event.clientY;viewport.apply();});
