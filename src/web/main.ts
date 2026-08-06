@@ -9,6 +9,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
   DiagramResponse,
+  EditorGotoDefinition,
   FileResponse,
   GotoDefinition,
   GotoDefinitionLookupResponse,
@@ -601,8 +602,57 @@ function destroyEditor(invalidate=true):void{
   state.file=null;
   $("#editor-content").hidden=true;
   $("#editor-empty").hidden=false;
+  $("#outline").textContent="";
 }
 function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
+const OUTLINE_ICONS:Record<EditorGotoDefinition["kind"],string>={class:"C",interface:"I",enum:"E",type:"T",method:"·"};
+function renderOutline(file:FileResponse):void{
+  const root=$("#outline");
+  root.textContent="";
+  const tops=file.definitions.filter((definition)=>definition.kind!=="method");
+  const methods=file.definitions.filter((definition)=>definition.kind==="method");
+  if(tops.length===0&&methods.length===0){
+    const empty=document.createElement("div");
+    empty.className="outline-empty";
+    empty.textContent="No indexed symbols";
+    root.append(empty);
+    return;
+  }
+  const makeRow=(definition:EditorGotoDefinition):HTMLButtonElement=>{
+    const row=document.createElement("button");
+    row.type="button";
+    row.className="outline-row";
+    const icon=document.createElement("span");
+    icon.className="icon";
+    icon.textContent=OUTLINE_ICONS[definition.kind];
+    const label=document.createElement("span");
+    label.textContent=definition.name;
+    row.append(icon,label);
+    row.onclick=()=>{
+      revealEditorOffset(definition.displayFrom);
+      for(const active of root.querySelectorAll(".outline-row.active"))active.classList.remove("active");
+      row.classList.add("active");
+    };
+    return row;
+  };
+  const attached=new Set<EditorGotoDefinition>();
+  for(const top of tops){
+    root.append(makeRow(top));
+    const children=methods.filter((method)=>method.uml.entityName===top.uml.entityName);
+    if(children.length===0)continue;
+    const childHolder=document.createElement("div");
+    childHolder.className="outline-children";
+    for(const method of children){
+      childHolder.append(makeRow(method));
+      attached.add(method);
+    }
+    root.append(childHolder);
+  }
+  for(const method of methods){
+    if(attached.has(method))continue;
+    root.append(makeRow(method));
+  }
+}
 function printEditor():void{
   if(!state.view)return;
   forceParsing(state.view,state.view.state.doc.length,PRINT_PARSE_BUDGET_MS);
@@ -680,6 +730,7 @@ async function openFile(
       editorDefinitionHandlers(),
     ];
     state.view=new EditorView({state:EditorState.create({doc:file.content,extensions}),parent:$("#editor")});
+    renderOutline(file);
     if(!isCurrent()){
       destroyEditor(false);
       return false;
@@ -869,6 +920,11 @@ nodeSearch.oninput=()=>{if(nodeSearch.value!=="")return;clearSearch();};
 $("#packages-mode").onclick=()=>void selectScope({name:"Packages",path:"",kind:"directory"},"packages");
 $("#uml-mode").onclick=()=>void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");
 $("#editor-mode").onclick=()=>{definitionRequests.next();diagramRequests.next();activateView("editor");};$("#tree-filter").oninput=renderTree;$("#zoom-in").onclick=()=>zoomAtStageCenter(ZOOM_IN_FACTOR);$("#zoom-out").onclick=()=>zoomAtStageCenter(ZOOM_OUT_FACTOR);$("#zoom-reset").onclick=()=>viewport.reset();$("#legend-toggle").onclick=()=>{$("#legend").hidden=!$("#legend").hidden;};$("#sidebar-toggle").onclick=toggleSidebar;$("#editor-close").onclick=()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);};$("#editor-print").onclick=printEditor;
+$("#outline-toggle").onclick=()=>{
+  const body=$("#editor-body");
+  const hidden=body.classList.toggle("outline-hidden");
+  $("#outline-toggle").setAttribute("aria-expanded",String(!hidden));
+};
 diagramStage.addEventListener("wheel",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true")return;event.preventDefault();const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(event.deltaY>0?ZOOM_OUT_FACTOR:ZOOM_IN_FACTOR,event.clientX-rect.left,event.clientY-rect.top);},{passive:false});
 diagramStage.addEventListener("pointerdown",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true"||event.button!==0||dragState.pointerId!==null)return;dragState.pointerId=event.pointerId;dragState.startX=dragState.lastX=event.clientX;dragState.startY=dragState.lastY=event.clientY;dragState.moved=false;});
 diagramStage.addEventListener("pointermove",(event)=>{if(dragState.pointerId!==event.pointerId)return;if(!dragState.moved){if(!hasPassedDragThreshold(dragState.startX,dragState.startY,event.clientX,event.clientY))return;dragState.moved=true;diagramStage.setPointerCapture(event.pointerId);diagramStage.classList.add("dragging");}panViewport(viewport,event.clientX-dragState.lastX,event.clientY-dragState.lastY);dragState.lastX=event.clientX;dragState.lastY=event.clientY;viewport.apply();});
