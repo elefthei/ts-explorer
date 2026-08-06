@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
+import { readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import yargs from "yargs/yargs";
-import { stat } from "node:fs/promises";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import type { WatchEventName } from "./types.ts";
 import { ExplorerServer } from "./server.ts";
@@ -26,15 +27,22 @@ function expandHome(value: string): string {
   return value;
 }
 
+function readPackageVersion(): string {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version?: unknown };
+  if (typeof manifest.version !== "string") throw new Error("package.json is missing a version");
+  return manifest.version;
+}
+
+export const cliVersion = readPackageVersion();
+
 export function parseCliOptions(args: string[]) {
   const parsed = yargs(args)
     .scriptName("ts-explorer")
-    .usage("$0 [options]")
-    .option("dir", {
-      type: "string",
-      demandOption: true,
-      describe: "Source directory to explore",
-    })
+    .usage(
+      "$0 <dir> [options]\n\nExplore a TypeScript project in the browser. <dir> is the source directory to explore.",
+    )
     .option("host", {
       type: "string",
       default: "127.0.0.1",
@@ -50,20 +58,22 @@ export function parseCliOptions(args: string[]) {
       default: true,
       describe: "Open the explorer in the default browser (--no-open to disable)",
     })
+    .demandCommand(1, 1)
     .strict()
-    .version(false)
+    .version(cliVersion)
+    .alias("version", "v")
     .help()
     .alias("help", "h")
     .showHelpOnFail(false)
     .exitProcess(false)
     .fail(false)
     .parseSync();
-  if (parsed.help) return null;
+  if (parsed.help || parsed.version) return null;
   if (!Number.isInteger(parsed.port) || parsed.port < 1 || parsed.port > 65535) {
     throw new Error("port must be an integer between 1 and 65535");
   }
   return {
-    sourceDir: resolve(expandHome(parsed.dir)),
+    sourceDir: resolve(expandHome(String(parsed._[0]))),
     host: parsed.host,
     port: parsed.port,
     open: parsed.open,

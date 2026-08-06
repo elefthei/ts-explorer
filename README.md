@@ -15,7 +15,7 @@ The explorer never imports or executes the inspected project.
 bun install
 ```
 
-To put the `tse` command on your PATH, link the package globally (creates the shim in Bun's global bin directory):
+To put the `ts-explorer` command (and its `tse` alias) on your PATH, link the package globally (creates the shim in Bun's global bin directory):
 
 ```sh
 bun link
@@ -28,7 +28,7 @@ Remove it again with `bun unlink` from this directory.
 After linking, run the explorer from anywhere:
 
 ```sh
-tse --dir /path/to/project
+tse /path/to/project
 ```
 
 It launches your default browser at <http://127.0.0.1:8080>. Pass `--no-open` to keep the terminal-only behavior.
@@ -36,28 +36,34 @@ It launches your default browser at <http://127.0.0.1:8080>. Pass `--no-open` to
 The source path may use `~`:
 
 ```sh
-tse --dir ~/git/junco-runtime
+tse ~/git/junco-runtime
 ```
 
 Without linking, run it from this repository:
 
 ```sh
-bun run start -- --dir /path/to/project
+bun run start -- /path/to/project
 ```
 
 ### CLI options
 
-| Option | Default | Description |
+```sh
+tse <dir> [options]
+```
+
+| Argument | Default | Description |
 | --- | --- | --- |
-| `--dir` | _required_ | Source directory to inspect |
+| `<dir>` | _required_ | Source directory to inspect (positional) |
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8080` | HTTP/WebSocket port |
 | `--open` | `true` | Launch the default browser at the served URL; disable with `--no-open` |
+| `-v`, `--version` | | Print the version from `package.json` and exit |
+| `-h`, `--help` | | Print usage and exit |
 
 For example, to use a different local port:
 
 ```sh
-tse --dir ~/git/my-project --host 127.0.0.1 --port 8081
+tse ~/git/my-project --host 127.0.0.1 --port 8081
 ```
 
 Use `--host 0.0.0.0` only when you intentionally want the server reachable beyond the local machine.

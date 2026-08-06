@@ -141,7 +141,6 @@ function spawnCli(fixtureRoot: string, port: number): SpawnedCli {
     [
       "run",
       "src/cli.ts",
-      "--dir",
       fixtureRoot,
       "--host",
       "127.0.0.1",

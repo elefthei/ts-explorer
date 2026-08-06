@@ -5,6 +5,7 @@
   "type": "module",
   "packageManager": "bun@1.3.14",
   "bin": {
+    "ts-explorer": "./src/cli.ts",
     "tse": "./src/cli.ts"
   },
   "scripts": {
