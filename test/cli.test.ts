@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   browserOpenCommand,
@@ -6,6 +8,7 @@ import {
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
+  validateSourceDir,
 } from "../src/cli.ts";
 
 test("parses explicit directory, host, and port options", () => {
@@ -88,4 +91,33 @@ test("formats path-sorted watch invalidation arrays exactly without losing JSON 
   )).toBe(
     '[sync] invalidate watch version=17 paths=["packages/a file.ts","packages/b\\"quoted\\".ts"] events=["change","unlink"]',
   );
+});
+
+test("validateSourceDir resolves for an existing directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ts-explorer-cli-"));
+  try {
+    await expect(validateSourceDir(dir)).resolves.toBeUndefined();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("validateSourceDir rejects a path that does not exist", async () => {
+  const missing = join(tmpdir(), "ts-explorer-cli-does-not-exist-12345");
+  await expect(validateSourceDir(missing)).rejects.toThrow(
+    `source directory does not exist or is not a directory: ${missing}`,
+  );
+});
+
+test("validateSourceDir rejects a path that is a file, not a directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ts-explorer-cli-"));
+  const filePath = join(dir, "not-a-dir.txt");
+  await writeFile(filePath, "content");
+  try {
+    await expect(validateSourceDir(filePath)).rejects.toThrow(
+      `source directory does not exist or is not a directory: ${filePath}`,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

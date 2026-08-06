@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import yargs from "yargs/yargs";
-import { stat } from "node:fs/promises";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
-import type { WatchEventName } from "./types.ts";
 import { ExplorerServer } from "./server.ts";
+import type { WatchEventName } from "./types.ts";
 
 
 export function formatSyncProgress(event: PreprocessProgressEvent): string {
@@ -70,7 +70,7 @@ export function parseCliOptions(args: string[]) {
   };
 }
 
-async function validateSourceDir(sourceDir: string): Promise<void> {
+export async function validateSourceDir(sourceDir: string): Promise<void> {
   try {
     const sourceStat = await stat(sourceDir);
     if (!sourceStat.isDirectory()) throw new Error("not a directory");
