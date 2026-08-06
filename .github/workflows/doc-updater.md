@@ -39,6 +39,10 @@ permissions:
   pull-requests: read
   copilot-requests: write
 
+engine:
+  id: copilot
+  version: 1.0.78
+
 tools:
   github:
     toolsets: [default]
