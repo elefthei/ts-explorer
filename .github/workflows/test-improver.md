@@ -60,6 +60,11 @@ network:
   - python
   - rust
   - java
+  - github
+  - "msfeed12.pkgs.visualstudio.com"
+  - "msfeed2.pkgs.visualstudio.com"
+  - "msfeed25.pkgs.visualstudio.com"
+  - "packagefeedproxy.microsoft.io"
 
 safe-outputs:
   add-comment:

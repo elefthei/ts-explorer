@@ -68,6 +68,11 @@ network:
   - python
   - rust
   - java
+  - github
+  - "msfeed12.pkgs.visualstudio.com"
+  - "msfeed2.pkgs.visualstudio.com"
+  - "msfeed25.pkgs.visualstudio.com"
+  - "packagefeedproxy.microsoft.io"
 
 checkout:
   fetch: ["*"]     # fetch all remote branches to allow working on PR branches
