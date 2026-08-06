@@ -37,6 +37,7 @@ import {
   zoomViewportAt,
   type ViewportState,
 } from "./diagram-interactions.ts";
+import { rankFuzzy, type FuzzyMatch } from "./navigation.ts";
 
 function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
 const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
@@ -231,7 +232,9 @@ function renderTree(){
     const button=document.createElement("button");
     button.className=`tree-row ${state.scope===node.path&&state.mode===(node.kind==="file"?state.mode:"uml")?"selected":""} ${nodeSearchMatch?"search-match":""}`.trim();
     button.dataset.treePath=node.path;
-    button.innerHTML=`<span class="icon">${isDir?(expanded?"▾":"▸"):"·"}</span><span>${node.name}</span>`;
+    const icon=document.createElement("span");icon.className="icon";icon.textContent=isDir?(expanded?"▾":"▸"):"·";
+    const name=document.createElement("span");name.textContent=node.name;
+    button.append(icon,name);
     if(isDir)button.setAttribute("aria-expanded",String(expanded));
     button.onclick=()=>{
       if(isDir){
@@ -415,7 +418,114 @@ function renderDefinitionResults():void{
   }
   results.hidden=state.searchDefinitions.length===0;
 }
-
+const PALETTE_LIMIT=50;
+type PaletteItem={id:string;label:string;detail:string;text:string;run:()=>void};
+const paletteState={items:[] as PaletteItem[],commands:[] as PaletteItem[],ranked:[] as {item:PaletteItem;match:FuzzyMatch}[],active:0};
+function collectFilePaletteItems():PaletteItem[]{
+  const items:PaletteItem[]=[];
+  const walk=(node:TreeNode,root:boolean):void=>{
+    if(!root)items.push({id:node.path,label:node.name,detail:node.path,text:node.path,run:node.kind==="file"&&node.viewable?():void=>{void openFile(node.path);}:():void=>{void selectScope(node,"uml");}});
+    for(const child of node.children??[])walk(child,false);
+  };
+  if(state.tree)walk(state.tree,true);
+  return items;
+}
+async function copyViewLink():Promise<void>{
+  try{
+    await navigator.clipboard.writeText(location.href);
+    setStatus("Link copied to clipboard");
+  }catch(error){
+    setStatus(error instanceof Error?error.message:String(error),true);
+  }
+}
+function collectCommandPaletteItems():PaletteItem[]{
+  const command=(id:string,label:string,detail:string,run:()=>void):PaletteItem=>({id,label,detail,text:label,run});
+  const items=[
+    command("packages-diagram","Packages diagram","Show the package dependency diagram",()=>{void selectScope({name:"Packages",path:"",kind:"directory"},"packages");}),
+    command("uml-diagram","UML diagram","Show the UML diagram for the selected scope",()=>{void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");}),
+    command("editor","Editor","Switch to the file viewer",()=>{definitionRequests.next();diagramRequests.next();activateView("editor");}),
+    command("reset-diagram-view","Reset diagram view","Reset zoom and pan",()=>{viewport.reset();}),
+    command("toggle-legend","Toggle legend","Show or hide the diagram legend",()=>{$("#legend").hidden=!$("#legend").hidden;}),
+    command("toggle-file-tree","Toggle file tree","Collapse or expand the sidebar",()=>{toggleSidebar();}),
+    command("copy-link","Copy link to this view","Copy the current URL to the clipboard",()=>{void copyViewLink();}),
+  ];
+  if(state.file!==null){
+    items.push(command("print-file","Print file","Print the open file",()=>{printEditor();}));
+    items.push(command("close-file","Close file","Close the open file",()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);}));
+  }
+  return items;
+}
+function appendFuzzyText(target:HTMLElement,text:string,positions:readonly number[]):void{
+  const marked=new Set(positions);
+  let index=0;
+  while(index<text.length){
+    const highlighted=marked.has(index);
+    let end=index;
+    while(end<text.length&&marked.has(end)===highlighted)end+=1;
+    const chunk=text.slice(index,end);
+    if(highlighted){const mark=document.createElement("mark");mark.textContent=chunk;target.append(mark);}
+    else target.append(document.createTextNode(chunk));
+    index=end;
+  }
+}
+function paletteEmptyRow(message:string):HTMLElement{const row=document.createElement("div");row.className="palette-empty";row.textContent=message;return row;}
+function renderPalette():void{
+  const input=$("#palette-input");
+  const raw=input.value;
+  const commandMode=raw.startsWith(">");
+  const items=commandMode?paletteState.commands:paletteState.items;
+  const query=(commandMode?raw.slice(1):raw).trim();
+  paletteState.ranked=rankFuzzy(items,query,(item)=>item.text,PALETTE_LIMIT).slice();
+  if(paletteState.active>=paletteState.ranked.length)paletteState.active=Math.max(0,paletteState.ranked.length-1);
+  const results=$("#palette-results");
+  results.replaceChildren();
+  if(paletteState.ranked.length===0){
+    results.append(paletteEmptyRow(items.length===0?"No files indexed yet":"No matching results"));
+    input.removeAttribute("aria-activedescendant");
+    return;
+  }
+  paletteState.ranked.forEach(({item,match},index)=>{
+    const button=document.createElement("button");
+    button.type="button";
+    button.className=index===paletteState.active?"palette-result active":"palette-result";
+    button.id=`palette-result-${index}`;
+    button.setAttribute("role","option");
+    button.setAttribute("aria-selected",String(index===paletteState.active));
+    const label=document.createElement("span");
+    label.className="palette-result-label";
+    if(item.label===item.text)appendFuzzyText(label,item.label,match.positions);else label.textContent=item.label;
+    const detail=document.createElement("span");
+    detail.className="palette-result-detail";
+    if(item.detail===item.text)appendFuzzyText(detail,item.detail,match.positions);else detail.textContent=item.detail;
+    button.append(label,detail);
+    results.append(button);
+  });
+  input.setAttribute("aria-activedescendant",`palette-result-${paletteState.active}`);
+  results.querySelector(".palette-result.active")?.scrollIntoView({block:"nearest"});
+}
+function openPalette(mode:"files"|"commands"):void{
+  paletteState.items=collectFilePaletteItems();
+  paletteState.commands=collectCommandPaletteItems();
+  paletteState.active=0;
+  const input=$("#palette-input");
+  input.value=mode==="commands"?">":"";
+  renderPalette();
+  const dialog=$<HTMLDialogElement>("#palette");
+  if(!dialog.open)dialog.showModal();
+  input.focus();
+  input.setSelectionRange(input.value.length,input.value.length);
+}
+function movePaletteActive(delta:number):void{
+  if(paletteState.ranked.length===0)return;
+  paletteState.active=Math.max(0,Math.min(paletteState.active+delta,paletteState.ranked.length-1));
+  renderPalette();
+}
+function runPaletteActive():void{
+  const entry=paletteState.ranked[paletteState.active];
+  if(!entry)return;
+  $<HTMLDialogElement>("#palette").close();
+  entry.item.run();
+}
 function clearSearch():void{
   definitionRequests.next();
   searchRequests.next();
@@ -876,6 +986,30 @@ window.addEventListener("pointerup",(event)=>finishDrag(event,true));
 window.addEventListener("pointercancel",(event)=>finishDrag(event,false));
 $("#svg-holder").addEventListener("click",activateDiagramLink);
 $("#svg-holder").addEventListener("keydown",activateDiagramLink);
+const paletteInput=$("#palette-input");
+paletteInput.oninput=()=>{paletteState.active=0;renderPalette();};
+paletteInput.onkeydown=(event)=>{
+  if(event.key==="ArrowDown"||event.key==="ArrowUp"){event.preventDefault();movePaletteActive(event.key==="ArrowDown"?1:-1);return;}
+  if(event.key==="Home"||event.key==="End"){event.preventDefault();movePaletteActive(event.key==="Home"?-paletteState.ranked.length:paletteState.ranked.length);return;}
+  if(event.key!=="Enter")return;
+  event.preventDefault();
+  runPaletteActive();
+};
+$("#palette-results").addEventListener("click",(event)=>{
+  const row=event.target instanceof Element?event.target.closest<HTMLButtonElement>(".palette-result"):null;
+  if(!row)return;
+  const index=[...$("#palette-results").querySelectorAll(".palette-result")].indexOf(row);
+  if(index<0)return;
+  paletteState.active=index;
+  runPaletteActive();
+});
+window.addEventListener("keydown",(event)=>{
+  if(!(event.metaKey||event.ctrlKey)||event.altKey)return;
+  const key=event.key.toLowerCase();
+  if(key!=="p"&&key!=="k")return;
+  event.preventDefault();
+  openPalette(key==="k"?"commands":"files");
+});
 await loadTree();
 connect();
 void loadDiagram().catch((error)=>{
