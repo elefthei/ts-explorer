@@ -148,6 +148,53 @@ test("discovers workspace packages and only workspace dependency edges", async (
   });
 });
 
+test("falls back to a packages/ directory when no workspaces field is present", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-packages-");
+  await fixtures.writeFixtureFile(root, "package.json", JSON.stringify({ name: "root" }));
+  await fixtures.writeFixtureFile(
+    root,
+    "packages/a/package.json",
+    JSON.stringify({ name: "a", dependencies: {} }),
+  );
+  // A non-directory entry under packages/ must be ignored, not crash discovery.
+  await fixtures.writeFixtureFile(root, "packages/stray-file", "not a package");
+
+  const packages = await discoverPackages(root);
+  expect(packages).toEqual([{ name: "a", path: "packages/a", dependencies: [] }]);
+});
+
+test("expands an object-form workspaces.packages field", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-packages-");
+  await fixtures.writeFixtureFile(
+    root,
+    "package.json",
+    JSON.stringify({ workspaces: { packages: ["packages/*"] } }),
+  );
+  await fixtures.writeFixtureFile(
+    root,
+    "packages/a/package.json",
+    JSON.stringify({ name: "a", dependencies: {} }),
+  );
+
+  const packages = await discoverPackages(root);
+  expect(packages).toEqual([{ name: "a", path: "packages/a", dependencies: [] }]);
+});
+
+test("treats the source root itself as the sole package when it has no sub-packages", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-packages-");
+  await fixtures.writeFixtureFile(root, "package.json", JSON.stringify({ name: "solo" }));
+
+  const packages = await discoverPackages(root);
+  expect(packages).toEqual([{ name: "solo", path: "", dependencies: [] }]);
+});
+
+test("rejects a malformed root package.json instead of silently discovering nothing", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-packages-");
+  await fixtures.writeFixtureFile(root, "package.json", "{ not json");
+
+  await expect(discoverPackages(root)).rejects.toThrow(/root package\.json is malformed/);
+});
+
 test("omits malformed child manifests without crashing", async () => {
   const root = await fixtures.temporaryRoot("ts-explorer-packages-");
   await fixtures.writeFixtureFile(
@@ -253,6 +300,26 @@ test("rejects malformed package graphs before rendering", () => {
         const [relation] = graph.relations;
         if (!relation) throw new Error("fixture package graph needs a relation");
         relation.targetNodeId = "p0";
+      },
+    },
+    {
+      name: "unsupported format version",
+      mutate: (graph) => {
+        (graph as { formatVersion: number }).formatVersion = -1;
+      },
+    },
+    {
+      name: "relation count mismatch",
+      mutate: (graph) => {
+        graph.relations.pop();
+      },
+    },
+    {
+      name: "package node missing its package path",
+      mutate: (graph) => {
+        const [row] = graph.packageNodes;
+        if (!row) throw new Error("fixture package graph needs a model row");
+        row.packagePath = null;
       },
     },
   ];
