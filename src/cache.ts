@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { dirname, posix } from "node:path";
 import { Database, type Statement } from "bun:sqlite";
 import {
@@ -2817,6 +2817,60 @@ private static recreateSchema(db: Database): void {
   db.run(`PRAGMA user_version=${CACHE_SCHEMA_VERSION}`);
 }
 
+// The cache database is fully regenerable, so a structurally corrupted or
+// unreadable file (e.g. left behind by a killed process, a full disk, or a
+// crashed filesystem) should never be a fatal error. `isCorruptionError`
+// recognizes the SQLite error signatures for this case, and the `dbPath`/
+// `-wal`/`-shm` sidecar files are deleted before a fresh `Database` is
+// opened at the same path.
+private static isCorruptionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /file is not a database/i.test(message)
+    || /database disk image is malformed/i.test(message)
+    || /SQLITE_CORRUPT/i.test(message)
+    || /SQLITE_NOTADB/i.test(message)
+  );
+}
+
+private static deleteDatabaseFiles(dbPath: string): void {
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    try {
+      rmSync(`${dbPath}${suffix}`, { force: true });
+    } catch {
+      // best-effort cleanup; if this fails the subsequent reopen will surface the real error
+    }
+  }
+}
+
+// Opens `dbPath`, applying the baseline PRAGMAs. If the file (or its WAL/
+// journal sidecars) is corrupted, the cache is safe to discard: this closes
+// the broken handle, deletes the database files, and reopens a fresh one.
+// Any other failure is rethrown unchanged.
+private static openHealthy(dbPath: string): Database {
+  const tryOpenAndPrime = (): Database => {
+    const db = new Database(dbPath, { create: true, strict: true });
+    const journalStatement = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=WAL");
+    try {
+      journalStatement.get();
+    } finally {
+      journalStatement.finalize();
+    }
+    db.run("PRAGMA synchronous=NORMAL");
+    db.run("PRAGMA foreign_keys=ON");
+    db.run("PRAGMA busy_timeout=5000");
+    return db;
+  };
+
+  try {
+    return tryOpenAndPrime();
+  } catch (error) {
+    if (!Cache.isCorruptionError(error)) throw error;
+    Cache.deleteDatabaseFiles(dbPath);
+    return tryOpenAndPrime();
+  }
+}
+
 
 private readonly db!: Database;
 private readonly graphStore!: PreparedGraphStore;
@@ -2869,20 +2923,10 @@ private closed = false;
 
 constructor(dbPath: string) {
   mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath, { create: true, strict: true });
+  const db = Cache.openHealthy(dbPath);
   this.db = db;
 
   try {
-    const journalStatement = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=WAL");
-    try {
-      journalStatement.get();
-    } finally {
-      journalStatement.finalize();
-    }
-    db.run("PRAGMA synchronous=NORMAL");
-    db.run("PRAGMA foreign_keys=ON");
-    db.run("PRAGMA busy_timeout=5000");
-
     const versionStatement = db.query<{ user_version: number }, []>("PRAGMA user_version");
     let version: number | undefined;
     try {
