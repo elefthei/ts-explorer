@@ -81,6 +81,27 @@ interface SubprocessSlot {
   retirement?: Promise<void>;
   recovery?: Promise<void>;
   expectedShutdown: boolean;
+  // Crash-loop protection: consecutive respawn failures without an intervening
+  // successful ("idle") spawn, and the delay applied before the next respawn attempt.
+  consecutiveCrashes: number;
+  disabled: boolean;
+}
+
+// Crash-loop protection tuning: once a slot crashes this many times in a row without
+// successfully reaching "idle", stop respawning it and surface a terminal error instead
+// of looping forever. The backoff schedule ramps up between attempts to avoid a tight
+// instant-respawn loop while still recovering quickly from a one-off transient crash.
+const SLOT_CRASH_THRESHOLD = 5;
+const SLOT_RESPAWN_BACKOFF_MS = [0, 100, 500, 2000, 5000];
+
+function delay(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function respawnBackoffFor(consecutiveCrashes: number): number {
+  const index = Math.min(consecutiveCrashes, SLOT_RESPAWN_BACKOFF_MS.length - 1);
+  return SLOT_RESPAWN_BACKOFF_MS[index] ?? SLOT_RESPAWN_BACKOFF_MS[SLOT_RESPAWN_BACKOFF_MS.length - 1];
 }
 
 interface ScopeRecord {
@@ -657,6 +678,7 @@ export class Preprocessor {
       if (this.closed) throw this.closedError();
       slot.state = "idle";
       slot.retirement = undefined;
+      slot.consecutiveCrashes = 0;
       return result.activeGenerationId;
     } catch (error) {
       slot.state = "dead";
@@ -690,9 +712,32 @@ export class Preprocessor {
   
   private ensureSlotRecovery(slot: SubprocessSlot): Promise<void> {
     if (slot.recovery) return slot.recovery;
+    if (slot.disabled) {
+      return Promise.reject(
+        new PreprocessorError(
+          "INTERNAL",
+          `preprocess worker ${slot.index} crashed ${slot.consecutiveCrashes} times in a row and has been disabled; see logs above for the underlying error`,
+        ),
+      );
+    }
     const recovery = (async () => {
       if (slot.retirement) await slot.retirement;
-      await this.initializeSlot(slot, false);
+      const backoff = respawnBackoffFor(slot.consecutiveCrashes);
+      if (backoff > 0) await delay(backoff);
+      try {
+        await this.initializeSlot(slot, false);
+      } catch (error) {
+        slot.consecutiveCrashes += 1;
+        if (slot.consecutiveCrashes >= SLOT_CRASH_THRESHOLD) {
+          slot.disabled = true;
+          slot.state = "dead";
+          throw new PreprocessorError(
+            "INTERNAL",
+            `preprocess worker ${slot.index} crashed ${slot.consecutiveCrashes} times in a row and has been disabled; see logs above for the underlying error`,
+          );
+        }
+        throw error;
+      }
     })();
     slot.recovery = recovery.finally(() => {
       slot.recovery = undefined;
@@ -712,6 +757,12 @@ export class Preprocessor {
         "INTERNAL",
         `preprocess child ${slot.index} failed to respawn: ${asError(error).message || failure.message}`,
       );
+      if (this.slots.some((candidate) => candidate.state === "idle" || candidate.state === "busy")) {
+        // At least one other slot is still healthy; surface the error without failing
+        // the whole generation so the pool can keep operating on remaining slots.
+        this.notifyError(terminal);
+        return;
+      }
       if (this.building) this.failGeneration(this.building, terminal, true);
       else this.notifyError(terminal);
     }
@@ -1207,6 +1258,8 @@ export class Preprocessor {
         token: 0,
         state: "new",
         expectedShutdown: false,
+        consecutiveCrashes: 0,
+        disabled: false,
       };
       this.slots.push(initializer);
       this.activeGenerationId = await this.initializeSlotWithRetry(initializer, true);
@@ -1218,6 +1271,8 @@ export class Preprocessor {
           token: 0,
           state: "new",
           expectedShutdown: false,
+          consecutiveCrashes: 0,
+          disabled: false,
         };
         this.slots.push(slot);
         additional.push(slot);
