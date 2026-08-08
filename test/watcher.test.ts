@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startSourceWatcher } from "../src/watcher.ts";
@@ -52,5 +52,25 @@ test("batches visible changes while suppressing cache changes under .explore", a
     });
   } finally {
     await watcher.close();
+  }
+}, 5_000);
+
+test("rejects when the watch root cannot be watched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-watch-"));
+  roots.push(root);
+  // Root user ignores permission bits, so this case cannot be exercised there.
+  if (process.getuid?.() === 0) return;
+  await chmod(root, 0o000);
+
+  try {
+    await expect(
+      startSourceWatcher(
+        root,
+        () => undefined,
+        () => undefined,
+      ),
+    ).rejects.toThrow(/EACCES|permission denied/i);
+  } finally {
+    await chmod(root, 0o700);
   }
 }, 5_000);
