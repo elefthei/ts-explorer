@@ -34,10 +34,17 @@ export class ExplorerServer {
       minify: false,
     });
     if (!bundle.success) {
-      throw new AggregateError(bundle.logs, "client bundle failed");
+      throw new AggregateError(
+        bundle.logs,
+        "client bundle failed — this likely indicates a corrupted install; try reinstalling with `bun install` or filing an issue with the log above",
+      );
     }
     const output = bundle.outputs[0];
-    if (!output) throw new Error("client bundle produced no output");
+    if (!output) {
+      throw new Error(
+        "client bundle produced no output — this likely indicates a corrupted install; try reinstalling with `bun install` or filing an issue with the log above",
+      );
+    }
     const explorerServer = new ExplorerServer(
       options,
       await output.arrayBuffer(),

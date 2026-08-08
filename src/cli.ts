@@ -27,12 +27,35 @@ function expandHome(value: string): string {
   return value;
 }
 
-function readPackageVersion(): string {
-  const manifest = JSON.parse(
-    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-  ) as { version?: unknown };
-  if (typeof manifest.version !== "string") throw new Error("package.json is missing a version");
+export function parsePackageVersion(manifestJson: string): string {
+  let manifest: { version?: unknown };
+  try {
+    manifest = JSON.parse(manifestJson) as { version?: unknown };
+  } catch (error) {
+    throw new Error(
+      "failed to parse package.json — this likely indicates a corrupted install; try reinstalling with `bun install` or filing an issue with the log above",
+      { cause: error },
+    );
+  }
+  if (typeof manifest.version !== "string") {
+    throw new Error(
+      "package.json is missing a version — this likely indicates a corrupted install; try reinstalling with `bun install` or filing an issue with the log above",
+    );
+  }
   return manifest.version;
+}
+
+function readPackageVersion(): string {
+  let manifestJson: string;
+  try {
+    manifestJson = readFileSync(new URL("../package.json", import.meta.url), "utf8");
+  } catch (error) {
+    throw new Error(
+      "failed to read package.json — this likely indicates a corrupted install; try reinstalling with `bun install` or filing an issue with the log above",
+      { cause: error },
+    );
+  }
+  return parsePackageVersion(manifestJson);
 }
 
 export const cliVersion = readPackageVersion();

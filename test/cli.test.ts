@@ -8,6 +8,7 @@ import {
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
+  parsePackageVersion,
 } from "../src/cli.ts";
 
 test("parses explicit directory, host, and port options", () => {
@@ -96,6 +97,22 @@ test("reports the version declared in package.json", () => {
 
   expect(cliVersion).toBe(manifest.version);
   expect(cliVersion).toMatch(/^\d+\.\d+\.\d+/);
+});
+
+test("parsePackageVersion returns the version from valid manifest JSON", () => {
+  expect(parsePackageVersion('{"version":"1.2.3"}')).toBe("1.2.3");
+});
+
+test("parsePackageVersion gives actionable guidance for invalid JSON", () => {
+  expect(() => parsePackageVersion("not json")).toThrow(
+    /failed to parse package\.json.*try reinstalling with `bun install`/,
+  );
+});
+
+test("parsePackageVersion gives actionable guidance for a missing version field", () => {
+  expect(() => parsePackageVersion("{}")).toThrow(
+    /package\.json is missing a version.*try reinstalling with `bun install`/,
+  );
 });
 
 test("formats generation-aware phase progress exactly", () => {
