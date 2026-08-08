@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ExplorerServer } from "../src/server.ts";
@@ -1593,3 +1593,45 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
     }
   }
 }, 60_000);
+
+test("getTree deduplicates concurrent calls and discards a failed tree so a retry can recover", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-tree-cache-"));
+  const flakyDir = join(root, "flaky");
+  await mkdir(flakyDir, { recursive: true });
+  await writeFile(join(flakyDir, "a.ts"), "export {};\n");
+
+  // Start the store (and its watcher) while the directory is still
+  // accessible, so only the *read* fails later rather than watch setup.
+  const store = new ExplorerStore(root);
+  try {
+    await store.ready();
+    await chmod(flakyDir, 0o000);
+
+    await expect(store.getTree()).rejects.toThrow();
+
+    // Concurrent calls while the tree is still broken share the same rejection
+    // rather than each triggering their own filesystem scan.
+    const [first, second] = await Promise.allSettled([store.getTree(), store.getTree()]);
+    expect(first.status).toBe("rejected");
+    expect(second.status).toBe("rejected");
+
+    // Once the underlying problem is fixed, getTree must not still be serving
+    // the previously cached rejection - it should retry and succeed.
+    await chmod(flakyDir, 0o755);
+    const tree = await store.getTree();
+    expect(tree.children?.some((child) => child.name === "flaky")).toBe(true);
+
+    // A successful tree is cached: concurrent calls resolve to the identical
+    // promise/result without re-reading the filesystem.
+    const [cachedA, cachedB] = await Promise.all([store.getTree(), store.getTree()]);
+    expect(cachedA).toBe(tree);
+    expect(cachedB).toBe(tree);
+  } finally {
+    try {
+      await chmod(flakyDir, 0o755).catch(() => undefined);
+      await store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
