@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   browserOpenCommand,
@@ -56,6 +57,20 @@ test("rejects a second positional argument", () => {
 
 test("disables the browser launch with --no-open", () => {
   expect(parseCliOptions([".", "--no-open"])?.open).toBe(false);
+});
+
+test("expands a bare ~ directory to the home directory", () => {
+  expect(parseCliOptions(["~"])?.sourceDir).toBe(resolve(homedir()));
+});
+
+test("expands a ~/ prefixed directory relative to the home directory", () => {
+  expect(parseCliOptions(["~/projects/demo"])?.sourceDir).toBe(
+    resolve(homedir(), "projects/demo"),
+  );
+});
+
+test("does not expand a directory that merely starts with ~ but has no separator", () => {
+  expect(parseCliOptions(["~project"])?.sourceDir).toBe(resolve("~project"));
 });
 
 test("browses the loopback address when bound to a wildcard host", () => {
