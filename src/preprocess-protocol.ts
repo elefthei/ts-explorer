@@ -102,7 +102,7 @@ export type PreprocessRequest =
   | { id: number; type: "shutdown" };
 
 export type PreprocessResultMap = {
-  init: { activeGenerationId: number | null };
+  init: { activeGenerationId: number | null; hasFailedDiagrams: boolean };
   "begin-generation": { generationId: number };
   "discover-packages": { packages: PackageInfo[] };
   "index-definitions": { definitionCount: number };

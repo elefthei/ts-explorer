@@ -203,6 +203,7 @@ type CacheStatements = {
   selectTreeEntries: Statement<TreeRow, [number]>;
   selectPackages: Statement<PackageRow, [number]>;
   selectDiagram: Statement<DiagramRow, [number, CacheDiagramResponse["kind"], string]>;
+  selectFailedDiagram: Statement<{ scope_path: string }, [number]>;
   selectFile: Statement<FileRow, [number, string]>;
   selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
   selectDefinitions: Statement<GotoDefinitionRow, [number, string]>;
@@ -2835,6 +2836,7 @@ private readonly insertGotoDefinition!: CacheStatements["insertGotoDefinition"];
 private readonly selectTreeEntries!: CacheStatements["selectTreeEntries"];
 private readonly selectPackages!: CacheStatements["selectPackages"];
 private readonly selectDiagram!: CacheStatements["selectDiagram"];
+private readonly selectFailedDiagram!: CacheStatements["selectFailedDiagram"];
 private readonly selectFile!: CacheStatements["selectFile"];
 private readonly selectDefinition!: CacheStatements["selectDefinition"];
 private readonly selectDefinitions!: CacheStatements["selectDefinitions"];
@@ -3053,6 +3055,13 @@ constructor(dbPath: string) {
     FROM diagrams
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
   `);
+  const selectFailedDiagram = db.query<{ scope_path: string }, [number]>(`
+    SELECT scope_path
+    FROM diagrams
+    WHERE generation_id = ?
+      AND json_extract(response_json, '$.status') = 'error'
+    LIMIT 1
+  `);
   const selectFile = db.query<FileRow, [number, string]>(`
     SELECT path, raw_content, display_content, source_error, format_error
     FROM files
@@ -3194,6 +3203,7 @@ constructor(dbPath: string) {
     selectTreeEntries,
     selectPackages,
     selectDiagram,
+    selectFailedDiagram,
     selectFile,
     selectDefinition,
     selectDefinitions,
@@ -3227,6 +3237,7 @@ constructor(dbPath: string) {
   this.selectTreeEntries = selectTreeEntries;
   this.selectPackages = selectPackages;
   this.selectDiagram = selectDiagram;
+  this.selectFailedDiagram = selectFailedDiagram;
   this.selectFile = selectFile;
   this.selectDefinition = selectDefinition;
   this.selectDefinitions = selectDefinitions;
@@ -3526,6 +3537,10 @@ recover(): number | null {
 
 getActiveGenerationId(): number | null {
   return this.selectActiveGeneration.get()?.id ?? null;
+}
+
+hasFailedDiagrams(generationId: number): boolean {
+  return this.selectFailedDiagram.get(generationId) !== null;
 }
 
 repairTableForSchemaError(error: unknown): CacheTableName | null {

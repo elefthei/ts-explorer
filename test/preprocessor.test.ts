@@ -507,7 +507,7 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
   expect(await initResponse).toEqual({
     id: 1,
     ok: true,
-    value: { activeGenerationId: null },
+    value: { activeGenerationId: null, hasFailedDiagrams: false },
   });
 
   const beginResponse = waitForResponse(2);
@@ -587,7 +587,7 @@ test("exits when the parent IPC channel disconnects", async () => {
   expect(await initResponse).toEqual({
     id: 1,
     ok: true,
-    value: { activeGenerationId: null },
+    value: { activeGenerationId: null, hasFailedDiagrams: false },
   });
 
   subprocess.disconnect();
@@ -2194,6 +2194,182 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     }
   });
 }, 30_000);
+
+test("startup retries diagram scopes whose cached outcome is an error", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-failure-retry-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "retry-workspace" }));
+  await writeFixtureFile(root, "app.ts", "export class RetryTarget {}\n");
+
+  const first = trackedPreprocessor(root, () => undefined, () => undefined);
+  await first.ready();
+  await first.whenIdle();
+  await closePreprocessor(first);
+  const readActiveId = () =>
+    openDatabase(dbPath, (db) =>
+      db.query<{ id: number }, []>(
+        `SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'`,
+      ).get()?.id);
+  const seededId = readActiveId();
+  if (seededId === undefined) throw new Error("active generation was not persisted");
+
+  // A healthy warm cache is reused: no new generation.
+  const second = trackedPreprocessor(root, () => undefined, () => undefined);
+  await second.ready();
+  await second.whenIdle();
+  await closePreprocessor(second);
+  expect(readActiveId()).toBe(seededId);
+
+  // Poison the cached outcome for the root UML scope.
+  const changes = openDatabase(dbPath, (db) =>
+    db.query<never, [number]>(`
+      UPDATE diagrams
+      SET response_json = json_set(
+        response_json, '$.status', 'error', '$.error', 'seeded stale failure'
+      )
+      WHERE generation_id = ? AND kind = 'uml' AND scope_path = ''
+    `).run(seededId).changes);
+  expect(changes).toBe(1);
+
+  const thirdErrors: Error[] = [];
+  const third = trackedPreprocessor(root, () => undefined, (error) => thirdErrors.push(error));
+  await third.ready();
+  await third.whenIdle();
+  const repaired = await third.getDiagram("uml", "");
+  await closePreprocessor(third);
+  expect(thirdErrors).toEqual([]);
+  expect(repaired.status).toBe("ready");
+  expect(repaired.error).toBeUndefined();
+  expect(readActiveId()).not.toBe(seededId);
+}, 60_000);
+
+test("serves packages from a building generation before the watch rebuild promotes", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-packages-rebuild-");
+  const dbPath = join(root, ".explore", "explore.db");
+  const blockerSource = Array.from(
+    { length: 1_000 },
+    (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  await writeFixtureFile(
+    root,
+    "package.json",
+    JSON.stringify({ name: "packages-root", workspaces: ["packages/*"] }),
+  );
+  await writeFixtureFile(root, "packages/a/package.json", JSON.stringify({ name: "a" }));
+  await writeFixtureFile(root, "packages/a/a-blocker.ts", `${blockerSource}\n`);
+
+  const readActiveId = () =>
+    openDatabase(dbPath, (db) =>
+      db.query<{ id: number }, []>(
+        `SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'`,
+      ).get()?.id);
+
+  const promotions: string[] = [];
+  const errors: Error[] = [];
+  const rebuildScopeStarted = Promise.withResolvers<void>();
+  let watchingRebuild = false;
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => promotions.push("promoted"),
+    (error) => errors.push(error),
+    1,
+    (event) => {
+      if (
+        watchingRebuild && event.cause === "watch" && event.event === "start" &&
+        event.component === "code"
+      ) {
+        rebuildScopeStarted.resolve();
+      }
+    },
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  expect((await preprocessor.getPackages()).map((pkg) => pkg.name)).toEqual(["a"]);
+  const seededId = readActiveId();
+  if (seededId === undefined) throw new Error("active generation was not persisted");
+  const promotionsBeforeRebuild = promotions.length;
+
+  // A live change adds a second workspace package, then a rebuild starts.
+  await writeFixtureFile(root, "packages/b/package.json", JSON.stringify({ name: "b" }));
+  await writeFixtureFile(root, "packages/b/b-blocker.ts", `${blockerSource}\n`);
+  watchingRebuild = true;
+  preprocessor.rebuild("watch");
+  let idleResolved = false;
+  const idle = preprocessor.whenIdle().then(() => {
+    idleResolved = true;
+  });
+
+  // A scope job for the rebuild means discovery already finished and the remaining scope work is
+  // still queued: exactly the window in which /api/packages used to block until promotion.
+  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+  const rebuilding = await preprocessor.getPackages();
+  expect(rebuilding.map((pkg) => pkg.name).sort()).toEqual(["a", "b"]);
+  expect(readActiveId()).toBe(seededId);
+  expect(promotions.length).toBe(promotionsBeforeRebuild);
+  expect(idleResolved).toBe(false);
+
+  await idle;
+  expect(readActiveId()).not.toBe(seededId);
+  expect((await preprocessor.getPackages()).map((pkg) => pkg.name).sort()).toEqual(["a", "b"]);
+  await closePreprocessor(preprocessor);
+  expect(errors).toEqual([]);
+}, 60_000);
+
+test("reserves a subprocess slot so background scope work never saturates the pool", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-interactive-slot-");
+  const blockerSource = Array.from(
+    { length: 400 },
+    (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  const targetPath = "z-slot-target.ts";
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "interactive-slot" }));
+  for (const name of ["a", "b", "c"]) {
+    await writeFixtureFile(root, `${name}-blocker.ts`, `${blockerSource}\n`);
+  }
+  await writeFixtureFile(root, targetPath, "export class SlotTarget { locate() { return 1; } }\n");
+
+  const poolSize = 2;
+  const errors: Error[] = [];
+  let activeScopes = 0;
+  let peakScopes = 0;
+  const rebuildScopeStarted = Promise.withResolvers<void>();
+  let watchingRebuild = false;
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+    poolSize,
+    (event) => {
+      if (event.component !== "code") return;
+      if (event.event === "start") {
+        activeScopes += 1;
+        peakScopes = Math.max(peakScopes, activeScopes);
+        if (watchingRebuild && event.cause === "watch") rebuildScopeStarted.resolve();
+      } else {
+        activeScopes -= 1;
+      }
+    },
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+
+  watchingRebuild = true;
+  preprocessor.rebuild("watch");
+  let idleResolved = false;
+  const idle = preprocessor.whenIdle().then(() => {
+    idleResolved = true;
+  });
+  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+
+  // Issued while the rebuild owns the pool: the reserved slot has to serve it anyway.
+  await preprocessor.getDefinition(targetPath, { line: 1, column: 14 });
+  expect(idleResolved).toBe(false);
+
+  await idle;
+  expect(peakScopes).toBe(poolSize - 1);
+  await closePreprocessor(preprocessor);
+  expect(errors).toEqual([]);
+}, 60_000);
 
 test("defers recovered readiness when a watch rebuild is requested before bootstrap completes", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-recovery-race-");

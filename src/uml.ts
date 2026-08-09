@@ -438,7 +438,10 @@ export async function extractUmlDiagramGraph(
   settings.typeLinks = true;
   settings.memberAssociations = true;
   settings.exportedTypesOnly = false;
-  const declarations = files.length && settings.glob ? parseProject(settings) : [];
+  // ts-morph accepts an array of paths; a single `{a,b,c}` brace glob trips the 10 000-character
+  // limit in `braces` once a scope holds ~130 files.
+  const parseSettings = { ...settings, glob: normalizedFiles } as unknown as TsUML2Settings;
+  const declarations = normalizedFiles.length ? parseProject(parseSettings) : [];
   await addMissingTypeAliases(files, declarations);
   removeSelfMemberAssociations(declarations);
   escapeStructuredMemberTypes(declarations);

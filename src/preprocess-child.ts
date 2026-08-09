@@ -689,7 +689,10 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
         ? cache.recover()
         : cache.getActiveGenerationId();
       state = { sourceDir, cache };
-      return success(request, { activeGenerationId });
+      return success(request, {
+        activeGenerationId,
+        hasFailedDiagrams: activeGenerationId !== null && cache.hasFailedDiagrams(activeGenerationId),
+      });
     } catch (error) {
       cache.close();
       throw error;

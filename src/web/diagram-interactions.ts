@@ -11,6 +11,24 @@ export function shouldStackDiagram(kind: DiagramKind): boolean {
   return kind === "uml";
 }
 
+const DIAGRAM_STYLING_PREFIXES = [
+  "classDef ",
+  "cssClass ",
+  "style ",
+  "linkStyle ",
+  "direction ",
+] as const;
+
+export function hasDiagramBody(dsl: string): boolean {
+  const lines = dsl
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("%%"));
+  return lines
+    .slice(1)
+    .some((line) => !DIAGRAM_STYLING_PREFIXES.some((prefix) => line.startsWith(prefix)));
+}
+
 export class RequestSequence {
   #latest = 0;
 

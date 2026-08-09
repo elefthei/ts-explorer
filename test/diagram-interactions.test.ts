@@ -6,6 +6,7 @@ import {
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
   packageNodeIdFromNodeId,
+  hasDiagramBody,
   hasPassedDragThreshold,
   matchesSearchQuery,
   panViewport,
@@ -13,6 +14,7 @@ import {
   treeScrollTopForRow,
   zoomViewportAt,
 } from "../src/web/diagram-interactions.ts";
+import { STYLE_DEFS } from "../src/uml/mermaid.ts";
 
 test("shouldStackDiagram stacks UML diagrams but not package diagrams", () => {
   expect(shouldStackDiagram("uml")).toBe(true);
@@ -402,3 +404,24 @@ test("zoomViewportAt preserves the world point under a nonzero pointer origin", 
   expect((origin.y - viewport.y) / viewport.scale).toBe(worldBefore.y);
 });
 
+test("hasDiagramBody rejects DSLs that carry no renderable statements", () => {
+  const emptyUml = `classDiagram\n${STYLE_DEFS.map(([name, style]) => `classDef ${name} ${style}`).join("\n")}\n`;
+  const cases = [
+    { name: "bare UML render mode", dsl: "classDiagram\n  direction LR", expected: false },
+    { name: "UML scope with no entities", dsl: emptyUml, expected: false },
+    { name: "header with nothing after it", dsl: "classDiagram", expected: false },
+    { name: "bare package render mode", dsl: "flowchart LR", expected: false },
+    {
+      name: "package diagram with no packages",
+      dsl: "flowchart LR\n  classDef package fill:#17324d,stroke:#69d2ff,color:#f4f7fb",
+      expected: false,
+    },
+    { name: "empty string", dsl: "", expected: false },
+    { name: "leading blank line before the header", dsl: "\nclassDiagram\n\nclass Foo", expected: true },
+    { name: "class diagram with one labeled entity", dsl: 'classDiagram\nclass Foo["Foo"]\nclassDef local fill:#000', expected: true },
+    { name: "flowchart with one node", dsl: 'flowchart LR\n  p0["share"]\n  classDef package fill:#000\n  class p0 package', expected: true },
+  ] as const;
+  for (const { name, dsl, expected } of cases) {
+    expect(hasDiagramBody(dsl), name).toBe(expected);
+  }
+});

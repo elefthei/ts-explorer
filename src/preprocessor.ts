@@ -629,7 +629,7 @@ export class Preprocessor {
   private async initializeSlot(
     slot: SubprocessSlot,
     recover: boolean,
-  ): Promise<number | null> {
+  ): Promise<PreprocessResultMap["init"]> {
     if (slot.retirement) await slot.retirement;
     if (this.closed) throw this.closedError();
     slot.state = "initializing";
@@ -657,7 +657,7 @@ export class Preprocessor {
       if (this.closed) throw this.closedError();
       slot.state = "idle";
       slot.retirement = undefined;
-      return result.activeGenerationId;
+      return result;
     } catch (error) {
       slot.state = "dead";
       if (slot.subprocess === subprocess) {
@@ -679,7 +679,7 @@ export class Preprocessor {
   private async initializeSlotWithRetry(
     slot: SubprocessSlot,
     recover: boolean,
-  ): Promise<number | null> {
+  ): Promise<PreprocessResultMap["init"]> {
     try {
       return await this.initializeSlot(slot, recover);
     } catch (firstError) {
@@ -784,12 +784,21 @@ export class Preprocessor {
     this.dispatch();
   }
   
-  private nextJob(): QueueJob | undefined {
+  private backgroundSlotsInUse(): number {
+    let count = 0;
+    for (const slot of this.slots) {
+      if (slot.state === "busy" && slot.current?.priority === "background") count += 1;
+    }
+    return count;
+  }
+
+  private nextJob(allowBackground: boolean): QueueJob | undefined {
     let job = this.interactiveQueue.shift();
     while (job) {
       if (!job.cancelled) return job;
       job = this.interactiveQueue.shift();
     }
+    if (!allowBackground) return undefined;
     job = this.backgroundQueue.shift();
     while (job) {
       if (!job.cancelled) return job;
@@ -797,12 +806,17 @@ export class Preprocessor {
     }
     return undefined;
   }
-  
+
   private dispatch(): void {
     if (!this.poolReady || this.closed) return;
+    // Keep one slot free for interactive work. A `preprocess-scope` job can hold a subprocess for
+    // seconds and a running job cannot be preempted, so without a reservation a user-initiated
+    // read waits behind the entire pool. The cost is one slot of background throughput while the
+    // pool is saturated; a single-slot pool has nothing to reserve and keeps its old behaviour.
+    const backgroundLimit = Math.max(1, this.poolSize - 1);
     for (const slot of this.slots) {
       if (slot.state !== "idle") continue;
-      const job = this.nextJob();
+      const job = this.nextJob(this.backgroundSlotsInUse() < backgroundLimit);
       if (!job) return;
       this.runJob(slot, job);
     }
@@ -1209,7 +1223,8 @@ export class Preprocessor {
         expectedShutdown: false,
       };
       this.slots.push(initializer);
-      this.activeGenerationId = await this.initializeSlotWithRetry(initializer, true);
+      const init = await this.initializeSlotWithRetry(initializer, true);
+      this.activeGenerationId = init.activeGenerationId;
   
       const additional: SubprocessSlot[] = [];
       for (let index = 1; index < this.poolSize; index += 1) {
@@ -1226,12 +1241,13 @@ export class Preprocessor {
       if (this.closed) throw this.closedError();
       this.poolReady = true;
       this.dispatch();
-      if (this.activeGenerationId === null) {
+      if (this.activeGenerationId === null || init.hasFailedDiagrams) {
         await this.beginGeneration("startup");
       }
       this.readyDeferred.resolve(undefined);
       if (
         this.activeGenerationId !== null
+        && this.building === undefined
         && !this.watchRebuilding
         && !this.watchRequested
       ) {
@@ -1294,33 +1310,35 @@ export class Preprocessor {
     throw this.closedError();
   }
   
+  private async readBuildingPackages(): Promise<readonly PackageInfo[]> {
+    const generation = await this.awaitBuildingGeneration();
+    await generation.discovered.promise;
+    return await this.enqueueCachedRequest<"read-packages">(
+      { type: "read-packages", generationId: generation.id },
+      "interactive",
+      generation.id,
+    );
+  }
+
   private async readPackagesAcrossGenerations(): Promise<readonly PackageInfo[]> {
     await this.readyDeferred.promise;
     while (!this.closed) {
       if (this.watchRebuilding) {
-        const generation = await this.awaitBuildingGeneration();
         try {
-          await generation.promoted.promise;
+          return await this.readBuildingPackages();
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
         }
-        continue;
       }
       if (this.activeGenerationId !== null) {
-        return this.enqueueCachedRequest<"read-packages">(
+        return await this.enqueueCachedRequest<"read-packages">(
           { type: "read-packages", generationId: this.activeGenerationId },
           "interactive",
         );
       }
-      const generation = await this.awaitBuildingGeneration();
       try {
-        await generation.discovered.promise;
-        return await this.enqueueCachedRequest<"read-packages">(
-          { type: "read-packages", generationId: generation.id },
-          "interactive",
-          generation.id,
-        );
+        return await this.readBuildingPackages();
       } catch (error) {
         if (error instanceof SupersededGenerationError) continue;
         throw error;
