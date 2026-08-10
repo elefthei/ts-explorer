@@ -1593,3 +1593,84 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
     }
   }
 }, 60_000);
+
+test("api/preprocess rejects malformed request bodies with 422 and a descriptive error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-preprocess-validation-"));
+  await writeFixtureFile(root, "index.ts", "export const value = 1;\n");
+  const server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const post = (body: string) =>
+      fetch(`${base}/api/preprocess`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+
+    const cases: Array<{ name: string; body: string; error: string }> = [
+      { name: "invalid JSON", body: "not json", error: "request body must be valid JSON" },
+      {
+        name: "missing action",
+        body: JSON.stringify({ resource: "./index.ts" }),
+        error: "preprocess request must be an object with an action",
+      },
+      {
+        name: "non-string action",
+        body: JSON.stringify({ action: 1 }),
+        error: "preprocess request must be an object with an action",
+      },
+      {
+        name: "unknown action",
+        body: JSON.stringify({ action: "cancel" }),
+        error: "preprocess action must be prioritize or poll",
+      },
+      {
+        name: "prioritize missing resource",
+        body: JSON.stringify({ action: "prioritize" }),
+        error: "prioritize request must contain only action and resource",
+      },
+      {
+        name: "prioritize with extra field",
+        body: JSON.stringify({ action: "prioritize", resource: "./index.ts", extra: 1 }),
+        error: "prioritize request must contain only action and resource",
+      },
+      {
+        name: "prioritize with non-string resource",
+        body: JSON.stringify({ action: "prioritize", resource: 1 }),
+        error: "prioritize request must contain only action and resource",
+      },
+      {
+        name: "poll missing requestId",
+        body: JSON.stringify({ action: "poll" }),
+        error: "poll request must contain a positive safe requestId",
+      },
+      {
+        name: "poll with non-number requestId",
+        body: JSON.stringify({ action: "poll", requestId: "1" }),
+        error: "poll request must contain a positive safe requestId",
+      },
+      {
+        name: "poll with non-positive requestId",
+        body: JSON.stringify({ action: "poll", requestId: 0 }),
+        error: "poll request must contain a positive safe requestId",
+      },
+      {
+        name: "poll with non-safe-integer requestId",
+        body: JSON.stringify({ action: "poll", requestId: 1.5 }),
+        error: "poll request must contain a positive safe requestId",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const response = await post(testCase.body);
+      expect(response.status, testCase.name).toBe(422);
+      expect(await response.json(), testCase.name).toEqual({ error: testCase.error });
+    }
+  } finally {
+    try {
+      await server.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
