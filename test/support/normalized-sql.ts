@@ -33,8 +33,6 @@ type NormalizedRowByTable = {
   diagram_edges: GraphRow<DiagramGraph["edges"][number]>;
   diagram_edge_relations: GraphRow<DiagramGraph["relations"][number]>;
   package_graph_nodes: PackageRow<PackageDiagramGraph["packageNodes"][number]>;
-  uml_settings: UmlRow<NonNullable<UmlDiagramGraph["settings"]>>;
-  uml_setting_lines: UmlRow<UmlDiagramGraph["settingLines"][number]>;
   uml_declarations: UmlRow<UmlDiagramGraph["declarations"][number]>;
   uml_entities: UmlRow<UmlDiagramGraph["entities"][number]>;
   uml_properties: UmlRow<UmlDiagramGraph["properties"][number]>;
@@ -188,42 +186,6 @@ export const NORMALIZED_TABLE_SPECS = {
           ...packageIdentity(),
           node_id: row.nodeId,
           package_path: row.packagePath,
-        }))
-      : [],
-  ),
-  uml_settings: tableSpec(
-    "uml_settings",
-    [
-      "glob", "tsconfig", "out_file", "property_types", "modifiers", "type_links", "out_dsl",
-      "out_mermaid_dsl", "member_associations", "exported_types_only",
-    ],
-    [],
-    (graph) => graph.kind === "uml" && graph.settings !== null
-      ? [{
-          ...umlIdentity(graph),
-          glob: graph.settings.glob,
-          tsconfig: graph.settings.tsconfig,
-          out_file: graph.settings.outFile,
-          property_types: sqlBoolean(graph.settings.propertyTypes),
-          modifiers: sqlBoolean(graph.settings.modifiers),
-          type_links: sqlBoolean(graph.settings.typeLinks),
-          out_dsl: graph.settings.outDsl,
-          out_mermaid_dsl: graph.settings.outMermaidDsl,
-          member_associations: sqlBoolean(graph.settings.memberAssociations),
-          exported_types_only: sqlBoolean(graph.settings.exportedTypesOnly),
-        }]
-      : [],
-  ),
-  uml_setting_lines: tableSpec(
-    "uml_setting_lines",
-    ["setting_kind", "line_ordinal", "value"],
-    ["setting_kind", "line_ordinal"],
-    (graph) => graph.kind === "uml"
-      ? graph.settingLines.map((row) => ({
-          ...umlIdentity(graph),
-          setting_kind: row.settingKind,
-          line_ordinal: row.lineOrdinal,
-          value: row.value,
         }))
       : [],
   ),

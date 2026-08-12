@@ -1,4 +1,13 @@
-import ts from "typescript";
+import type { Node } from "@vscode/tree-sitter-wasm";
+import {
+  ENTITY_KIND_BY_NODE,
+  isAccessor,
+  METHOD_NODE_TYPES,
+  memberName,
+  parseTypeScriptSource,
+  renderedTypeName,
+  topLevelDeclarations,
+} from "./lang/typescript.ts";
 import { isDeclarationPath, isTypeScriptPath } from "./source.ts";
 import type { GotoDefinitionKind } from "./types.ts";
 
@@ -21,124 +30,96 @@ export type ParsedDefinitionSpan = {
   to: number;
 };
 
-
-function entityKind(node: ts.Statement): ParsedEntityKind | undefined {
-  if (ts.isClassDeclaration(node)) return "class";
-  if (ts.isInterfaceDeclaration(node)) return "interface";
-  if (ts.isEnumDeclaration(node)) return "enum";
-  if (ts.isTypeAliasDeclaration(node)) return "type";
-  return undefined;
-}
-
-function methodName(node: ts.PropertyName): string | undefined {
-  if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) {
-    return node.text;
+function entityMethodNodes(declaration: Node, kind: ParsedEntityKind): Node[] {
+  const body = declaration.childForFieldName("body");
+  const methods: Node[] = [];
+  if (kind === "class") {
+    if (body?.type !== "class_body") return methods;
+    for (const member of body.namedChildren) {
+      if (!member || !METHOD_NODE_TYPES.has(member.type) || isAccessor(member)) continue;
+      methods.push(member);
+    }
+    return methods;
   }
-  return undefined;
-}
-
-function renderedEntityName(
-  name: string,
-  typeParameters: ts.NodeArray<ts.TypeParameterDeclaration> | undefined,
-): string {
-  if (!typeParameters?.length) return name;
-  return `${name}<${typeParameters.map((parameter) => parameter.name.text).join(",")}>`;
-}
-
-function entityMethods(
-  node: ts.ClassDeclaration | ts.InterfaceDeclaration | ts.TypeAliasDeclaration | ts.EnumDeclaration,
-): readonly (ts.MethodDeclaration | ts.MethodSignature)[] {
-  if (ts.isClassDeclaration(node)) return node.members.filter(ts.isMethodDeclaration);
-  if (ts.isInterfaceDeclaration(node)) return node.members.filter(ts.isMethodSignature);
-  if (ts.isTypeAliasDeclaration(node) && ts.isTypeLiteralNode(node.type)) {
-    return node.type.members.filter(ts.isMethodSignature);
+  if (kind === "interface") {
+    if (body?.type !== "interface_body") return methods;
+    for (const member of body.namedChildren) {
+      if (member?.type === "method_signature") methods.push(member);
+    }
+    return methods;
   }
-  return [];
-}
-
-function location(
-  sourceFile: ts.SourceFile,
-  node: ts.Node,
-): Pick<ParsedDefinitionSpan, "line" | "column" | "from" | "to"> {
-  const from = node.getStart(sourceFile);
-  const { line, character } = sourceFile.getLineAndCharacterOfPosition(from);
-  return {
-    line: line + 1,
-    column: character + 1,
-    from,
-    to: node.getEnd(),
-  };
+  if (kind === "type") {
+    const value = declaration.childForFieldName("value");
+    if (value?.type !== "object_type") return methods;
+    for (const member of value.namedChildren) {
+      if (member?.type === "method_signature") methods.push(member);
+    }
+  }
+  return methods;
 }
 
 export function parseDefinitionSpans(path: string, content: string): ParsedDefinitionSpan[] {
   if (!isTypeScriptPath(path) || isDeclarationPath(path)) return [];
-  const sourceFile = ts.createSourceFile(
-    path,
-    content,
-    ts.ScriptTarget.Latest,
-    true,
-    path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-  );
+  const parsed = parseTypeScriptSource(path, content);
+  if (!parsed) return [];
   const entityOccurrences = new Map<string, number>();
   const memberOccurrences = new Map<string, number>();
   const definitions: ParsedDefinitionSpan[] = [];
 
-  for (const statement of sourceFile.statements) {
-    const kind = entityKind(statement);
-    if (!kind || !(
-      ts.isClassDeclaration(statement)
-      || ts.isInterfaceDeclaration(statement)
-      || ts.isEnumDeclaration(statement)
-      || ts.isTypeAliasDeclaration(statement)
-    )) continue;
-    const nameNode = statement.name;
-    if (!nameNode) continue;
-    const name = nameNode.text;
-    const entityCounterKey = `${kind}\0${name}`;
-    const entityOccurrence = entityOccurrences.get(entityCounterKey) ?? 0;
-    entityOccurrences.set(entityCounterKey, entityOccurrence + 1);
-    const renderedName = renderedEntityName(
-      name,
-      "typeParameters" in statement ? statement.typeParameters : undefined,
-    );
-    definitions.push({
-      key: JSON.stringify([kind, name, entityOccurrence, null, null]),
-      kind,
-      name,
-      qualifiedName: name,
-      entityKind: kind,
-      entityName: name,
-      renderedEntityName: renderedName,
-      entityOccurrence,
-      ...location(sourceFile, nameNode),
-    });
-
-    for (const method of entityMethods(statement)) {
-      const name = methodName(method.name);
-      if (name === undefined) continue;
-      const memberCounterKey = `${kind}\0${statement.name.text}\0${name}`;
-      const sourceMemberOccurrence = memberOccurrences.get(memberCounterKey) ?? 0;
-      memberOccurrences.set(memberCounterKey, sourceMemberOccurrence + 1);
+  try {
+    for (const declaration of topLevelDeclarations(parsed.root)) {
+      const kind = ENTITY_KIND_BY_NODE[declaration.type];
+      if (!kind) continue;
+      const nameNode = declaration.childForFieldName("name");
+      if (!nameNode) continue;
+      const name = nameNode.text;
+      const entityCounterKey = `${kind}\0${name}`;
+      const entityOccurrence = entityOccurrences.get(entityCounterKey) ?? 0;
+      entityOccurrences.set(entityCounterKey, entityOccurrence + 1);
+      const renderedName = renderedTypeName(name, declaration);
       definitions.push({
-        key: JSON.stringify([
-          kind,
-          statement.name.text,
-          entityOccurrence,
-          name,
-          sourceMemberOccurrence,
-        ]),
-        kind: "method",
+        key: JSON.stringify([kind, name, entityOccurrence, null, null]),
+        kind,
         name,
-        qualifiedName: `${statement.name.text}.${name}`,
+        qualifiedName: name,
         entityKind: kind,
-        entityName: statement.name.text,
+        entityName: name,
         renderedEntityName: renderedName,
         entityOccurrence,
-        memberName: name,
-        sourceMemberOccurrence,
-        ...location(sourceFile, method.name),
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column + 1,
+        from: nameNode.startIndex,
+        to: nameNode.endIndex,
       });
+
+      for (const method of entityMethodNodes(declaration, kind)) {
+        const member = memberName(method);
+        // The definition index addresses members by source name; `#private` members are unaddressable.
+        if (!member || member.node.type === "private_property_identifier") continue;
+        if (member.name === "constructor") continue;
+        const memberCounterKey = `${kind}\0${name}\0${member.name}`;
+        const sourceMemberOccurrence = memberOccurrences.get(memberCounterKey) ?? 0;
+        memberOccurrences.set(memberCounterKey, sourceMemberOccurrence + 1);
+        definitions.push({
+          key: JSON.stringify([kind, name, entityOccurrence, member.name, sourceMemberOccurrence]),
+          kind: "method",
+          name: member.name,
+          qualifiedName: `${name}.${member.name}`,
+          entityKind: kind,
+          entityName: name,
+          renderedEntityName: renderedName,
+          entityOccurrence,
+          memberName: member.name,
+          sourceMemberOccurrence,
+          line: member.node.startPosition.row + 1,
+          column: member.node.startPosition.column + 1,
+          from: member.node.startIndex,
+          to: member.node.endIndex,
+        });
+      }
     }
+  } finally {
+    parsed.dispose();
   }
   return definitions;
 }

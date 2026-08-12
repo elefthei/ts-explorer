@@ -26,3 +26,10 @@ export function umlFileKey(fileName: string): string {
 export function scopeRelativePath(sourceDir: string, path: string): string {
   return posix(relative(sourceDir, path));
 }
+
+export function syntheticTypeId(filePath: string, renderedName: string): string {
+  const normalized = posix(filePath);
+  const extension = normalized.lastIndexOf(".");
+  const withoutExtension = extension < 0 ? normalized : normalized.slice(0, extension);
+  return `"${withoutExtension}".${renderedName}`;
+}

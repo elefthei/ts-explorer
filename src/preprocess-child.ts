@@ -10,6 +10,7 @@ import {
 } from "./cache.ts";
 import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
+import { computeHighlightSpans } from "./highlight.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
@@ -29,7 +30,12 @@ import type {
   PreprocessErrorCode,
 } from "./preprocess-protocol.ts";
 import { isRecord } from "./preprocess-protocol.ts";
-import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
+import {
+  decodeSourceBytes,
+  isDeclarationPath,
+  isSourcePath,
+  isTypeScriptPath,
+} from "./source.ts";
 import { buildTree, collectTreeEntries, computeSourceFingerprint, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
 import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
@@ -325,9 +331,10 @@ async function indexDefinitions(
     const batch = files.slice(start, start + DEFINITION_INDEX_READ_BATCH);
     const contents = await Promise.all(batch.map(async (entry) => {
       try {
-        const text = new TextDecoder("utf-8", { fatal: true })
-          .decode(await readFileBytes(join(preprocessState.sourceDir, entry.path)));
-        return text.includes("\0") ? null : text;
+        const decoded = decodeSourceBytes(
+          await readFileBytes(join(preprocessState.sourceDir, entry.path)),
+        );
+        return "failure" in decoded ? null : decoded.text;
       } catch {
         return null;
       }
@@ -411,33 +418,22 @@ async function preprocessFile(
   path: string,
   rawDefinitions: readonly GotoDefinition[],
 ): Promise<PreprocessedFile> {
-  let rawContent: string;
-  try {
-    rawContent = new TextDecoder("utf-8", { fatal: true }).decode(await readFileBytes(absolutePath));
-  } catch {
+  const decoded = await readFileBytes(absolutePath).then(decodeSourceBytes, () => ({
+    failure: "file is not valid UTF-8 text" as const,
+  }));
+  if ("failure" in decoded) {
     return {
       file: {
         path,
         rawContent: null,
         displayContent: null,
-        sourceError: "file is not valid UTF-8 text",
+        sourceError: decoded.failure,
         formatError: null,
       },
       definitions: [],
     };
   }
-  if (rawContent.includes("\0")) {
-    return {
-      file: {
-        path,
-        rawContent: null,
-        displayContent: null,
-        sourceError: "file contains NUL bytes",
-        formatError: null,
-      },
-      definitions: [],
-    };
-  }
+  const rawContent = decoded.text;
   let file: CacheFileWrite;
   if (!isSourcePath(path)) {
     file = {
@@ -659,17 +655,36 @@ async function readCachedFile(
     throw new PreprocessRequestError("INVALID_INPUT", "source file has no display content");
   }
   const definitions = preprocessState.cache.readDefinitions(generationId, path);
-  if (!location) return { path, content: record.displayContent, definitions };
+  if (!location) {
+    return {
+      path,
+      content: record.displayContent,
+      definitions,
+      highlights: computeHighlightSpans(path, record.displayContent),
+    };
+  }
 
   const rawOffset = rawOffsetForLocation(record.rawContent, location);
   if (record.formatError) {
-    return { path, content: record.rawContent, definitions, cursorOffset: rawOffset };
+    return {
+      path,
+      content: record.rawContent,
+      definitions,
+      highlights: computeHighlightSpans(path, record.rawContent),
+      cursorOffset: rawOffset,
+    };
   }
   const result = await formatWithCursor(record.rawContent, {
     filepath: absolutePath,
     cursorOffset: rawOffset,
   });
-  return { path, content: result.formatted, definitions, cursorOffset: result.cursorOffset };
+  return {
+    path,
+    content: result.formatted,
+    definitions,
+    highlights: computeHighlightSpans(path, result.formatted),
+    cursorOffset: result.cursorOffset,
+  };
 }
 
 function success<Type extends PreprocessRequest["type"]>(

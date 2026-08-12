@@ -1,14 +1,4 @@
-import { access, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { parseProject, TsUML2Settings } from "tsuml2";
-import {
-  Enum,
-  TypeAlias,
-  type Clazz,
-  type FileDeclaration,
-  type HeritageClause,
-  type Interface,
-} from "tsuml2/dist/core/model";
+import { readFile, stat } from "node:fs/promises";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type UmlDiagramGraph,
@@ -16,22 +6,29 @@ import {
 } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
 import { resolveInside } from "./paths.ts";
-import { isDeclarationPath, isUmlIgnoredPath } from "./source.ts";
+import { decodeSourceBytes, isDeclarationPath, isUmlIgnoredPath } from "./source.ts";
 import type { PackageInfo } from "./types.ts";
-import { extractUmlTopology } from "./uml/graph.ts";
+import { parseUmlAssociations, removeSelfMemberAssociations } from "./uml/associations.ts";
 import { UML_ENTITY_COLLECTIONS } from "./uml/entities.ts";
+import { extractUmlTopology } from "./uml/graph.ts";
 import {
   bareUmlName,
   isTestPath,
   posix,
   scopeRelativePath,
+  syntheticTypeId,
   umlFileKey,
 } from "./uml/keys.ts";
-import {
-  escapeStructuredMemberTypes,
-  removeSelfMemberAssociations,
-} from "./uml/mermaid.ts";
-import type { CategoryMap, UmlReference } from "./uml/model.ts";
+import { escapeStructuredMemberTypes } from "./uml/mermaid.ts";
+import type {
+  CategoryMap,
+  FileDeclaration,
+  HeritageClause,
+  UmlEntityModel,
+  UmlReference,
+} from "./uml/model.ts";
+import { parseUmlProject, resolveUmlTypeReferences } from "./uml/parse.ts";
+import { buildSymbolTable } from "./uml/resolve.ts";
 import { analyzeUmlTypes } from "./uml/usage.ts";
 
 const CATEGORY_ENTITY_COLLECTIONS = [
@@ -67,22 +64,6 @@ function packageForScope(
     .sort((left, right) => right.path.length - left.path.length)[0];
 }
 
-async function getTsConfig(
-  sourceDir: string,
-  scopePath: string,
-  packages: readonly PackageInfo[],
-): Promise<string | undefined> {
-  const selected = packageForScope(scopePath, packages);
-  const candidates = [
-    selected ? join(sourceDir, selected.path, "tsconfig.json") : undefined,
-    join(sourceDir, "tsconfig.json"),
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  for (const candidate of candidates) {
-    if (await access(candidate).then(() => true).catch(() => false)) return candidate;
-  }
-  return undefined;
-}
-
 function fileDeclarations(declarations: FileDeclaration[]): CategoryMap {
   const result: CategoryMap = new Map();
   for (const declaration of declarations) {
@@ -97,17 +78,11 @@ function fileDeclarations(declarations: FileDeclaration[]): CategoryMap {
   return result;
 }
 
-function syntheticTypeId(filePath: string, renderedName: string): string {
-  const normalized = posix(filePath);
-  const extension = normalized.lastIndexOf(".");
-  const withoutExtension = extension < 0 ? normalized : normalized.slice(0, extension);
-  return `"${withoutExtension}".${renderedName}`;
-}
-
-async function addMissingTypeAliases(
+function addMissingTypeAliases(
   files: readonly string[],
   declarations: FileDeclaration[],
-): Promise<void> {
+  contents: ReadonlyMap<string, string>,
+): void {
   const byFile = new Map(declarations.map((declaration) => [
     umlFileKey(declaration.fileName),
     declaration,
@@ -115,7 +90,7 @@ async function addMissingTypeAliases(
   for (const file of files) {
     const declaration = byFile.get(umlFileKey(file));
     if (!declaration) continue;
-    const parsed = parseDefinitionSpans(file, await readFile(file, "utf8"))
+    const parsed = parseDefinitionSpans(file, contents.get(umlFileKey(file)) ?? "")
       .filter((definition) => definition.kind === "type");
     const order = new Map(parsed.map((definition, index) => [
       `${definition.entityName}\0${definition.entityOccurrence}`,
@@ -132,13 +107,14 @@ async function addMissingTypeAliases(
     for (const definition of parsed) {
       const key = `${definition.entityName}\0${definition.entityOccurrence}`;
       if (existing.has(key)) continue;
-      declaration.types.push(new TypeAlias({
+      declaration.types.push({
         name: definition.renderedEntityName,
         id: syntheticTypeId(file, definition.renderedEntityName),
         properties: [],
         methods: [],
         heritageClauses: [],
-      }));
+        items: [],
+      });
       existing.add(key);
     }
     const typeOccurrences = new Map<string, number>();
@@ -214,7 +190,7 @@ function serializeEntity(
   declarationOrdinal: number,
   entityKind: UmlEntityKind,
   entityOrdinal: number,
-  entity: Clazz | Interface | TypeAlias | Enum,
+  entity: UmlEntityModel,
   rows: UmlModelRows,
 ): void {
   rows.entities.push({
@@ -223,7 +199,7 @@ function serializeEntity(
     entityOrdinal,
     nodeId: entity.id,
   });
-  if (entity instanceof Enum) {
+  if (entityKind === "enum") {
     for (const [itemOrdinal, value] of entity.items.entries()) {
       rows.enumItems.push({
         declarationOrdinal,
@@ -352,7 +328,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
         bName: association.b.name,
         bMultiplicity: association.b.multiplicity ?? null,
         associationType: association.associationType,
-        inherited: association.inerhited,
+        inherited: association.inherited,
       });
     }
   }
@@ -382,8 +358,6 @@ export function bareUmlDiagramGraph(scopePath: string): UmlDiagramGraph {
     aliases: [],
     edges: [],
     relations: [],
-    settings: null,
-    settingLines: [],
     ...emptyUmlModelRows(),
     categories: [],
     methodReturnDependencies: [],
@@ -394,6 +368,16 @@ export function bareUmlDiagramGraph(scopePath: string): UmlDiagramGraph {
     externalUserTargets: [],
     definitions: [],
   };
+}
+
+async function readUmlSources(files: readonly string[]): Promise<Map<string, string>> {
+  const contents = new Map<string, string>();
+  for (const file of files) {
+    const decoded = decodeSourceBytes(await readFile(file));
+    if ("failure" in decoded) throw new Error(`${decoded.failure}: ${file}`);
+    contents.set(umlFileKey(file), decoded.text);
+  }
+  return contents;
 }
 
 export async function extractUmlDiagramGraph(
@@ -427,34 +411,30 @@ export async function extractUmlDiagramGraph(
       }
     }
   }
-  const settings = new TsUML2Settings();
-  const normalizedFiles = files.map(posix);
-  settings.glob = normalizedFiles.length === 1
-    ? normalizedFiles[0]
-    : normalizedFiles.length ? `{${normalizedFiles.join(",")}}` : "";
-  settings.tsconfig = await getTsConfig(sourceDir, scopePath, packages);
-  settings.propertyTypes = true;
-  settings.modifiers = true;
-  settings.typeLinks = true;
-  settings.memberAssociations = true;
-  settings.exportedTypesOnly = false;
-  // ts-morph accepts an array of paths; a single `{a,b,c}` brace glob trips the 10 000-character
-  // limit in `braces` once a scope holds ~130 files.
-  const parseSettings = { ...settings, glob: normalizedFiles } as unknown as TsUML2Settings;
-  const declarations = normalizedFiles.length ? parseProject(parseSettings) : [];
-  await addMissingTypeAliases(files, declarations);
+
+  const contents = await readUmlSources(projectFiles);
+  const project = parseUmlProject(files, contents);
+  let declarations: FileDeclaration[];
+  try {
+    resolveUmlTypeReferences(project, buildSymbolTable(project.units, project.entities));
+    parseUmlAssociations(project.declarations);
+    declarations = project.declarations;
+  } finally {
+    project.dispose();
+  }
+  addMissingTypeAliases(files, declarations, contents);
   removeSelfMemberAssociations(declarations);
   escapeStructuredMemberTypes(declarations);
   const categories = fileDeclarations(declarations);
-  const analysis = analyzeUmlTypes(
-    canonicalSourceDir,
-    files,
+  const analysis = analyzeUmlTypes({
+    sourceDir: canonicalSourceDir,
+    sourceFiles: files,
     projectFiles,
+    contents,
     declarations,
-    settings.tsconfig,
     categories,
     ignoredExternalUserFiles,
-  );
+  });
   const localOwnerEntityIds = new Set<string>();
   for (const local of analysis.localUserNodes) {
     if (local.ownerEntityId) localOwnerEntityIds.add(local.ownerEntityId);
@@ -485,30 +465,6 @@ export async function extractUmlDiagramGraph(
     formatVersion: DIAGRAM_GRAPH_FORMAT_VERSION,
     renderMode: "normal",
     ...topology,
-    settings: {
-      glob: settings.glob,
-      tsconfig: settings.tsconfig ?? null,
-      outFile: settings.outFile,
-      propertyTypes: settings.propertyTypes,
-      modifiers: settings.modifiers,
-      typeLinks: settings.typeLinks,
-      outDsl: settings.outDsl,
-      outMermaidDsl: settings.outMermaidDsl,
-      memberAssociations: settings.memberAssociations,
-      exportedTypesOnly: settings.exportedTypesOnly,
-    },
-    settingLines: [
-      ...settings.nomnoml.map((value, lineOrdinal) => ({
-        settingKind: "nomnoml" as const,
-        lineOrdinal,
-        value,
-      })),
-      ...settings.mermaid.map((value, lineOrdinal) => ({
-        settingKind: "mermaid" as const,
-        lineOrdinal,
-        value,
-      })),
-    ],
     ...modelRows,
     categories: [...categories.entries()].map(([entityName, info], categoryOrdinal) => ({
       categoryOrdinal,
@@ -561,4 +517,3 @@ export async function extractUmlDiagramGraph(
     })),
   };
 }
-

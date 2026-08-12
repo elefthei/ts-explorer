@@ -318,7 +318,7 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string, styleS
   expect(mainScript).not.toContain("/api/file/format");
   expect(mainScript).not.toMatch(/\bMod-s\b|method\s*:\s*["']PUT["']|conflict-banner/);
   expect(mainScript).toContain("window.print()");
-  expect(mainScript).toMatch(/forceParsing\s*\(/);
+  expect(mainScript).toContain("editorHighlightDecorations");
 
   expect(styleSheet).toContain("@media print");
   expect(styleSheet).toMatch(/#editor-panel \.tok-keyword\{color:#d73a49\}/);
@@ -798,6 +798,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       path: "packages/demo/src/index.ts",
       content: "export const value = 1;\n",
       definitions: [],
+      highlights: expect.any(Array),
     });
 
     const positionedFileResponse = await fetch(
@@ -809,6 +810,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       path: "packages/demo/src/index.ts",
       content: "export const value = 1;\n",
       definitions: [],
+      highlights: expect.any(Array),
       cursorOffset: 21,
     });
     expect(positioned.content[positioned.cursorOffset ?? -1]).toBe("1");
@@ -972,6 +974,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
         { ...indexedDefinitions[1], displayFrom: 32, displayTo: 40 },
         { ...indexedDefinitions[2], displayFrom: 82, displayTo: 91 },
       ],
+      highlights: expect.any(Array),
     });
 
     const priorityResponse = await fetch(`${base}/api/preprocess`, {
@@ -1129,6 +1132,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
       path: "watched/added.ts",
       content: 'export const watchedToken = "WATCHED_LIVE_TOKEN";\n',
       definitions: [],
+      highlights: expect.any(Array),
     });
 
     const graphDbPath = join(root, ".explore", "explore.db");
@@ -1331,11 +1335,6 @@ test("UML extraction errors retain the last promoted normalized graph and respon
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "uml-fallback" }));
   await writeFixtureFile(
     root,
-    "tsconfig.json",
-    JSON.stringify({ compilerOptions: { strict: true } }),
-  );
-  await writeFixtureFile(
-    root,
     "model.ts",
     [
       "export class FallbackTarget {}",
@@ -1359,7 +1358,8 @@ test("UML extraction errors retain the last promoted normalized graph and respon
     const graphDbPath = join(root, ".explore", "explore.db");
     const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
 
-    await writeFile(join(root, "tsconfig.json"), "{ malformed");
+    // The parser rejects invalid UTF-8, which is the only source-level failure it can observe.
+    await writeFile(join(root, "model.ts"), Buffer.from([0x65, 0x78, 0x70, 0xff, 0xfe]));
     await withTimeout(promotions.second, "failed UML cache promotion");
     const failed = await store.getDiagram("uml", "");
     await store.close();

@@ -525,9 +525,16 @@ test("TSX generic arrow syntax parses as TSX", () => {
     { key: '["class","Component",0,null,null]', line: 2, column: 14 },
     { key: '["class","Component",0,"run",0]', line: 3, column: 3 },
   ]);
-  // characterizes: without the disambiguating comma the TSX parser consumes the rest as JSX,
-  // while the same text parsed as .ts still yields the class - proof the extension picks the parser
-  expect(contractRows("component.tsx", withoutTrailingComma)).toEqual([]);
+  // characterizes: tree-sitter-tsx accepts the ambiguous generic arrow instead of reading `<T>`
+  // as the start of a JSX element, so the declarations after it stay navigable in both parsers
+  expect(contractRows("component.tsx", withoutTrailingComma).map(({ key, line, column }) => ({
+    key,
+    line,
+    column,
+  }))).toEqual([
+    { key: '["class","Component",0,null,null]', line: 2, column: 14 },
+    { key: '["class","Component",0,"run",0]', line: 3, column: 3 },
+  ]);
   expect(contractRows("component.ts", withoutTrailingComma).map(({ key }) => key)).toEqual([
     '["class","Component",0,null,null]',
     '["class","Component",0,"run",0]',

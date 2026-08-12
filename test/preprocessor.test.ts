@@ -56,19 +56,6 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       sourceNodeId: "a",
       targetNodeId: "b",
     }],
-    settings: {
-      glob: scopePath,
-      tsconfig: null,
-      outFile: "",
-      propertyTypes: true,
-      modifiers: true,
-      typeLinks: true,
-      outDsl: "",
-      outMermaidDsl: "",
-      memberAssociations: true,
-      exportedTypesOnly: false,
-    },
-    settingLines: [],
     declarations: [
       { declarationOrdinal: 0, fileName: "alpha.ts", memberAssociationsPresent: false },
       { declarationOrdinal: 1, fileName: "beta.ts", memberAssociationsPresent: false },
@@ -117,6 +104,13 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
     externalUserTargets: [],
     definitions: [],
   };
+}
+
+/** Stamps a distinguishing marker into a stored graph so persisted scopes can be told apart. */
+function setFixtureMarker(graph: UmlDiagramGraph, marker: string): void {
+  const [declaration] = graph.declarations;
+  if (declaration === undefined) throw new Error("UML graph has no declaration to mark");
+  declaration.fileName = `${marker}.ts`;
 }
 
 function renderFixtureGraph(graph: DiagramGraph): RenderedDiagram {
@@ -841,16 +835,19 @@ test("preprocesses each visible scope once and serves formatted files and litera
     path: "root.ts",
     content: formattedRootSource,
     definitions: rootDefinitions,
+    highlights: expect.any(Array),
   });
   expect(await preprocessor.readFile("packages/b/index.js")).toEqual({
     path: "packages/b/index.js",
     content: 'export const jsValue = { text: "js-untracked" };\n',
     definitions: [],
+    highlights: expect.any(Array),
   });
   expect(await preprocessor.readFile("malformed.js")).toEqual({
     path: "malformed.js",
     content: malformedSource,
     definitions: [],
+    highlights: expect.any(Array),
   });
 
   const positioned = await preprocessor.readFile("root.ts", { line: 10, column: 14 });
@@ -977,7 +974,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 5,
+      user_version: 6,
     });
     expect(db.query<{
       name: string;
@@ -1304,12 +1301,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     const originalDefinitions = activeCache.readDefinitions(generationId, "root.ts");
 
     const rendererFailureGraph = structuredClone(rootGraph);
-    const rendererFailureSettings = rendererFailureGraph.settings;
-    if (rendererFailureSettings === null) throw new Error("fixture UML graph has no settings");
-    rendererFailureGraph.settings = {
-      ...rendererFailureSettings,
-      outFile: "renderer-failure-must-roll-back",
-    };
+    setFixtureMarker(rendererFailureGraph, "renderer-failure-must-roll-back");
     const rendererCall: { graph: DiagramGraph | null } = { graph: null };
     expect(() => activeCache.writeScope(generationId, {
       entries: [],
@@ -1348,12 +1340,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       uml: { scopePath: "root.ts", entityName: "SearchNeedleEntity<T>" },
     };
     const definitionFailureGraph = structuredClone(rootGraph);
-    const definitionFailureSettings = definitionFailureGraph.settings;
-    if (definitionFailureSettings === null) throw new Error("fixture UML graph has no settings");
-    definitionFailureGraph.settings = {
-      ...definitionFailureSettings,
-      outFile: "definition-failure-must-roll-back",
-    };
+    setFixtureMarker(definitionFailureGraph, "definition-failure-must-roll-back");
     let definitionRendererCalled = false;
     expect(() => activeCache.writeScope(generationId, {
       entries: [],
@@ -1457,13 +1444,9 @@ test("rejects unavailable or inconsistent fallback sources without replacing tar
     const targetGenerationId = activeCache.beginGeneration("watch", "");
     const sourceGraph = fixtureUmlGraph("source.ts");
     const targetSourceGraph = fixtureUmlGraph("source.ts");
-    const targetSourceSettings = targetSourceGraph.settings;
-    if (targetSourceSettings === null) throw new Error("fixture UML graph has no settings");
-    targetSourceGraph.settings = { ...targetSourceSettings, outFile: "target-source" };
+    setFixtureMarker(targetSourceGraph, "target-source");
     const targetOtherGraph = fixtureUmlGraph("other.ts");
-    const targetOtherSettings = targetOtherGraph.settings;
-    if (targetOtherSettings === null) throw new Error("fixture UML graph has no settings");
-    targetOtherGraph.settings = { ...targetOtherSettings, outFile: "target-other" };
+    setFixtureMarker(targetOtherGraph, "target-other");
 
     activeCache.writeScope(sourceGenerationId, {
       entries: [],
@@ -1714,12 +1697,6 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
           const [edge] = graph.edges;
           if (edge === undefined) throw new Error("fixture UML graph has no first edge");
           edge.weight = 2;
-        },
-      },
-      {
-        name: "normal graph has no settings",
-        mutate: (graph) => {
-          graph.settings = null;
         },
       },
       {

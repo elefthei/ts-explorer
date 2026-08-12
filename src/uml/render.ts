@@ -1,40 +1,31 @@
-import { getMermaidDSL, TsUML2Settings } from "tsuml2";
-import {
-  Clazz,
-  Enum,
-  Interface,
-  MemberAssociation,
-  TypeAlias,
-  type FileDeclaration,
-  type HeritageClause,
-  type MethodDetails,
-  type PropertyDetails,
-} from "tsuml2/dist/core/model";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type RenderedDiagram,
   type UmlDiagramGraph,
   type UmlEntityKind,
 } from "../diagram-graph.ts";
+import { emitMermaidClassDiagram } from "./emit.ts";
 import { hydrateUmlGraph, type UmlGraph } from "./graph.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
 import { STYLE_DEFS, escapeMermaidLabel, mermaidEntityId } from "./mermaid.ts";
 import type {
   CategoryMap,
   ExternalUserNode,
+  FileDeclaration,
+  HeritageClause,
   LocalUserNode,
+  MethodDetails,
+  PropertyDetails,
   UmlDependency,
+  UmlEntityModel,
 } from "./model.ts";
 
 
 function cloneWith<T extends object>(value: T, overrides: Partial<T>): T {
-  return Object.assign(Object.create(Object.getPrototypeOf(value)) as T, value, overrides);
+  return { ...value, ...overrides };
 }
 
-type StructuredEntityInstance = Clazz | Interface | TypeAlias;
-
 type RenderInput = {
-  settings: TsUML2Settings;
   categories: CategoryMap;
   methodReturnDependencies: readonly UmlDependency[];
   usageEdges: readonly UmlDependency[];
@@ -42,7 +33,7 @@ type RenderInput = {
   externalUserNodes: readonly ExternalUserNode[];
 };
 
-function cloneMermaidEntity<T extends StructuredEntityInstance>(entity: T): T {
+function cloneMermaidEntity(entity: UmlEntityModel): UmlEntityModel {
   const clone = cloneWith(entity, {});
   clone.name = mermaidEntityId(entity.name);
   clone.heritageClauses = entity.heritageClauses.map((clause) => cloneWith(clause, {
@@ -123,7 +114,7 @@ function renderUmlDsl(
     }
   }
   let dsl = (presentIds.size
-    ? getMermaidDSL(renderDeclarations, model.settings).trimEnd()
+    ? emitMermaidClassDiagram(renderDeclarations).trimEnd()
     : "classDiagram") + entityLabels;
 
   for (const dependency of model.methodReturnDependencies) {
@@ -237,8 +228,6 @@ function partitionUmlCommunities(
   }
   return communities;
 }
-
-type EntityInstance = StructuredEntityInstance | Enum;
 
 
 const UML_ENTITY_KINDS = new Set(UML_ENTITY_COLLECTIONS.map(({ kind }) => kind));
@@ -576,53 +565,6 @@ function hydrateUsers(
   return { users, topologyNodeIds };
 }
 
-function hydrateSettings(record: UmlDiagramGraph): TsUML2Settings {
-  if (!record.settings) throw new Error("Missing normal UML settings");
-  const source = record.settings;
-  assertString(source.glob, "UML settings glob", true);
-  if (source.tsconfig !== null) assertString(source.tsconfig, "UML settings tsconfig");
-  assertString(source.outFile, "UML settings output file", true);
-  assertString(source.outDsl, "UML settings DSL output", true);
-  assertString(source.outMermaidDsl, "UML settings Mermaid output", true);
-  assertBoolean(source.propertyTypes, "UML propertyTypes setting");
-  assertBoolean(source.modifiers, "UML modifiers setting");
-  assertBoolean(source.typeLinks, "UML typeLinks setting");
-  assertBoolean(source.memberAssociations, "UML memberAssociations setting");
-  assertBoolean(source.exportedTypesOnly, "UML exportedTypesOnly setting");
-
-  assertOrderedOrdinals(
-    record.settingLines,
-    (line) => line.settingKind,
-    (line) => line.lineOrdinal,
-    "UML setting line",
-  );
-  const nomnoml: string[] = [];
-  const mermaid: string[] = [];
-  for (const line of record.settingLines) {
-    if (line.settingKind !== "nomnoml" && line.settingKind !== "mermaid") {
-      throw new Error(`Invalid UML setting line kind: ${String(line.settingKind)}`);
-    }
-    assertString(line.value, "UML setting line", true);
-    (line.settingKind === "nomnoml" ? nomnoml : mermaid).push(line.value);
-  }
-
-  const settings = new TsUML2Settings();
-  settings.glob = source.glob;
-  if (source.tsconfig === null) delete settings.tsconfig;
-  else settings.tsconfig = source.tsconfig;
-  settings.outFile = source.outFile;
-  settings.propertyTypes = source.propertyTypes;
-  settings.modifiers = source.modifiers;
-  settings.typeLinks = source.typeLinks;
-  settings.nomnoml = nomnoml;
-  settings.outDsl = source.outDsl;
-  settings.outMermaidDsl = source.outMermaidDsl;
-  settings.mermaid = mermaid;
-  settings.memberAssociations = source.memberAssociations;
-  settings.exportedTypesOnly = source.exportedTypesOnly;
-  return settings;
-}
-
 function hydrateHeritageClause(
   row:
     | UmlDiagramGraph["entityHeritageClauses"][number]
@@ -656,7 +598,6 @@ function sameHeritageClause(
 }
 
 function hydrateModel(record: UmlDiagramGraph) {
-  const settings = hydrateSettings(record);
   const topology = hydrateUmlGraph(record.nodes, record.aliases, record.edges, record.relations);
   const topologyNodes = new Map(record.nodes.map((node) => [node.nodeId, node]));
 
@@ -744,7 +685,7 @@ function hydrateModel(record: UmlDiagramGraph) {
     heritageClauses: [],
     ...(declaration.memberAssociationsPresent ? { memberAssociations: [] } : {}),
   }));
-  const instances = new Map<string, EntityInstance>();
+  const instances = new Map<string, UmlEntityModel>();
   for (const entity of record.entities) {
     const key = entityOccurrenceKey(entity);
     const node = topologyNodes.get(entity.nodeId);
@@ -757,25 +698,28 @@ function hydrateModel(record: UmlDiagramGraph) {
     const properties = members?.properties ?? [];
     const methods = members?.methods ?? [];
     const heritageClauses = (entityHeritage.get(key) ?? []).map(hydrateHeritageClause);
-    let instance: EntityInstance;
+    let instance: UmlEntityModel;
     if (entity.entityKind === "class") {
-      instance = new Clazz({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.classes[entity.entityOrdinal] = instance;
     } else if (entity.entityKind === "interface") {
-      instance = new Interface({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.interfaces[entity.entityOrdinal] = instance;
     } else if (entity.entityKind === "type") {
-      instance = new TypeAlias({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.types[entity.entityOrdinal] = instance;
     } else {
       if (properties.length || methods.length || heritageClauses.length) {
         throw new Error(`Enum UML occurrence has structured members: ${key}`);
       }
-      instance = new Enum({
+      instance = {
         name: node.name,
         id: entity.nodeId,
-        enumItems: (enumItems.get(key) ?? []).map((item) => item.value),
-      });
+        properties: [],
+        methods: [],
+        heritageClauses: [],
+        items: (enumItems.get(key) ?? []).map((item) => item.value),
+      };
       declaration.enums[entity.entityOrdinal] = instance;
     }
     instances.set(key, instance);
@@ -828,13 +772,7 @@ function hydrateModel(record: UmlDiagramGraph) {
       throw new Error(`Mismatched UML declaration heritage group: ${groupKey}`);
     }
     const instance = instances.get(ownerKey);
-    if (
-      !(instance instanceof Clazz)
-      && !(instance instanceof Interface)
-      && !(instance instanceof TypeAlias)
-    ) {
-      throw new Error(`Invalid UML declaration heritage instance: ${ownerKey}`);
-    }
+    if (!instance) throw new Error(`Invalid UML declaration heritage instance: ${ownerKey}`);
     const declaration = declarations[group.declarationOrdinal];
     if (!declaration) {
       throw new Error(`Missing UML heritage group declaration: ${group.declarationOrdinal}`);
@@ -874,22 +812,20 @@ function hydrateModel(record: UmlDiagramGraph) {
     if (!memberAssociations) {
       throw new Error(`Invalid UML association declaration: ${association.declarationOrdinal}`);
     }
-    memberAssociations.push(
-      new MemberAssociation(
-        {
-          typeId: association.aTypeId,
-          name: association.aName,
-          ...(association.aMultiplicity === null ? {} : { multiplicity: association.aMultiplicity }),
-        },
-        {
-          typeId: association.bTypeId,
-          name: association.bName,
-          ...(association.bMultiplicity === null ? {} : { multiplicity: association.bMultiplicity }),
-        },
-        association.associationType,
-        association.inherited,
-      ),
-    );
+    memberAssociations.push({
+      a: {
+        typeId: association.aTypeId,
+        name: association.aName,
+        ...(association.aMultiplicity === null ? {} : { multiplicity: association.aMultiplicity }),
+      },
+      b: {
+        typeId: association.bTypeId,
+        name: association.bName,
+        ...(association.bMultiplicity === null ? {} : { multiplicity: association.bMultiplicity }),
+      },
+      associationType: association.associationType,
+      inherited: association.inherited,
+    });
   }
 
 
@@ -1013,7 +949,6 @@ function hydrateModel(record: UmlDiagramGraph) {
 
   return {
     topology,
-    settings,
     declarations,
     categories,
     methodReturnDependencies,
@@ -1025,13 +960,11 @@ function hydrateModel(record: UmlDiagramGraph) {
 }
 
 function assertBareUmlGraph(record: UmlDiagramGraph): void {
-  if (record.settings !== null) throw new Error("Bare UML graph cannot contain settings");
   const rowCollections: readonly (readonly unknown[])[] = [
     record.nodes,
     record.aliases,
     record.edges,
     record.relations,
-    record.settingLines,
     record.declarations,
     record.entities,
     record.properties,

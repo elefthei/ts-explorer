@@ -62,7 +62,7 @@ export interface Container<T> {
         kind: "class",
         name: "Widget",
         properties: [
-          { name: "label", type: "string", optional: false, modifiers: [] },
+          { name: "label", type: null, optional: false, modifiers: [] },
           { name: "size", type: "number", optional: true, modifiers: [] },
         ],
         // characterizes: rendered return types carry the "\n§() " method-return marker
@@ -379,22 +379,23 @@ export interface Signatures {
       kind: "class",
       name: "Members",
       properties: [
-        { name: "plain", type: "number", optional: false, modifiers: ["public"] },
-        { name: "secret", type: "number", optional: false, modifiers: ["private"] },
-        { name: "shared", type: "number", optional: false, modifiers: ["protected"] },
-        { name: "counter", type: "number", optional: false, modifiers: ["static"] },
-        // characterizes: readonly initializers keep their literal type
-        { name: "frozen", type: "5", optional: false, modifiers: ["readonly"] },
-        { name: "both", type: "6", optional: false, modifiers: ["static", "readonly"] },
+        { name: "plain", type: null, optional: false, modifiers: ["public"] },
+        { name: "secret", type: null, optional: false, modifiers: ["private"] },
+        { name: "shared", type: null, optional: false, modifiers: ["protected"] },
+        { name: "counter", type: null, optional: false, modifiers: ["static"] },
+        // characterizes: an unannotated member carries no type - nothing is inferred
+        { name: "frozen", type: null, optional: false, modifiers: ["readonly"] },
+        { name: "both", type: null, optional: false, modifiers: ["static", "readonly"] },
         // characterizes: `?` sets optional and strips the trailing "| undefined"
         { name: "optional", type: "string", optional: true, modifiers: [] },
         { name: "definite", type: "string", optional: false, modifiers: [] },
-        { name: "tracked", type: "number", optional: false, modifiers: ["accessor"] },
+        { name: "tracked", type: null, optional: false, modifiers: ["accessor"] },
         { name: "ambient", type: "number", optional: false, modifiers: ["ambient"] },
         // characterizes: `#private` fields are kept, name included
-        { name: "#hard", type: "number", optional: false, modifiers: [] },
-        // characterizes: an arrow-function field stays a property, never a method
-        { name: "arrow", type: "(value: number) =⟩ number", optional: false, modifiers: [] },
+        { name: "#hard", type: null, optional: false, modifiers: [] },
+        // characterizes: an arrow-function field stays a property, never a method, and its
+        // unannotated declaration leaves the property untyped
+        { name: "arrow", type: null, optional: false, modifiers: [] },
         // characterizes: constructor parameter properties are appended after the class fields
         { name: "injected", type: "string", optional: false, modifiers: ["public"] },
         { name: "hidden", type: "number", optional: false, modifiers: ["private"] },
@@ -403,8 +404,8 @@ export interface Signatures {
       methods: [
         { name: "run", type: "\n§() void", modifiers: ["abstract"] },
         { name: "load", type: "\n§() Promise⟨void⟩", modifiers: ["async"] },
-        // characterizes: no fixture tsconfig means non-strict TS, so "| undefined" collapses away
-        { name: "make", type: "\n§() Members", modifiers: ["protected", "static"] },
+        // characterizes: an explicit `| undefined` return annotation is preserved verbatim
+        { name: "make", type: "\n§() Members | undefined", modifiers: ["protected", "static"] },
       ],
       enumItems: [],
       heritage: [],
@@ -952,7 +953,7 @@ export class Box<T> {
 test("a malformed source file does not lose the rest of the scope", async () => {
   const root = await fixtureRoot("ts-explorer-contract-malformed-", {
     "src/broken.ts": `export class Broken {
-  run(): void {
+  run(): void {}
 `,
     "src/valid.ts": `export class Valid {
   ok(): boolean {
@@ -964,8 +965,8 @@ test("a malformed source file does not lose the rest of the scope", async () => 
 
   const { contract } = await extractContract(root);
 
-  // characterizes: malformed input resolves partially - the recovered parse of the broken file
-  // still contributes its entity and members, and the valid file is unaffected.
+  // characterizes: the recovered parse of a file with an unclosed class still contributes its
+  // entity and members, and the valid file is unaffected.
   expect(contract.entities).toEqual([
     {
       file: "src/broken.ts",

@@ -2,9 +2,6 @@ import mermaid from "mermaid";
 import { basicSetup, EditorView } from "codemirror";
 import { Decoration } from "@codemirror/view";
 import { EditorSelection, EditorState } from "@codemirror/state";
-import { javascript } from "@codemirror/lang-javascript";
-import { forceParsing, syntaxHighlighting } from "@codemirror/language";
-import { classHighlighter } from "@lezer/highlight";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
@@ -44,7 +41,6 @@ function $<T extends Element = HTMLInputElement>(selector:string):T{const elemen
 const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>(),packages:[] as readonly PackageInfo[]};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
-const PRINT_PARSE_BUDGET_MS=5_000;
 const EMPTY_DIAGRAM_MESSAGE="No diagram content for this scope";
 const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
 const diagramRequests=new RequestSequence();
@@ -639,8 +635,13 @@ function destroyEditor(invalidate=true):void{
 function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
 function printEditor():void{
   if(!state.view)return;
-  forceParsing(state.view,state.view.state.doc.length,PRINT_PARSE_BUDGET_MS);
   window.print();
+}
+function editorHighlightDecorations(file:FileResponse){
+  return Decoration.set(file.highlights.flatMap((span)=>{
+    if(span.from<0||span.to>file.content.length||span.from>=span.to)return[];
+    return[Decoration.mark({class:`tok-${span.token}`}).range(span.from,span.to)];
+  }),true);
 }
 function editorDefinitionDecorations(file:FileResponse){
   return Decoration.set(file.definitions.flatMap((definition)=>{
@@ -701,15 +702,12 @@ async function openFile(
     state.file=file;
     $("#editor-name").textContent=path.split("/").at(-1)??path;
     $("#editor-path").textContent=path;
-    const typescript=/\.(?:ts|tsx|mts|cts)$/.test(path);
-    const jsx=/\.(?:tsx|jsx)$/.test(path);
     const extensions=[
       basicSetup,
-      javascript({typescript,jsx}),
       oneDark,
-      syntaxHighlighting(classHighlighter),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
+      EditorView.decorations.of(editorHighlightDecorations(file)),
       EditorView.decorations.of(editorDefinitionDecorations(file)),
       editorDefinitionHandlers(),
     ];

@@ -1,6 +1,6 @@
-import type { FileDeclaration } from "tsuml2/dist/core/model";
 import { UML_METHOD_RETURN_MARKER } from "../types.ts";
 import { bareUmlName } from "./keys.ts";
+import type { FileDeclaration } from "./model.ts";
 
 export const STYLE_DEFS = [
   ["interface", "fill:#183a66,stroke:#69d2ff,color:#f4f7fb"],
@@ -26,11 +26,11 @@ export function escapeMermaidLabel(label: string): string {
   return label.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 }
 
-export function stripImportTypeQualifiers(type: string): string {
+function stripImportTypeQualifiers(type: string): string {
   return type.replace(/import\((?:"[^"]*"|'[^']*')\)\./g, "");
 }
 
-export function escapeStructuredType(type: string | undefined): string | undefined {
+function escapeStructuredType(type: string | undefined): string | undefined {
   return type === undefined
     ? undefined
     : stripImportTypeQualifiers(type)
@@ -54,14 +54,6 @@ export function escapeStructuredMemberTypes(declarations: FileDeclaration[]): vo
       for (const property of entity.properties) property.type = escapeStructuredType(property.type);
       for (const method of entity.methods) method.returnType = escapeMethodReturnType(method.returnType);
     }
-  }
-}
-
-export function removeSelfMemberAssociations(declarations: FileDeclaration[]): void {
-  for (const declaration of declarations) {
-    declaration.memberAssociations = declaration.memberAssociations?.filter(
-      (association) => association.a.typeId !== association.b.typeId,
-    );
   }
 }
 

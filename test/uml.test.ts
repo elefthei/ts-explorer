@@ -66,9 +66,9 @@ test("renders generic and semantic UML styles including tests", async () => {
   const resultLine = lines[resultIndex].trim();
   const executeLine = lines[executeIndex].trim();
   const executeReturnRow =
-    "§() Promise⟨｛ ok: true; output: Output; ｝ | ｛ ok: false; rejection: Error; ｝⟩";
+    "§() Promise⟨ ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝ ⟩";
   expect(resultLine).toContain(
-    "result: ｛ ok: true; output: Output; ｝ | ｛ ok: false; rejection: Error; ｝",
+    "result: ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝",
   );
   expect(resultLine).not.toContain("§()");
   expect(executeLine).toBe("+execute()");
@@ -299,8 +299,8 @@ test("removes import qualifiers from nested generic property and method labels",
     [
       'import { current, definitions } from "./types";',
       "export class Runtime<TSchema> {",
-      "  readonly registry = definitions<TSchema>();",
-      "  resolve() { return current<TSchema>(); }",
+      "  readonly registry: Map<Skill, AgentTool<TSchema, any>> = definitions<TSchema>();",
+      "  resolve(): { tool: AgentTool<TSchema, any>; context: DurableContext } { return current<TSchema>(); }",
       "}",
       "",
     ].join("\n"),
@@ -314,7 +314,7 @@ test("removes import qualifiers from nested generic property and method labels",
   expect(registryLine).toBe("+registry: Map⟨Skill, AgentTool⟨TSchema, any⟩⟩");
   expect(lines[resolveIndex]).toBe("+resolve()");
   expect(lines[resolveIndex + 1]).toBe(
-    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext; ｝",
+    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext ｝",
   );
 });
 

@@ -20,7 +20,6 @@ const UML_RECORD_ARRAY_FIELDS = [
   "aliases",
   "edges",
   "relations",
-  "settingLines",
   "declarations",
   "entities",
   "properties",
@@ -102,7 +101,6 @@ export function expectNormalizedUmlRoundTrip(
   actual: UmlDiagramGraph,
   expected: UmlDiagramGraph,
 ): void {
-  expect(actual.settings).toEqual(expected.settings);
   for (const field of UML_RECORD_ARRAY_FIELDS) {
     expect(actual[field], field).toEqual(expected[field]);
   }

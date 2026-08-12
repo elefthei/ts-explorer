@@ -32,7 +32,6 @@ type DiagramRelationKind =
 
 export type UmlEntityKind = "class" | "interface" | "enum" | "type";
 type UmlCategoryKind = "interface" | "type" | "enum" | "abstract" | "concrete";
-type UmlSettingLineKind = "nomnoml" | "mermaid";
 
 type UmlEntityOccurrence = {
   declarationOrdinal: number;
@@ -105,23 +104,6 @@ export type PackageDiagramGraph = DiagramGraphBase & {
 
 export type UmlDiagramGraph = DiagramGraphBase & {
   kind: "uml";
-  settings: {
-    glob: string;
-    tsconfig: string | null;
-    outFile: string;
-    propertyTypes: boolean;
-    modifiers: boolean;
-    typeLinks: boolean;
-    outDsl: string;
-    outMermaidDsl: string;
-    memberAssociations: boolean;
-    exportedTypesOnly: boolean;
-  } | null;
-  settingLines: {
-    settingKind: UmlSettingLineKind;
-    lineOrdinal: number;
-    value: string;
-  }[];
   declarations: {
     declarationOrdinal: number;
     fileName: string;

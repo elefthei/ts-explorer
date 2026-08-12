@@ -71,10 +71,10 @@ Use `--host 0.0.0.0` only when you intentionally want the server reachable beyon
 ## Explorer workflow
 
 - **Packages** shows workspace package dependencies as a Mermaid graph.
-- **UML** shows TsUML2 class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
+- **UML** shows class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
 - The file tree lists packages, folders, and files. Use the filter to narrow it.
 - Select a TypeScript or JavaScript source file to open it in the read-only editor; other files are not viewable.
-- The editor shows the Prettier-formatted source produced during preprocessing. It is never editable, and the explorer never writes to the inspected project.
+- The editor shows the Prettier-formatted source produced during preprocessing, syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
 - Class, interface, enum, type, and method names are underlined in the editor. Click one to jump straight to its declaration; the target comes from a definition index written at the start of every preprocessing generation, so the jump never waits on UML extraction of the target file.
 - Search matches file contents and definition names. Selecting a definition result opens the declaration in the editor or highlights it in the UML diagram.
 - The graph supports wheel zoom, pointer-drag panning, and reset-to-fit controls.

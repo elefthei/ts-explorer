@@ -24,7 +24,7 @@ import type {
 } from "./types.ts";
 import { validateUmlDiagramGraph } from "./uml/render.ts";
 
-const CACHE_SCHEMA_VERSION = 5;
+const CACHE_SCHEMA_VERSION = 6;
 
 export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
@@ -125,20 +125,6 @@ type GraphHeaderRow = {
   renderMode: "normal" | "bare";
 };
 type SqlEdgeRow = Omit<DiagramGraph["edges"][number], "directed"> & { directed: number };
-type SqlSettingsRow = Omit<
-  NonNullable<UmlDiagramGraph["settings"]>,
-  | "propertyTypes"
-  | "modifiers"
-  | "typeLinks"
-  | "memberAssociations"
-  | "exportedTypesOnly"
-> & {
-  propertyTypes: number;
-  modifiers: number;
-  typeLinks: number;
-  memberAssociations: number;
-  exportedTypesOnly: number;
-};
 type SqlDeclarationRow = Omit<
   UmlDiagramGraph["declarations"][number],
   "memberAssociationsPresent"
@@ -410,43 +396,6 @@ const CACHE_SCHEMA_OBJECTS = [
       PRIMARY KEY (generation_id, kind, scope_path, node_id),
       FOREIGN KEY (generation_id, kind, scope_path, node_id)
         REFERENCES diagram_nodes(generation_id, kind, scope_path, node_id) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_settings",
-    kind: "table",
-    createSql: `CREATE TABLE uml_settings (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      glob TEXT NOT NULL,
-      tsconfig TEXT,
-      out_file TEXT NOT NULL,
-      property_types INTEGER NOT NULL CHECK (property_types IN (0, 1)),
-      modifiers INTEGER NOT NULL CHECK (modifiers IN (0, 1)),
-      type_links INTEGER NOT NULL CHECK (type_links IN (0, 1)),
-      out_dsl TEXT NOT NULL,
-      out_mermaid_dsl TEXT NOT NULL,
-      member_associations INTEGER NOT NULL CHECK (member_associations IN (0, 1)),
-      exported_types_only INTEGER NOT NULL CHECK (exported_types_only IN (0, 1)),
-      PRIMARY KEY (generation_id, kind, scope_path),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_setting_lines",
-    kind: "table",
-    createSql: `CREATE TABLE uml_setting_lines (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      setting_kind TEXT NOT NULL CHECK (setting_kind IN ('nomnoml', 'mermaid')),
-      line_ordinal INTEGER NOT NULL CHECK (line_ordinal >= 0),
-      value TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, setting_kind, line_ordinal),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES uml_settings(generation_id, kind, scope_path) ON DELETE CASCADE
     )`,
   },
   {
@@ -1393,45 +1342,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       generation_id, kind, scope_path, node_id, package_path
     ) VALUES (?, ?, ?, ?, ?)
   `);
-  const insertUmlSettings = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      string,
-      string | null,
-      string,
-      number,
-      number,
-      number,
-      string,
-      string,
-      number,
-      number,
-    ]
-  >(`
-    INSERT INTO uml_settings(
-      generation_id, kind, scope_path, glob, tsconfig, out_file, property_types,
-      modifiers, type_links, out_dsl, out_mermaid_dsl, member_associations,
-      exported_types_only
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlSettingLine = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      UmlDiagramGraph["settingLines"][number]["settingKind"],
-      number,
-      string,
-    ]
-  >(`
-    INSERT INTO uml_setting_lines(
-      generation_id, kind, scope_path, setting_kind, line_ordinal, value
-    ) VALUES (?, ?, ?, ?, ?, ?)
-  `);
   const insertUmlDeclaration = db.query<
     never,
     [number, "uml", string, number, string, number]
@@ -1820,30 +1730,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE packages.generation_id = ? AND packages.kind = ? AND packages.scope_path = ?
     ORDER BY nodes.node_ordinal
   `);
-  const selectUmlSettings = db.query<SqlSettingsRow, GraphIdentity>(`
-    SELECT
-      glob,
-      tsconfig,
-      out_file AS outFile,
-      property_types AS propertyTypes,
-      modifiers,
-      type_links AS typeLinks,
-      out_dsl AS outDsl,
-      out_mermaid_dsl AS outMermaidDsl,
-      member_associations AS memberAssociations,
-      exported_types_only AS exportedTypesOnly
-    FROM uml_settings
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-  `);
-  const selectUmlSettingLines = db.query<
-    UmlDiagramGraph["settingLines"][number],
-    GraphIdentity
-  >(`
-    SELECT setting_kind AS settingKind, line_ordinal AS lineOrdinal, value
-    FROM uml_setting_lines
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY CASE setting_kind WHEN 'nomnoml' THEN 0 ELSE 1 END, line_ordinal
-  `);
   const selectUmlDeclarations = db.query<SqlDeclarationRow, GraphIdentity>(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
@@ -2157,13 +2043,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   const selectUmlRowsPresent = db.query<{ present: number }, GraphIdentity>(`
     WITH identity(generation_id, kind, scope_path) AS (VALUES (?, ?, ?))
     SELECT (
-      EXISTS(SELECT 1 FROM uml_settings AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_setting_lines AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_declarations AS rows JOIN identity
+      EXISTS(SELECT 1 FROM uml_declarations AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_entities AS rows JOIN identity
@@ -2231,8 +2111,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     insertEdge,
     insertRelation,
     insertPackageNode,
-    insertUmlSettings,
-    insertUmlSettingLine,
     insertUmlDeclaration,
     insertUmlEntity,
     insertUmlProperty,
@@ -2258,8 +2136,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     selectEdges,
     selectRelations,
     selectPackageNodes,
-    selectUmlSettings,
-    selectUmlSettingLines,
     selectUmlDeclarations,
     selectUmlEntities,
     selectUmlProperties,
@@ -2338,24 +2214,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
         return;
       }
       const umlIdentity = [generationId, graph.kind, graph.scopePath] as const;
-      if (graph.settings) {
-        insertUmlSettings.run(
-          ...umlIdentity,
-          graph.settings.glob,
-          graph.settings.tsconfig,
-          graph.settings.outFile,
-          sqliteBoolean(graph.settings.propertyTypes, "UML property-types setting"),
-          sqliteBoolean(graph.settings.modifiers, "UML modifiers setting"),
-          sqliteBoolean(graph.settings.typeLinks, "UML type-links setting"),
-          graph.settings.outDsl,
-          graph.settings.outMermaidDsl,
-          sqliteBoolean(graph.settings.memberAssociations, "UML member-associations setting"),
-          sqliteBoolean(graph.settings.exportedTypesOnly, "UML exported-types setting"),
-        );
-      }
-      for (const line of graph.settingLines) {
-        insertUmlSettingLine.run(...umlIdentity, line.settingKind, line.lineOrdinal, line.value);
-      }
       for (const declaration of graph.declarations) {
         insertUmlDeclaration.run(
           ...umlIdentity,
@@ -2609,23 +2467,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           packageNodes: selectPackageNodes.all(...identity),
         };
       }
-      const settingsRow = selectUmlSettings.get(...identity);
-      const settings = settingsRow
-        ? {
-          ...settingsRow,
-          propertyTypes: settingsRow.propertyTypes !== 0,
-          modifiers: settingsRow.modifiers !== 0,
-          typeLinks: settingsRow.typeLinks !== 0,
-          memberAssociations: settingsRow.memberAssociations !== 0,
-          exportedTypesOnly: settingsRow.exportedTypesOnly !== 0,
-        }
-        : null;
       return {
         ...base,
         kind: "uml",
         formatVersion: header.formatVersion as typeof DIAGRAM_GRAPH_FORMAT_VERSION,
-        settings,
-        settingLines: selectUmlSettingLines.all(...identity),
         declarations: selectUmlDeclarations.all(...identity).map((row) => ({
           ...row,
           memberAssociationsPresent: row.memberAssociationsPresent !== 0,
@@ -2696,7 +2541,6 @@ function assertGraphIdentity(
       "aliases",
       "edges",
       "relations",
-      "settingLines",
       "declarations",
       "entities",
       "properties",
@@ -2719,9 +2563,7 @@ function assertGraphIdentity(
     ];
   if (
     (graph.kind === "packages" && (
-      "settings" in candidate
-      || "settingLines" in candidate
-      || "declarations" in candidate
+      "declarations" in candidate
       || "entities" in candidate
       || "properties" in candidate
       || "propertyTypeIds" in candidate
@@ -2747,13 +2589,6 @@ function assertGraphIdentity(
   }
   if (arrayFields.some((field) => !Array.isArray(candidate[field]))) {
     throw invalidMaterialization("invalid diagram graph row collections");
-  }
-  if (
-    graph.kind === "uml"
-    && graph.settings !== null
-    && (typeof graph.settings !== "object" || Array.isArray(graph.settings))
-  ) {
-    throw invalidMaterialization("invalid UML settings record");
   }
 }
 
