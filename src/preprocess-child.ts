@@ -30,7 +30,7 @@ import type {
 } from "./preprocess-protocol.ts";
 import { isRecord } from "./preprocess-protocol.ts";
 import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
-import { buildTree, collectTreeEntries, readDirectoryEntries } from "./tree.ts";
+import { buildTree, collectTreeEntries, computeSourceFingerprint, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
 import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
 import { renderUmlDiagramGraph } from "./uml/render.ts";
@@ -683,10 +683,11 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
   if (request.type === "init") {
     if (state) throw new PreprocessRequestError("BAD_REQUEST", "preprocess child is already initialized");
     const sourceDir = await resolveInside(request.sourceDir, "", true);
+    const sourceFingerprint = await computeSourceFingerprint(sourceDir);
     const cache = new Cache(request.dbPath);
     try {
       const activeGenerationId = request.recover
-        ? cache.recover()
+        ? cache.recover(sourceFingerprint)
         : cache.getActiveGenerationId();
       state = { sourceDir, cache };
       return success(request, {
@@ -710,7 +711,10 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
   switch (request.type) {
     case "begin-generation":
       return success(request, {
-        generationId: preprocessState.cache.beginGeneration(request.cause),
+        generationId: preprocessState.cache.beginGeneration(
+          request.cause,
+          await computeSourceFingerprint(preprocessState.sourceDir),
+        ),
       });
     case "discover-packages":
       return success(request, await discoverAndPersist(preprocessState, request.generationId));

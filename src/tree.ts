@@ -1,4 +1,5 @@
-import { readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { normalizeRelativePath, resolveInside } from "./paths.ts";
 import { isSourcePath, isTraversalIgnoredPath } from "./source.ts";
@@ -42,6 +43,35 @@ export async function collectTreeEntries(
       .map((entry) => collectTreeEntries(sourceDir, entry.path)),
   );
   return entries.concat(...descendants);
+}
+
+async function collectFingerprintEntries(
+  sourceDir: string,
+  scopePath: string,
+): Promise<TreeNode[]> {
+  const entries = await readDirectoryEntries(sourceDir, scopePath).catch((): TreeNode[] => []);
+  const descendants = await Promise.all(
+    entries
+      .filter((entry) => entry.kind === "directory")
+      .map((entry) => collectFingerprintEntries(sourceDir, entry.path)),
+  );
+  return entries.concat(...descendants);
+}
+
+export async function computeSourceFingerprint(sourceDir: string): Promise<string> {
+  const entries = await collectFingerprintEntries(sourceDir, "");
+  const stamps = await Promise.all(
+    entries.map(async (entry): Promise<string | null> => {
+      if (entry.kind === "directory") return `d\0${entry.path}`;
+      const info = await stat(resolve(sourceDir, entry.path)).catch(() => null);
+      return info === null ? null : `f\0${entry.path}\0${info.size}\0${info.mtimeMs}`;
+    }),
+  );
+  const hash = createHash("sha256");
+  for (const stamp of stamps.filter((stamp) => stamp !== null).sort()) {
+    hash.update(`${stamp}\n`);
+  }
+  return hash.digest("hex");
 }
 
 export async function readTree(sourceDir: string): Promise<TreeNode> {

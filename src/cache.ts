@@ -24,7 +24,7 @@ import type {
 } from "./types.ts";
 import { validateUmlDiagramGraph } from "./uml/render.ts";
 
-const CACHE_SCHEMA_VERSION = 4;
+const CACHE_SCHEMA_VERSION = 5;
 
 export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
@@ -79,8 +79,7 @@ type CacheScopeWrite = {
 };
 
 
-type ActiveGenerationRow = { id: number };
-type MetaRow = { value: string };
+type ActiveGenerationRow = { id: number; source_fingerprint: string };
 type PackageRow = { packages_json: string };
 type TreeRow = {
   path: string;
@@ -161,12 +160,11 @@ type SqlCategoryRow = Omit<
   "isTest"
 > & { isTest: number };
 type CacheStatements = {
-  selectRawActiveGeneration: Statement<MetaRow, []>;
   selectActiveGeneration: Statement<ActiveGenerationRow, []>;
   deleteActivePointer: Statement<never, []>;
   deleteGenerationsExcept: Statement<never, [number]>;
   deleteAllGenerations: Statement<never, []>;
-  insertGeneration: Statement<never, ["startup" | "watch", number]>;
+  insertGeneration: Statement<never, ["startup" | "watch", number, string]>;
   upsertPackages: Statement<never, [number, string]>;
   upsertTreeEntry: Statement<
     never,
@@ -252,7 +250,8 @@ const CACHE_SCHEMA_OBJECTS = [
       state TEXT NOT NULL CHECK (state IN ('building', 'active', 'failed')),
       cause TEXT NOT NULL CHECK (cause IN ('startup', 'watch')),
       started_at INTEGER NOT NULL,
-      completed_at INTEGER
+      completed_at INTEGER,
+      source_fingerprint TEXT NOT NULL
     )`,
   },
   {
@@ -2821,7 +2820,6 @@ private static recreateSchema(db: Database): void {
 
 private readonly db!: Database;
 private readonly graphStore!: PreparedGraphStore;
-private readonly selectRawActiveGeneration!: CacheStatements["selectRawActiveGeneration"];
 private readonly selectActiveGeneration!: CacheStatements["selectActiveGeneration"];
 private readonly deleteActivePointer!: CacheStatements["deleteActivePointer"];
 private readonly deleteGenerationsExcept!: CacheStatements["deleteGenerationsExcept"];
@@ -2912,13 +2910,8 @@ constructor(dbPath: string) {
       throw new Error(`cache schema is incomplete: missing ${missingObjects.join(", ")}`);
     }
 
-  const selectRawActiveGeneration = db.query<MetaRow, []>(`
-    SELECT value
-    FROM cache_meta
-    WHERE key = 'active_generation'
-  `);
   const selectActiveGeneration = db.query<ActiveGenerationRow, []>(`
-    SELECT generations.id AS id
+    SELECT generations.id AS id, generations.source_fingerprint AS source_fingerprint
     FROM cache_meta
     JOIN generations
       ON generations.id = CAST(cache_meta.value AS INTEGER)
@@ -2932,9 +2925,9 @@ constructor(dbPath: string) {
     DELETE FROM generations WHERE id <> ?
   `);
   const deleteAllGenerations = db.query<never, []>("DELETE FROM generations");
-  const insertGeneration = db.query<never, ["startup" | "watch", number]>(`
-    INSERT INTO generations(state, cause, started_at)
-    VALUES ('building', ?, ?)
+  const insertGeneration = db.query<never, ["startup" | "watch", number, string]>(`
+    INSERT INTO generations(state, cause, started_at, source_fingerprint)
+    VALUES ('building', ?, ?, ?)
   `);
   const upsertPackages = db.query<never, [number, string]>(`
     INSERT INTO package_snapshots(generation_id, packages_json)
@@ -3188,7 +3181,6 @@ constructor(dbPath: string) {
   const graphStore = prepareGraphStore(db);
 
   const statements: Array<{ finalize(): void }> = [
-    selectRawActiveGeneration,
     selectActiveGeneration,
     deleteActivePointer,
     deleteGenerationsExcept,
@@ -3222,7 +3214,6 @@ constructor(dbPath: string) {
     selectDefinitionIndexEntry,
     ...graphStore.statements,
   ];
-  this.selectRawActiveGeneration = selectRawActiveGeneration;
   this.selectActiveGeneration = selectActiveGeneration;
   this.deleteActivePointer = deleteActivePointer;
   this.deleteGenerationsExcept = deleteGenerationsExcept;
@@ -3528,11 +3519,12 @@ constructor(dbPath: string) {
   }
 }
 
-recover(): number | null {
-  const hasPointer = this.selectRawActiveGeneration.get() !== null;
-  const activeGenerationId = this.selectActiveGeneration.get()?.id ?? null;
+recover(sourceFingerprint: string): number | null {
+  const active = this.selectActiveGeneration.get() ?? null;
+  const activeGenerationId =
+    active !== null && active.source_fingerprint === sourceFingerprint ? active.id : null;
   this.recoveryTransaction.immediate(activeGenerationId);
-  return hasPointer ? activeGenerationId : null;
+  return activeGenerationId;
 }
 
 getActiveGenerationId(): number | null {
@@ -3570,8 +3562,8 @@ repairTableForSchemaError(error: unknown): CacheTableName | null {
   return table;
 }
 
-beginGeneration(cause: "startup" | "watch"): number {
-  return Number(this.insertGeneration.run(cause, Date.now()).lastInsertRowid);
+beginGeneration(cause: "startup" | "watch", sourceFingerprint: string): number {
+  return Number(this.insertGeneration.run(cause, Date.now(), sourceFingerprint).lastInsertRowid);
 }
 
 writeDiscovery(

@@ -58,7 +58,7 @@ export async function materializeUmlGraph(
   cacheOrdinal += 1;
   const cache = new Cache(join(cacheDirectory, `.uml-graph-${cacheOrdinal}.sqlite`));
   try {
-    const generationId = cache.beginGeneration("startup");
+    const generationId = cache.beginGeneration("startup", "");
     const cached = cache.writeScope(
       generationId,
       {

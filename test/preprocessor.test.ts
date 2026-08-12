@@ -977,7 +977,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 4,
+      user_version: 5,
     });
     expect(db.query<{
       name: string;
@@ -1453,8 +1453,8 @@ test("rejects unavailable or inconsistent fallback sources without replacing tar
   const cache = new Cache(dbPath);
   let activeCache = cache;
   try {
-    const sourceGenerationId = activeCache.beginGeneration("startup");
-    const targetGenerationId = activeCache.beginGeneration("watch");
+    const sourceGenerationId = activeCache.beginGeneration("startup", "");
+    const targetGenerationId = activeCache.beginGeneration("watch", "");
     const sourceGraph = fixtureUmlGraph("source.ts");
     const targetSourceGraph = fixtureUmlGraph("source.ts");
     const targetSourceSettings = targetSourceGraph.settings;
@@ -1568,7 +1568,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
   const dbPath = join(root, "invalid-graph.db");
   const cache = new Cache(dbPath);
   try {
-    const generationId = cache.beginGeneration("startup");
+    const generationId = cache.beginGeneration("startup", "");
     const scopePath = "constraints.ts";
     const validGraph = fixtureUmlGraph(scopePath);
     cache.writeScope(generationId, {
@@ -2028,17 +2028,21 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   expect(firstErrors).toEqual([]);
   await closePreprocessor(first);
 
-  const activeId = openDatabase(dbPath, (db) => {
-    const activeGeneration = db.query<{ id: number }, []>(`
-      SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
+  const active = openDatabase(dbPath, (db) => {
+    const activeGeneration = db.query<{ id: number; started_at: number }, []>(`
+      SELECT generations.id AS id, generations.started_at AS started_at
+      FROM cache_meta
+      JOIN generations ON generations.id = CAST(cache_meta.value AS INTEGER)
+      WHERE cache_meta.key = 'active_generation'
     `).get();
     if (activeGeneration === null) throw new Error("active generation was not persisted");
-    return activeGeneration.id;
+    return activeGeneration;
   });
+  const activeId = active.id;
   const orphanCache = new Cache(dbPath);
   let orphanId: number;
   try {
-    orphanId = orphanCache.beginGeneration("watch");
+    orphanId = orphanCache.beginGeneration("watch", "");
     orphanCache.writeScope(orphanId, {
       entries: [],
       diagram: { graph: fixtureUmlGraph("orphan.ts"), outcome: { status: "ready" } },
@@ -2103,15 +2107,19 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   const second = trackedPreprocessor(root, () => undefined, (error) => secondErrors.push(error));
   await second.ready();
   await second.whenIdle();
-  expect((await second.search("initial-cache", false)).files).toEqual(["app.js"]);
-  expect((await second.search("after-orphan-recovery", false)).files).toEqual([]);
+  expect((await second.search("after-orphan-recovery", false)).files).toEqual(["app.js"]);
+  expect((await second.search("initial-cache", false)).files).toEqual([]);
   expect(secondErrors).toEqual([]);
-  openDatabase(dbPath, (db) => {
-    expect(db.query<{ id: number; state: string; cause: string }, []>(`
-      SELECT id, state, cause FROM generations ORDER BY id
-    `).all()).toEqual([
-      { id: seeded.activeId, state: "active", cause: "startup" },
-    ]);
+  const restartedId = openDatabase(dbPath, (db) => {
+    const generations = db.query<{ id: number; state: string; cause: string; started_at: number }, []>(`
+      SELECT id, state, cause, started_at FROM generations ORDER BY id
+    `).all();
+    expect(generations).toHaveLength(1);
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("startup generation was not rebuilt");
+    expect(generation).toMatchObject({ state: "active", cause: "startup" });
+    expect(generation.started_at).toBeGreaterThan(active.started_at);
+    return generation.id;
   });
 
   second.rebuild("watch");
@@ -2129,7 +2137,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     const [generation] = generations;
     if (generation === undefined) throw new Error("watch generation was not promoted");
     expect(generation).toMatchObject({ state: "active", cause: "watch" });
-    expect(generation.id).not.toBe(seeded.activeId);
+    expect(generation.id).not.toBe(restartedId);
     expectOnlyNormalizedGeneration(db, generation.id);
   });
 
@@ -2137,7 +2145,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   const invalidPointerCache = new Cache(dbPath);
   let invalidPointerOrphanId: number;
   try {
-    invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch");
+    invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch", "");
     invalidPointerCache.writeScope(invalidPointerOrphanId, {
       entries: [],
       diagram: {
