@@ -334,13 +334,16 @@ test("excludes declarations that have no canonical UML definition target", () =>
   }
 });
 
-test("accepts every supported TypeScript source extension", () => {
+test("accepts every supported source extension", () => {
   for (const path of ["component.ts", "component.tsx", "component.mts", "component.cts"]) {
     expect(
       parseDefinitionSpans(path, "export class Component {}\n").map(({ key }) => key),
       path,
     ).toEqual(['["class","Component",0,null,null]']);
   }
+  expect(
+    parseDefinitionSpans("component.rs", "pub struct Component;\n").map(({ key }) => key),
+  ).toEqual(['["class","Component",0,null,null]']);
 });
 
 test("CRLF sources keep one-based line and column", () => {

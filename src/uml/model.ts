@@ -1,24 +1,44 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
-import type { UmlDiagramGraph } from "../diagram-graph.ts";
+import type { HeritageClause, UmlDependency, UmlDiagramGraph } from "../diagram-graph.ts";
 import type { UmlExternalUser, UmlLocalUser } from "../types.ts";
 
 export type SourceUnit = { path: string; root: Node };
 
-// Numeric values MUST equal ts.ModifierFlags: test/support/uml-contract.ts decodes modifierFlags
-// with the TypeScript enum and reports `unknown:<residual>` for any bit it does not recognise.
-export const UML_MODIFIER_PUBLIC = 1;
-export const UML_MODIFIER_PRIVATE = 2;
-export const UML_MODIFIER_PROTECTED = 4;
-export const UML_MODIFIER_READONLY = 8;
-export const UML_MODIFIER_OVERRIDE = 16;
-export const UML_MODIFIER_ABSTRACT = 64;
-export const UML_MODIFIER_AMBIENT = 128;
-export const UML_MODIFIER_STATIC = 256;
-export const UML_MODIFIER_ACCESSOR = 512;
-export const UML_MODIFIER_ASYNC = 1024;
+/**
+ * Canonical order: a member's modifiers are always emitted in this order, in every language.
+ * `const`, `unsafe` and `mutable` are Rust-only; the rest are shared with TypeScript.
+ */
+export const UML_MODIFIERS = [
+  "ambient",
+  "public",
+  "private",
+  "protected",
+  "abstract",
+  "static",
+  "readonly",
+  "accessor",
+  "async",
+  "const",
+  "override",
+  "unsafe",
+  "mutable",
+] as const;
+
+export type UmlModifier = (typeof UML_MODIFIERS)[number];
+
+const UML_MODIFIER_ORDER: ReadonlyMap<string, number> = new Map(
+  UML_MODIFIERS.map((modifier, index) => [modifier, index]),
+);
+
+/** Deduplicates `modifiers` and sorts them into `UML_MODIFIERS` order. */
+export function orderUmlModifiers(modifiers: Iterable<UmlModifier>): UmlModifier[] {
+  return [...new Set(modifiers)].sort(
+    (left, right) => (UML_MODIFIER_ORDER.get(left) ?? 0) - (UML_MODIFIER_ORDER.get(right) ?? 0),
+  );
+}
 
 export type PropertyDetails = {
-  modifierFlags: number;
+  modifiers: UmlModifier[];
   name: string;
   type?: string;
   typeIds: string[];
@@ -26,19 +46,32 @@ export type PropertyDetails = {
 };
 
 export type MethodDetails = {
-  modifierFlags: number;
+  modifiers: UmlModifier[];
   name: string;
   returnType?: string;
   returnTypeIds?: string[];
 };
 
-export type HeritageClause = {
-  clause: string;
-  clauseTypeId: string;
-  className: string;
-  classTypeId: string;
-  type: 0 | 1;
+/** The parse-time shapes are the persisted row shapes; one declaration serves both. */
+export type { HeritageClause, UmlDependency };
+
+/** A member annotation whose type references resolve once the whole project is parsed. */
+type PendingMemberTypes = {
+  kind: "member";
+  file: string;
+  annotation: Node;
+  assign: (typeIds: string[]) => void;
 };
+
+/** A heritage base name whose target entity resolves once the whole project is parsed. */
+type PendingHeritage = {
+  kind: "heritage";
+  file: string;
+  base: Node;
+  clause: HeritageClause;
+};
+
+export type PendingTypeReference = PendingMemberTypes | PendingHeritage;
 
 type AssociationEnd = {
   typeId: string;
@@ -70,13 +103,6 @@ export type FileDeclaration = {
   types: UmlEntityModel[];
   heritageClauses: HeritageClause[][];
   memberAssociations?: MemberAssociation[];
-};
-
-export type UmlDependency = {
-  sourceId: string;
-  sourceName: string;
-  targetId: string;
-  targetName: string;
 };
 
 export type UmlReference = {

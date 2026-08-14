@@ -1,13 +1,13 @@
 import { dirname, join } from "node:path/posix";
 import type { Node } from "@vscode/tree-sitter-wasm";
+import { firstAncestor, namedChildren } from "../lang/ast.ts";
 import {
   declarationName,
   ENTITY_KIND_BY_NODE,
-  firstAncestor,
-  namedChildren,
   TYPE_REFERENCE_NODE_TYPES,
   typeReferenceNodes,
 } from "../lang/typescript.ts";
+import { analysisLanguageForPath } from "../lang/registry.ts";
 import {
   bareUmlName,
   posix,
@@ -15,6 +15,7 @@ import {
   umlFileKey,
 } from "./keys.ts";
 import type { SourceUnit, UmlReference } from "./model.ts";
+import { collectRustFileScope, rustReferenceNodes } from "./rust-resolve.ts";
 
 export type EntityReference = { file: string; node: Node; target: UmlReference };
 
@@ -197,10 +198,29 @@ export function buildSymbolTable(
   entities: ReadonlyMap<string, UmlReference>,
 ): SymbolTable {
   const byKey = new Map<string, UnitIndex>();
+  // Rust files never enter the TypeScript index: their scopes are per-file name maps keyed the
+  // same way, so a `use` can never bind a TypeScript entity and an `import` can never bind a
+  // Rust one. One table, two disjoint resolution universes.
+  const rustUnits = new Map<string, SourceUnit>();
   for (const unit of units) {
+    if (analysisLanguageForPath(unit.path) === "rust") {
+      rustUnits.set(umlFileKey(unit.path), unit);
+      continue;
+    }
     const index = indexUnit(unit);
     byKey.set(index.key, index);
   }
+  const rustScopes = new Map<string, Map<string, UmlReference>>();
+  const rustScope = (key: string): Map<string, UmlReference> | undefined => {
+    const unit = rustUnits.get(key);
+    if (!unit) return undefined;
+    let scope = rustScopes.get(key);
+    if (!scope) {
+      scope = collectRustFileScope(unit, entities, rustUnits);
+      rustScopes.set(key, scope);
+    }
+    return scope;
+  };
 
   const resolveModule = (fromFile: string, specifier: string): string | undefined => {
     if (!specifier.startsWith("./") && !specifier.startsWith("../")) return undefined;
@@ -277,7 +297,10 @@ export function buildSymbolTable(
   };
 
   const resolve = (file: string, name: string): UmlReference | undefined => {
-    const resolved = resolveDeclaration(umlFileKey(file), name);
+    const key = umlFileKey(file);
+    const scope = rustScope(key);
+    if (scope) return scope.get(name);
+    const resolved = resolveDeclaration(key, name);
     return resolved ? entityOf(resolved) : undefined;
   };
 
@@ -309,9 +332,18 @@ export function buildSymbolTable(
 
   const resolveTypeReferences = (file: string, annotation: Node): UmlReference[] => {
     const key = umlFileKey(file);
+    const scope = rustScope(key);
     const out: UmlReference[] = [];
     const seen = new Set<string>();
     for (const reference of typeReferenceNodes(annotation)) {
+      if (scope) {
+        const entity = scope.get(reference.text);
+        if (entity && !seen.has(entity.id)) {
+          seen.add(entity.id);
+          out.push(entity);
+        }
+        continue;
+      }
       resolveName(key, reference.text, 0, out, seen);
     }
     return out;
@@ -366,6 +398,14 @@ export function buildSymbolTable(
         for (const child of namedChildren(node)) visit(child);
       };
       visit(unit.root);
+    }
+    for (const [key, unit] of rustUnits) {
+      const scope = rustScope(key);
+      if (!scope) continue;
+      for (const node of rustReferenceNodes(unit)) {
+        const target = scope.get(node.text);
+        if (target) collected.push({ file: unit.path, node, target });
+      }
     }
     index = collected;
     return index;

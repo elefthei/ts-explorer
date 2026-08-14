@@ -213,7 +213,7 @@ test("unknown, non-source and out-of-range requests", async () => {
     );
     expect(nonSource).toBeInstanceOf(InputError);
     expect((nonSource as InputError).message).toBe(
-      "only TypeScript and JavaScript source files can be viewed",
+      "only TypeScript, JavaScript, and Rust source files can be viewed",
     );
 
     const content = "export class Shared {\n  run(): void {}\n}\n";

@@ -1,7 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { extractContract, normalizeRoot } from "./support/uml-contract.ts";
+import { extractContract, extractNormalizedGraph } from "./support/uml-contract.ts";
 
 const fixtures = createFixtureTracker();
 
@@ -9,20 +8,8 @@ afterEach(async () => {
   await fixtures.cleanup();
 });
 
-async function fixtureRoot(prefix: string, files: Record<string, string>): Promise<string> {
-  const root = await fixtures.temporaryRoot(prefix);
-  for (const [path, source] of Object.entries(files)) {
-    await fixtures.writeFixtureFile(root, path, source);
-  }
-  return root;
-}
-
-async function extractNormalizedGraph(root: string) {
-  return normalizeRoot(root, await extractUmlDiagramGraph(root, "", []));
-}
-
 test("extracts every entity kind with its members", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-kinds-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-kinds-", {
     "src/model.ts": `export class Widget {
   label = "widget";
   size?: number;
@@ -340,7 +327,7 @@ export interface Container<T> {
 }, 30_000);
 
 test("records decoded modifiers for every member form", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-modifiers-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-modifiers-", {
     "src/members.ts": `export abstract class Members {
   public plain = 1;
   private secret = 2;
@@ -425,7 +412,7 @@ export interface Signatures {
 }, 30_000);
 
 test("merged declarations and overloads share one entity", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-merged-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-merged-", {
     "src/merged.ts": `export interface Merged {
   first(): void;
 }
@@ -613,7 +600,7 @@ export class Overloads {
 }, 30_000);
 
 test("export form does not change entity extraction, and duplicate names stay distinct", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-exports-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-exports-", {
     "src/a.ts": `export class Dup {}
 class Hidden {}
 export default class Named {}
@@ -709,7 +696,7 @@ export { Dup as Aliased };
 }, 30_000);
 
 test("heritage records extends and implements, and unresolved bases become boundary nodes", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-heritage-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-heritage-", {
     "src/vendor.d.ts": `export declare class Missing {}
 `,
     "src/model.ts": `import { Missing } from "./vendor";
@@ -775,7 +762,7 @@ export class Foreign extends Missing {}
 }, 30_000);
 
 test("member associations link entities through property types", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-associations-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-associations-", {
     "src/model.ts": `export class Other {}
 export type Handle = { id: string };
 export class Owner {
@@ -813,7 +800,7 @@ export class Owner {
 }, 30_000);
 
 test("enum items keep their rendered values", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-enums-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-enums-", {
     "src/enums.ts": `export enum Numbers {
   First,
   Second = 5,
@@ -887,7 +874,7 @@ declare enum Ambient {
 }, 30_000);
 
 test("file forms decide what is extracted", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-files-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-files-", {
     "a.ts": `export class InTs {}
 `,
     "b.tsx": `export class InTsx {
@@ -924,7 +911,7 @@ test("file forms decide what is extracted", async () => {
 }, 30_000);
 
 test("entity ids embed the declaring file path", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-ids-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-ids-", {
     "src/model.ts": `export class Widget {}
 export class Box<T> {
   value!: T;
@@ -951,7 +938,7 @@ export class Box<T> {
 }, 30_000);
 
 test("a malformed source file does not lose the rest of the scope", async () => {
-  const root = await fixtureRoot("ts-explorer-contract-malformed-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-malformed-", {
     "src/broken.ts": `export class Broken {
   run(): void {}
 `,

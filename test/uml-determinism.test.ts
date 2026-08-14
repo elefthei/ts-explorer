@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
 import type { UmlDiagramGraph } from "../src/diagram-graph.ts";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
 import { renderUmlDiagramGraph, validateUmlDiagramGraph } from "../src/uml/render.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
 import {
@@ -9,7 +8,7 @@ import {
   expectTopologyRoundTrip,
   materializeUmlGraph,
 } from "./support/normalized-graph.ts";
-import { normalizeRoot } from "./support/uml-contract.ts";
+import { extractNormalizedGraph } from "./support/uml-contract.ts";
 
 const fixtures = createFixtureTracker();
 
@@ -122,18 +121,6 @@ afterEach(async () => {
   await fixtures.cleanup();
 });
 
-async function fixtureRoot(prefix: string, files: Record<string, string>): Promise<string> {
-  const root = await fixtures.temporaryRoot(prefix);
-  for (const [path, source] of Object.entries(files)) {
-    await fixtures.writeFixtureFile(root, path, source);
-  }
-  return root;
-}
-
-async function extractNormalizedGraph(root: string): Promise<UmlDiagramGraph> {
-  return normalizeRoot(root, await extractUmlDiagramGraph(root, "", []));
-}
-
 function expectContiguousOrdinals(
   rows: readonly { [key: string]: unknown }[],
   field: string,
@@ -179,7 +166,7 @@ function expectPersistedRecordContract(graph: UmlDiagramGraph, label: string): v
 }
 
 test("repeated extraction of one tree is identical", async () => {
-  const root = await fixtureRoot("ts-explorer-determinism-repeat-", FIXTURES.usage);
+  const root = await fixtures.fixtureRoot("ts-explorer-determinism-repeat-", FIXTURES.usage);
 
   const first = await extractNormalizedGraph(root);
   const second = await extractNormalizedGraph(root);
@@ -192,8 +179,8 @@ test("repeated extraction of one tree is identical", async () => {
 }, 60_000);
 
 test("two roots with identical content extract identically", async () => {
-  const firstRoot = await fixtureRoot("ts-explorer-determinism-root-a-", FIXTURES.usage);
-  const secondRoot = await fixtureRoot("ts-explorer-determinism-root-b-", FIXTURES.usage);
+  const firstRoot = await fixtures.fixtureRoot("ts-explorer-determinism-root-a-", FIXTURES.usage);
+  const secondRoot = await fixtures.fixtureRoot("ts-explorer-determinism-root-b-", FIXTURES.usage);
 
   const first = await extractNormalizedGraph(firstRoot);
   const second = await extractNormalizedGraph(secondRoot);
@@ -203,7 +190,7 @@ test("two roots with identical content extract identically", async () => {
 
 test("every fixture satisfies the persisted-record contract", async () => {
   for (const [name, files] of Object.entries(FIXTURES)) {
-    const root = await fixtureRoot(`ts-explorer-determinism-${name}-`, files);
+    const root = await fixtures.fixtureRoot(`ts-explorer-determinism-${name}-`, files);
     const graph = await extractNormalizedGraph(root);
 
     expectPersistedRecordContract(graph, name);
@@ -217,7 +204,7 @@ test("every fixture satisfies the persisted-record contract", async () => {
 }, 120_000);
 
 test("community assignment and frame rendering are reproducible", async () => {
-  const root = await fixtureRoot("ts-explorer-determinism-clusters-", FIXTURES.clusters);
+  const root = await fixtures.fixtureRoot("ts-explorer-determinism-clusters-", FIXTURES.clusters);
 
   const first = await extractNormalizedGraph(root);
   const second = await extractNormalizedGraph(root);

@@ -9,16 +9,8 @@ afterEach(async () => {
   await fixtures.cleanup();
 });
 
-async function fixtureRoot(prefix: string, files: Record<string, string>): Promise<string> {
-  const root = await fixtures.temporaryRoot(prefix);
-  for (const [path, source] of Object.entries(files)) {
-    await fixtures.writeFixtureFile(root, path, source);
-  }
-  return root;
-}
-
 test("reference syntaxes that produce usage edges", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-syntax-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-syntax-", {
     "src/targets.ts": `export class ArgTarget {}
 export class NewTarget {}
 export class ParamTarget {}
@@ -97,7 +89,7 @@ export class TypeOnlyUser {
 }, 30_000);
 
 test("method return types are traversed through aliases, unions, intersections, arrays, generics and cycles", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-returns-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-returns-", {
     "src/returns.ts": `export class Direct {}
 export class Wrapped {}
 export class UnionA {}
@@ -222,7 +214,7 @@ export type LiteralHost = {
 }, 30_000);
 
 test("only methods create return dependencies", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-non-methods-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-non-methods-", {
     "src/model.ts": `export class Target {}
 export class Holder {
   factory: () => Target = () => new Target();
@@ -255,7 +247,7 @@ export function make(): Target {
 }, 30_000);
 
 test("unresolved usage endpoints are dropped while heritage keeps a boundary node", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-boundary-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-boundary-", {
     "src/vendor.d.ts": `export declare class Missing {}
 export declare class Absent {}
 `,
@@ -286,7 +278,7 @@ export class Consumer extends Missing {
 }, 30_000);
 
 test("local and external users are grouped by owner signature", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-users-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-users-", {
     "src/inner/model.ts": `export class Widget {}
 `,
     "src/inner/users.ts": `import { Widget } from "./model.ts";
@@ -367,7 +359,7 @@ export function outsider(value: Widget): void {}
 }, 30_000);
 
 test("same-name references resolve to the declaring entity", async () => {
-  const root = await fixtureRoot("ts-explorer-usage-shadowing-", {
+  const root = await fixtures.fixtureRoot("ts-explorer-usage-shadowing-", {
     "src/first.ts": `export class Same {}
 export namespace Space {
   export class Nested {}

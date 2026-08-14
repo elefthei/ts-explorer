@@ -1,3 +1,5 @@
+import type { LanguageId } from "./lang/registry.ts";
+import type { UmlModifier } from "./uml/model.ts";
 import type {
   GotoDefinition,
   GotoDefinitionKind,
@@ -39,15 +41,17 @@ type UmlEntityOccurrence = {
   entityOrdinal: number;
 };
 
-type UmlHeritageFields = {
+/** The persisted heritage row; `src/uml/model.ts` re-exports it as the parse-time shape. */
+export type HeritageClause = {
   clause: string;
   clauseTypeId: string;
   className: string;
   classTypeId: string;
-  clauseType: 0 | 1;
+  relation: "extends" | "implements";
 };
 
-type UmlDependencyFields = {
+/** The persisted dependency row; `src/uml/model.ts` re-exports it as the parse-time shape. */
+export type UmlDependency = {
   sourceId: string;
   sourceName: string;
   targetId: string;
@@ -107,6 +111,7 @@ export type UmlDiagramGraph = DiagramGraphBase & {
   declarations: {
     declarationOrdinal: number;
     fileName: string;
+    language: LanguageId;
     memberAssociationsPresent: boolean;
   }[];
   entities: (UmlEntityOccurrence & {
@@ -114,7 +119,6 @@ export type UmlDiagramGraph = DiagramGraphBase & {
   })[];
   properties: (UmlEntityOccurrence & {
     propertyOrdinal: number;
-    modifierFlags: number;
     name: string;
     type: string | null;
     optional: boolean;
@@ -126,7 +130,6 @@ export type UmlDiagramGraph = DiagramGraphBase & {
   })[];
   methods: (UmlEntityOccurrence & {
     methodOrdinal: number;
-    modifierFlags: number;
     name: string;
     returnType: string | null;
     returnTypeIdsPresent: boolean;
@@ -136,17 +139,23 @@ export type UmlDiagramGraph = DiagramGraphBase & {
     typeIdOrdinal: number;
     typeId: string;
   })[];
+  memberModifiers: (UmlEntityOccurrence & {
+    memberKind: "property" | "method";
+    memberOrdinal: number;
+    modifierOrdinal: number;
+    modifier: UmlModifier;
+  })[];
   enumItems: (UmlEntityOccurrence & {
     itemOrdinal: number;
     value: string;
   })[];
-  entityHeritageClauses: (UmlEntityOccurrence & UmlHeritageFields & {
+  entityHeritageClauses: (UmlEntityOccurrence & HeritageClause & {
     clauseOrdinal: number;
   })[];
   declarationHeritageGroups: (UmlEntityOccurrence & {
     groupOrdinal: number;
   })[];
-  declarationHeritageClauses: (UmlHeritageFields & {
+  declarationHeritageClauses: (HeritageClause & {
     declarationOrdinal: number;
     groupOrdinal: number;
     clauseOrdinal: number;
@@ -169,10 +178,10 @@ export type UmlDiagramGraph = DiagramGraphBase & {
     category: UmlCategoryKind;
     isTest: boolean;
   }[];
-  methodReturnDependencies: (UmlDependencyFields & {
+  methodReturnDependencies: (UmlDependency & {
     dependencyOrdinal: number;
   })[];
-  usageEdges: (UmlDependencyFields & {
+  usageEdges: (UmlDependency & {
     dependencyOrdinal: number;
   })[];
   localUsers: {

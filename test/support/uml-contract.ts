@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import ts from "typescript";
+import type { UmlModifier } from "../../src/uml/model.ts";
 import type { UmlDiagramGraph, UmlEntityKind } from "../../src/diagram-graph.ts";
 import type { PackageInfo, UmlExternalUserKind } from "../../src/types.ts";
 import { extractUmlDiagramGraph } from "../../src/uml.ts";
@@ -54,39 +54,6 @@ export type UmlContract = {
   relations: { kind: string; source: string; target: string }[];
 };
 
-const MODIFIER_FLAGS = [
-  ["export", ts.ModifierFlags.Export],
-  ["ambient", ts.ModifierFlags.Ambient],
-  ["public", ts.ModifierFlags.Public],
-  ["private", ts.ModifierFlags.Private],
-  ["protected", ts.ModifierFlags.Protected],
-  ["abstract", ts.ModifierFlags.Abstract],
-  ["static", ts.ModifierFlags.Static],
-  ["readonly", ts.ModifierFlags.Readonly],
-  ["accessor", ts.ModifierFlags.Accessor],
-  ["async", ts.ModifierFlags.Async],
-  ["default", ts.ModifierFlags.Default],
-  ["const", ts.ModifierFlags.Const],
-  ["override", ts.ModifierFlags.Override],
-  ["in", ts.ModifierFlags.In],
-  ["out", ts.ModifierFlags.Out],
-  ["decorator", ts.ModifierFlags.Decorator],
-  ["deprecated", ts.ModifierFlags.Deprecated],
-] as const satisfies readonly (readonly [string, ts.ModifierFlags])[];
-
-export function decodeModifierFlags(flags: number): string[] {
-  const decoded: string[] = [];
-  let residual = flags;
-  for (const [name, flag] of MODIFIER_FLAGS) {
-    if ((flags & flag) === flag) {
-      decoded.push(name);
-      residual &= ~flag;
-    }
-  }
-  if (residual !== 0) decoded.push(`unknown:${residual}`);
-  return decoded;
-}
-
 export async function normalizeRoot(
   sourceDir: string,
   graph: UmlDiagramGraph,
@@ -96,6 +63,10 @@ export async function normalizeRoot(
   return JSON.parse(
     JSON.stringify(graph).replaceAll(real, "<root>").replaceAll(raw, "<root>"),
   ) as UmlDiagramGraph;
+}
+
+export async function extractNormalizedGraph(sourceDir: string): Promise<UmlDiagramGraph> {
+  return normalizeRoot(sourceDir, await extractUmlDiagramGraph(sourceDir, "", []));
 }
 
 type Occurrence = {
@@ -119,7 +90,8 @@ function groupByOccurrence<Row extends Occurrence>(rows: readonly Row[]): Map<st
   return groups;
 }
 
-function contractFile(fileName: string): string {
+/** Strips the `<root>/` prefix `normalizeRoot` leaves behind, in POSIX form. */
+export function contractFile(fileName: string): string {
   const normalized = fileName.replaceAll("\\", "/");
   return normalized.startsWith("<root>/") ? normalized.slice("<root>/".length) : normalized;
 }
@@ -143,6 +115,18 @@ export function toContract(graph: UmlDiagramGraph): UmlContract {
   const methods = groupByOccurrence(graph.methods);
   const enumItems = groupByOccurrence(graph.enumItems);
   const heritage = groupByOccurrence(graph.entityHeritageClauses);
+  const memberModifiers = new Map<string, UmlModifier[]>();
+  for (const row of graph.memberModifiers) {
+    const memberKey = `${occurrenceKey(row)}\0${row.memberKind}\0${row.memberOrdinal}`;
+    const existing = memberModifiers.get(memberKey);
+    if (existing) existing.push(row.modifier);
+    else memberModifiers.set(memberKey, [row.modifier]);
+  }
+  const modifiersOf = (
+    key: string,
+    memberKind: "property" | "method",
+    memberOrdinal: number,
+  ): UmlModifier[] => memberModifiers.get(`${key}\0${memberKind}\0${memberOrdinal}`) ?? [];
 
   const entities = graph.entities.map((entity): EntityContract => {
     const key = occurrenceKey(entity);
@@ -158,16 +142,16 @@ export function toContract(graph: UmlDiagramGraph): UmlContract {
         name: property.name,
         type: property.type,
         optional: property.optional,
-        modifiers: decodeModifierFlags(property.modifierFlags),
+        modifiers: modifiersOf(key, "property", property.propertyOrdinal),
       })),
       methods: (methods.get(key) ?? []).map((method) => ({
         name: method.name,
         type: method.returnType,
-        modifiers: decodeModifierFlags(method.modifierFlags),
+        modifiers: modifiersOf(key, "method", method.methodOrdinal),
       })),
       enumItems: (enumItems.get(key) ?? []).map((item) => item.value),
       heritage: (heritage.get(key) ?? []).map((clause) => ({
-        kind: clause.clauseType === 0 ? "extends" as const : "implements" as const,
+        kind: clause.relation,
         clause: clause.clause,
         className: clause.className,
       })),

@@ -41,7 +41,7 @@ export function parseCliOptions(args: string[]) {
   const parsed = yargs(args)
     .scriptName("ts-explorer")
     .usage(
-      "$0 <dir> [options]\n\nExplore a TypeScript project in the browser. <dir> is the source directory to explore.",
+      "$0 <dir> [options]\n\nExplore a TypeScript or Rust project in the browser. <dir> is the source directory to explore.",
     )
     .option("host", {
       type: "string",

@@ -12,42 +12,104 @@ function toPosix(path: string): string {
   return path.split(sep).join("/");
 }
 
-async function readManifest(path: string): Promise<Record<string, unknown> | null> {
+type Manifest = Record<string, unknown>;
+
+function table(value: unknown): Manifest | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Manifest : undefined;
+}
+
+async function readManifest(
+  path: string,
+  parse: (text: string) => unknown,
+): Promise<Manifest | undefined> {
   try {
-    const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+    return table(parse(await readFile(path, "utf8")));
   } catch {
-    return null;
+    return undefined;
   }
 }
 
 function workspacePatterns(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
-  if (value && typeof value === "object" && Array.isArray((value as { packages?: unknown }).packages)) {
-    return (value as { packages: unknown[] }).packages.filter((item): item is string => typeof item === "string");
-  }
-  return [];
+  return Array.isArray(value) ? stringList(value) : stringList(table(value)?.packages);
 }
 
-async function expandPattern(root: string, pattern: string): Promise<string[]> {
-  const glob = new Bun.Glob(`${pattern.replace(/\\/g, "/")}/package.json`);
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** Directories under `root` holding `manifest`; the anchored suffix keeps a root match as `""`. */
+async function expandPattern(root: string, pattern: string, manifest: string): Promise<string[]> {
+  const glob = new Bun.Glob(`${pattern.replace(/\\/g, "/")}/${manifest}`);
+  const suffix = `/${manifest}`;
   const matches: string[] = [];
   for await (const match of glob.scan({ cwd: root, onlyFiles: true, dot: true })) {
-    matches.push(toPosix(match).replace(/\/package\.json$/, ""));
+    const path = toPosix(match);
+    matches.push(path.endsWith(suffix) ? path.slice(0, -suffix.length) : path);
   }
   return matches;
 }
 
-export async function discoverPackages(sourceDir: string): Promise<readonly PackageInfo[]> {
-  const root = await realpath(sourceDir).catch(() => sourceDir);
-  const rootManifest = await readManifest(join(root, "package.json"));
+/** Keeps only dependencies that resolve to another discovered package, sorted by name. */
+function resolvePackages(
+  raw: readonly { name: string; path: string; manifest: Manifest }[],
+  fields: readonly string[],
+  dependencyName: (key: string, value: unknown) => string,
+): PackageInfo[] {
+  const names = new Set(raw.map((item) => item.name));
+  return raw.map(({ name, path, manifest }) => {
+    const dependencies = new Set<string>();
+    for (const field of fields) {
+      for (const [key, value] of Object.entries(table(manifest[field]) ?? {})) {
+        const dependency = dependencyName(key, value);
+        if (names.has(dependency)) dependencies.add(dependency);
+      }
+    }
+    return { name, path, dependencies: [...dependencies].sort() };
+  });
+}
+
+/** Cargo crates normalize to the same `PackageInfo`; a missing manifest is not an error. */
+async function discoverCargoPackages(root: string): Promise<PackageInfo[]> {
+  const rootManifest = await readManifest(join(root, "Cargo.toml"), Bun.TOML.parse);
+  if (!rootManifest) return [];
+
+  const workspace = table(rootManifest.workspace);
+  const members = stringList(workspace?.members);
+  const expanded = await Promise.all(
+    members.map((pattern) => expandPattern(root, pattern, "Cargo.toml")),
+  );
+  const excluded = new Set(stringList(workspace?.exclude).map((path) => toPosix(path)));
+  const directories = expanded.flat().filter((path) => !excluded.has(path));
+  if (table(rootManifest.package)?.name) directories.push("");
+
+  const candidates = [...new Set(directories)].sort();
+  const raw: Array<{ name: string; path: string; manifest: Manifest }> = [];
+  for (const path of candidates) {
+    const manifest = path === ""
+      ? rootManifest
+      : await readManifest(join(root, path, "Cargo.toml"), Bun.TOML.parse);
+    const name = manifest && table(manifest.package)?.name;
+    if (!manifest || typeof name !== "string" || !name) continue;
+    raw.push({ name, path: toPosix(path), manifest });
+  }
+  // `alias = { package = "real-name" }` renames a dependency; the real name is the identity.
+  return resolvePackages(raw, ["dependencies", "dev-dependencies", "build-dependencies"], (key, value) => {
+    const renamed = table(value)?.package;
+    return typeof renamed === "string" ? renamed : key;
+  });
+}
+
+async function discoverNpmPackages(root: string): Promise<PackageInfo[]> {
+  const rootManifest = await readManifest(join(root, "package.json"), JSON.parse);
   const rootText = await readFile(join(root, "package.json"), "utf8").catch(() => null);
   if (rootText !== null && !rootManifest) throw new Error("root package.json is malformed");
 
   let directories: string[] = [];
   const patterns = workspacePatterns(rootManifest?.workspaces);
   if (patterns.length) {
-    const expanded = await Promise.all(patterns.map((pattern) => expandPattern(root, pattern)));
+    const expanded = await Promise.all(
+      patterns.map((pattern) => expandPattern(root, pattern, "package.json")),
+    );
     directories = expanded.flat();
   } else {
     const packagesDir = join(root, "packages");
@@ -57,25 +119,31 @@ export async function discoverPackages(sourceDir: string): Promise<readonly Pack
 
   if (!directories.length && rootManifest?.name) directories = [""];
   const candidates = [...new Set(directories)].sort();
-  const raw: Array<{ name: string; path: string; manifest: Record<string, unknown> }> = [];
+  const raw: Array<{ name: string; path: string; manifest: Manifest }> = [];
   for (const path of candidates) {
-    const manifestPath = join(root, path, "package.json");
-    const manifest = await readManifest(manifestPath);
+    const manifest = await readManifest(join(root, path, "package.json"), JSON.parse);
     if (!manifest || typeof manifest.name !== "string" || !manifest.name) continue;
     raw.push({ name: manifest.name, path: toPosix(path), manifest });
   }
-  const names = new Set(raw.map((item) => item.name));
-  const packages = raw.map(({ name, path, manifest }) => {
-    const dependencyNames = new Set<string>();
-    for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
-      const dependencies = manifest[field];
-      if (dependencies && typeof dependencies === "object" && !Array.isArray(dependencies)) {
-        for (const dependency of Object.keys(dependencies)) if (names.has(dependency)) dependencyNames.add(dependency);
-      }
-    }
-    return { name, path, dependencies: [...dependencyNames].sort() };
-  });
-  return packages.sort((left, right) => left.path.localeCompare(right.path));
+  return resolvePackages(
+    raw,
+    ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"],
+    (key) => key,
+  );
+}
+
+export async function discoverPackages(sourceDir: string): Promise<readonly PackageInfo[]> {
+  const root = await realpath(sourceDir).catch(() => sourceDir);
+  const [npm, cargo] = await Promise.all([
+    discoverNpmPackages(root),
+    discoverCargoPackages(root),
+  ]);
+  // Keyed by path with npm winning: a hybrid napi-rs directory carries both manifests and its
+  // consumer-facing identity is the npm name, which keeps every existing npm result unchanged.
+  const byPath = new Map<string, PackageInfo>();
+  for (const pkg of cargo) byPath.set(pkg.path, pkg);
+  for (const pkg of npm) byPath.set(pkg.path, pkg);
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
 export function extractPackageDiagramGraph(

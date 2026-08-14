@@ -57,9 +57,9 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       targetNodeId: "b",
     }],
     declarations: [
-      { declarationOrdinal: 0, fileName: "alpha.ts", memberAssociationsPresent: false },
-      { declarationOrdinal: 1, fileName: "beta.ts", memberAssociationsPresent: false },
-      { declarationOrdinal: 2, fileName: "gamma.ts", memberAssociationsPresent: false },
+      { declarationOrdinal: 0, fileName: "alpha.ts", language: "typescript", memberAssociationsPresent: false },
+      { declarationOrdinal: 1, fileName: "beta.ts", language: "typescript", memberAssociationsPresent: false },
+      { declarationOrdinal: 2, fileName: "gamma.ts", language: "typescript", memberAssociationsPresent: false },
     ],
     entities: [
       { declarationOrdinal: 0, entityKind: "class", entityOrdinal: 0, nodeId: "a" },
@@ -73,7 +73,6 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       entityKind: "class",
       entityOrdinal: 0,
       methodOrdinal: 0,
-      modifierFlags: 0,
       name: "beta",
       returnType: "Beta",
       returnTypeIdsPresent: true,
@@ -86,6 +85,7 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       typeIdOrdinal: 0,
       typeId: "b",
     }],
+    memberModifiers: [],
     enumItems: [],
     entityHeritageClauses: [],
     declarationHeritageGroups: [],
@@ -974,7 +974,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 6,
+      user_version: 7,
     });
     expect(db.query<{
       name: string;
@@ -1312,6 +1312,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: "renderer failure must roll back",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [],
     }, (reloaded) => {
@@ -1351,6 +1352,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: "definition failure must roll back",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [invalidDefinition],
     }, (reloaded) => {
@@ -1398,6 +1400,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: replacementContent,
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [replacementDefinition],
     }, renderDiagramGraph);
@@ -1407,6 +1410,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       displayContent: replacementContent,
       sourceError: null,
       formatError: null,
+      language: "typescript",
     });
     expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
     expect(activeCache.searchFiles(
@@ -1563,6 +1567,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
         displayContent: "baseline",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [],
     }, renderFixtureGraph);
@@ -1620,6 +1625,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
             displayContent: name,
             sourceError: null,
             formatError: null,
+            language: "typescript",
           },
           definitions: [],
         }, (reloaded) => {
@@ -1727,6 +1733,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
           displayContent: name,
           sourceError: null,
           formatError: null,
+          language: "typescript",
         },
         definitions: [],
       }, (reloaded) => {

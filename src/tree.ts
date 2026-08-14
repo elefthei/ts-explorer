@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { normalizeRelativePath, resolveInside } from "./paths.ts";
-import { isSourcePath, isTraversalIgnoredPath } from "./source.ts";
+import { isCargoTargetPath, isSourcePath, isTraversalIgnoredPath } from "./source.ts";
 import type { TreeNode } from "./types.ts";
 
 function compareTreeNodes(left: TreeNode, right: TreeNode): number {
@@ -24,7 +24,11 @@ export async function readDirectoryEntries(
         normalizedScopePath ? `${normalizedScopePath}/${entry.name}` : entry.name,
       );
       if (isTraversalIgnoredPath(path)) return undefined;
-      if (entry.isDirectory()) return { name: entry.name, path, kind: "directory" };
+      if (entry.isDirectory()) {
+        return isCargoTargetPath(`${directory}/${entry.name}`)
+          ? undefined
+          : { name: entry.name, path, kind: "directory" };
+      }
       if (!entry.isFile()) return undefined;
       return { name: entry.name, path, kind: "file", viewable: isSourcePath(path) };
     })

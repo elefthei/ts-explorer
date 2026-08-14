@@ -1,14 +1,11 @@
-import {
-  type FileDeclaration,
-  type HeritageClause,
-  type MemberAssociation,
-  type MethodDetails,
-  type PropertyDetails,
-  UML_MODIFIER_ABSTRACT,
-  UML_MODIFIER_PRIVATE,
-  UML_MODIFIER_PROTECTED,
-  UML_MODIFIER_STATIC,
-  type UmlEntityModel,
+import type {
+  FileDeclaration,
+  HeritageClause,
+  MemberAssociation,
+  MethodDetails,
+  PropertyDetails,
+  UmlEntityModel,
+  UmlModifier,
 } from "./model.ts";
 
 // Ported verbatim from tsuml2's mermaid template: the brace replacements are deliberately
@@ -17,15 +14,15 @@ function escapeMermaid(value: string): string {
   return value.replace(/[<>]/g, "~").replace("{", "#123;").replace("}", "#125;");
 }
 
-function applyModifiers(modifierFlags: number, text: string): string {
+function applyModifiers(modifiers: readonly UmlModifier[], text: string): string {
   let result = "";
-  if (modifierFlags & UML_MODIFIER_PRIVATE) result = "-";
-  else if (modifierFlags & UML_MODIFIER_PROTECTED) result = "#";
+  if (modifiers.includes("private")) result = "-";
+  else if (modifiers.includes("protected")) result = "#";
   else result = "+";
   result += text;
   // UML2: a static member is underlined, an abstract member is italic.
-  if (modifierFlags & UML_MODIFIER_STATIC) result += "$";
-  if (modifierFlags & UML_MODIFIER_ABSTRACT) result += "*";
+  if (modifiers.includes("static")) result += "$";
+  if (modifiers.includes("abstract")) result += "*";
   return result;
 }
 
@@ -35,13 +32,13 @@ function propertyRow(property: PropertyDetails): string {
     if (property.optional) result += "?";
     result += `: ${escapeMermaid(property.type)}`;
   }
-  return applyModifiers(property.modifierFlags, result);
+  return applyModifiers(property.modifiers, result);
 }
 
 function methodRow(method: MethodDetails): string {
   let result = `${method.name}()`;
   if (method.returnType) result += ` ${escapeMermaid(method.returnType)}`;
-  return applyModifiers(method.modifierFlags, result);
+  return applyModifiers(method.modifiers, result);
 }
 
 function members(entity: UmlEntityModel): { props: string; methods: string } {
@@ -76,7 +73,7 @@ function enumBlock(entity: UmlEntityModel): string {
 }
 
 function heritageRow(clause: HeritageClause): string {
-  const separator = clause.type === 0 ? "<|--" : "<|..";
+  const separator = clause.relation === "extends" ? "<|--" : "<|..";
   return `${escapeMermaid(clause.clause)}${separator}${escapeMermaid(clause.className)}`;
 }
 

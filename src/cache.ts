@@ -8,6 +8,8 @@ import {
   type RenderedDiagram,
   type UmlDiagramGraph,
 } from "./diagram-graph.ts";
+import type { LanguageId } from "./lang/registry.ts";
+import type { UmlModifier } from "./uml/model.ts";
 import { normalizeRelativePath } from "./paths.ts";
 import { validatePackageDiagramGraph } from "./packages.ts";
 import { buildSearchScopes } from "./search.ts";
@@ -24,7 +26,7 @@ import type {
 } from "./types.ts";
 import { validateUmlDiagramGraph } from "./uml/render.ts";
 
-const CACHE_SCHEMA_VERSION = 6;
+const CACHE_SCHEMA_VERSION = 7;
 
 export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
@@ -59,6 +61,7 @@ export type CacheFileWrite = {
   displayContent: string | null;
   sourceError: string | null;
   formatError: string | null;
+  language: LanguageId | null;
 };
 
 export type DefinitionIndexWrite = {
@@ -94,6 +97,7 @@ type FileRow = {
   display_content: string | null;
   source_error: string | null;
   format_error: string | null;
+  language: LanguageId | null;
 };
 type SearchCandidateRow = { path: string; raw_content: string };
 type GotoDefinitionRow = {
@@ -162,7 +166,15 @@ type CacheStatements = {
   >;
   upsertFile: Statement<
     never,
-    [number, string, string | null, string | null, string | null, string | null]
+    [
+      number,
+      string,
+      string | null,
+      string | null,
+      string | null,
+      string | null,
+      LanguageId | null,
+    ]
   >;
   deleteScopeGotoDefs: Statement<never, [number, string]>;
   insertGotoDefinition: Statement<
@@ -407,6 +419,9 @@ const CACHE_SCHEMA_OBJECTS = [
       scope_path TEXT NOT NULL,
       declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
       file_name TEXT NOT NULL,
+      language TEXT NOT NULL CHECK (
+        language IN ('typescript', 'tsx', 'javascript', 'rust')
+      ),
       member_associations_present INTEGER NOT NULL CHECK (member_associations_present IN (0, 1)),
       PRIMARY KEY (generation_id, kind, scope_path, declaration_ordinal),
       UNIQUE (generation_id, kind, scope_path, file_name),
@@ -451,7 +466,6 @@ const CACHE_SCHEMA_OBJECTS = [
       entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       property_ordinal INTEGER NOT NULL CHECK (property_ordinal >= 0),
-      modifier_flags INTEGER NOT NULL CHECK (modifier_flags >= 0),
       name TEXT NOT NULL,
       type TEXT,
       optional INTEGER NOT NULL CHECK (optional IN (0, 1)),
@@ -534,7 +548,6 @@ const CACHE_SCHEMA_OBJECTS = [
       entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       method_ordinal INTEGER NOT NULL CHECK (method_ordinal >= 0),
-      modifier_flags INTEGER NOT NULL CHECK (modifier_flags >= 0),
       name TEXT NOT NULL,
       return_type TEXT,
       return_type_ids_present INTEGER NOT NULL CHECK (return_type_ids_present IN (0, 1)),
@@ -607,6 +620,53 @@ const CACHE_SCHEMA_OBJECTS = [
     )`,
   },
   {
+    name: "uml_member_modifiers",
+    kind: "table",
+    createSql: `CREATE TABLE uml_member_modifiers (
+      generation_id INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK (kind = 'uml'),
+      scope_path TEXT NOT NULL,
+      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
+      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
+      entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
+      member_kind TEXT NOT NULL CHECK (member_kind IN ('property', 'method')),
+      member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+      modifier_ordinal INTEGER NOT NULL CHECK (modifier_ordinal >= 0),
+      modifier TEXT NOT NULL CHECK (
+        modifier IN (
+          'ambient', 'public', 'private', 'protected', 'abstract', 'static',
+          'readonly', 'accessor', 'async', 'const', 'override', 'unsafe', 'mutable'
+        )
+      ),
+      PRIMARY KEY (
+        generation_id,
+        kind,
+        scope_path,
+        declaration_ordinal,
+        entity_kind,
+        entity_ordinal,
+        member_kind,
+        member_ordinal,
+        modifier_ordinal
+      ),
+      FOREIGN KEY (
+        generation_id,
+        kind,
+        scope_path,
+        declaration_ordinal,
+        entity_kind,
+        entity_ordinal
+      ) REFERENCES uml_entities(
+        generation_id,
+        kind,
+        scope_path,
+        declaration_ordinal,
+        entity_kind,
+        entity_ordinal
+      ) ON DELETE CASCADE
+    )`,
+  },
+  {
     name: "uml_enum_items",
     kind: "table",
     createSql: `CREATE TABLE uml_enum_items (
@@ -659,7 +719,7 @@ const CACHE_SCHEMA_OBJECTS = [
       clause_type_id TEXT NOT NULL,
       class_name TEXT NOT NULL,
       class_type_id TEXT NOT NULL,
-      clause_type INTEGER NOT NULL CHECK (clause_type IN (0, 1)),
+      relation TEXT NOT NULL CHECK (relation IN ('extends', 'implements')),
       PRIMARY KEY (
         generation_id,
         kind,
@@ -743,7 +803,7 @@ const CACHE_SCHEMA_OBJECTS = [
       clause_type_id TEXT NOT NULL,
       class_name TEXT NOT NULL,
       class_type_id TEXT NOT NULL,
-      clause_type INTEGER NOT NULL CHECK (clause_type IN (0, 1)),
+      relation TEXT NOT NULL CHECK (relation IN ('extends', 'implements')),
       PRIMARY KEY (
         generation_id,
         kind,
@@ -991,6 +1051,9 @@ const CACHE_SCHEMA_OBJECTS = [
       display_content TEXT,
       source_error TEXT,
       format_error TEXT,
+      language TEXT CHECK (
+        language IS NULL OR language IN ('typescript', 'tsx', 'javascript', 'rust')
+      ),
       UNIQUE (generation_id, path)
     )`,
   },
@@ -1344,12 +1407,12 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   `);
   const insertUmlDeclaration = db.query<
     never,
-    [number, "uml", string, number, string, number]
+    [number, "uml", string, number, string, LanguageId, number]
   >(`
     INSERT INTO uml_declarations(
-      generation_id, kind, scope_path, declaration_ordinal, file_name,
+      generation_id, kind, scope_path, declaration_ordinal, file_name, language,
       member_associations_present
-    ) VALUES (?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlEntity = db.query<
     never,
@@ -1378,7 +1441,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       UmlDiagramGraph["properties"][number]["entityKind"],
       number,
       number,
-      number,
       string,
       string | null,
       number,
@@ -1386,8 +1448,8 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   >(`
     INSERT INTO uml_properties(
       generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, property_ordinal, modifier_flags, name, type, optional
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      entity_ordinal, property_ordinal, name, type, optional
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlPropertyTypeId = db.query<
     never,
@@ -1418,7 +1480,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       UmlDiagramGraph["methods"][number]["entityKind"],
       number,
       number,
-      number,
       string,
       string | null,
       number,
@@ -1426,9 +1487,9 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   >(`
     INSERT INTO uml_methods(
       generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, method_ordinal, modifier_flags, name, return_type,
+      entity_ordinal, method_ordinal, name, return_type,
       return_type_ids_present
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlMethodReturnTypeId = db.query<
     never,
@@ -1448,6 +1509,26 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       generation_id, kind, scope_path, declaration_ordinal, entity_kind,
       entity_ordinal, method_ordinal, type_id_ordinal, type_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertUmlMemberModifier = db.query<
+    never,
+    [
+      number,
+      "uml",
+      string,
+      number,
+      UmlDiagramGraph["memberModifiers"][number]["entityKind"],
+      number,
+      UmlDiagramGraph["memberModifiers"][number]["memberKind"],
+      number,
+      number,
+      UmlModifier,
+    ]
+  >(`
+    INSERT INTO uml_member_modifiers(
+      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
+      entity_ordinal, member_kind, member_ordinal, modifier_ordinal, modifier
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlEnumItem = db.query<
     never,
@@ -1481,13 +1562,13 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       string,
       string,
       string,
-      number,
+      UmlDiagramGraph["entityHeritageClauses"][number]["relation"],
     ]
   >(`
     INSERT INTO uml_entity_heritage_clauses(
       generation_id, kind, scope_path, declaration_ordinal, entity_kind,
       entity_ordinal, clause_ordinal, clause, clause_type_id, class_name,
-      class_type_id, clause_type
+      class_type_id, relation
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlDeclarationHeritageGroup = db.query<
@@ -1509,11 +1590,23 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   `);
   const insertUmlDeclarationHeritageClause = db.query<
     never,
-    [number, "uml", string, number, number, number, string, string, string, string, number]
+    [
+      number,
+      "uml",
+      string,
+      number,
+      number,
+      number,
+      string,
+      string,
+      string,
+      string,
+      UmlDiagramGraph["declarationHeritageClauses"][number]["relation"],
+    ]
   >(`
     INSERT INTO uml_declaration_heritage_clauses(
       generation_id, kind, scope_path, declaration_ordinal, group_ordinal,
-      clause_ordinal, clause, clause_type_id, class_name, class_type_id, clause_type
+      clause_ordinal, clause, clause_type_id, class_name, class_type_id, relation
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlMemberAssociation = db.query<
@@ -1734,6 +1827,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     SELECT
       declaration_ordinal AS declarationOrdinal,
       file_name AS fileName,
+      language,
       member_associations_present AS memberAssociationsPresent
     FROM uml_declarations
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
@@ -1759,7 +1853,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       property_ordinal AS propertyOrdinal,
-      modifier_flags AS modifierFlags,
       name,
       type,
       optional
@@ -1799,7 +1892,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       method_ordinal AS methodOrdinal,
-      modifier_flags AS modifierFlags,
       name,
       return_type AS returnType,
       return_type_ids_present AS returnTypeIdsPresent
@@ -1833,6 +1925,29 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       method_ordinal,
       type_id_ordinal
   `);
+  const selectUmlMemberModifiers = db.query<
+    UmlDiagramGraph["memberModifiers"][number],
+    GraphIdentity
+  >(`
+    SELECT
+      declaration_ordinal AS declarationOrdinal,
+      entity_kind AS entityKind,
+      entity_ordinal AS entityOrdinal,
+      member_kind AS memberKind,
+      member_ordinal AS memberOrdinal,
+      modifier_ordinal AS modifierOrdinal,
+      modifier
+    FROM uml_member_modifiers
+    WHERE generation_id = ? AND kind = ? AND scope_path = ?
+    ORDER BY declaration_ordinal,
+      CASE entity_kind
+        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
+      END,
+      entity_ordinal,
+      CASE member_kind WHEN 'property' THEN 0 ELSE 1 END,
+      member_ordinal,
+      modifier_ordinal
+  `);
   const selectUmlEnumItems = db.query<UmlDiagramGraph["enumItems"][number], GraphIdentity>(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
@@ -1857,7 +1972,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       clause_type_id AS clauseTypeId,
       class_name AS className,
       class_type_id AS classTypeId,
-      clause_type AS clauseType
+      relation
     FROM uml_entity_heritage_clauses
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY declaration_ordinal,
@@ -1890,7 +2005,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       clause_type_id AS clauseTypeId,
       class_name AS className,
       class_type_id AS classTypeId,
-      clause_type AS clauseType
+      relation
     FROM uml_declaration_heritage_clauses
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY declaration_ordinal, group_ordinal, clause_ordinal
@@ -2061,6 +2176,9 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       OR EXISTS(SELECT 1 FROM uml_method_return_type_ids AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
+      OR EXISTS(SELECT 1 FROM uml_member_modifiers AS rows JOIN identity
+        ON identity.generation_id = rows.generation_id
+        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_enum_items AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
@@ -2117,6 +2235,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     insertUmlPropertyTypeId,
     insertUmlMethod,
     insertUmlMethodReturnTypeId,
+    insertUmlMemberModifier,
     insertUmlEnumItem,
     insertUmlEntityHeritage,
     insertUmlDeclarationHeritageGroup,
@@ -2142,6 +2261,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     selectUmlPropertyTypeIds,
     selectUmlMethods,
     selectUmlMethodReturnTypeIds,
+    selectUmlMemberModifiers,
     selectUmlEnumItems,
     selectUmlEntityHeritage,
     selectUmlDeclarationHeritageGroups,
@@ -2219,6 +2339,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           ...umlIdentity,
           declaration.declarationOrdinal,
           declaration.fileName,
+          declaration.language,
           sqliteBoolean(
             declaration.memberAssociationsPresent,
             "UML member-associations presence flag",
@@ -2241,7 +2362,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           property.entityKind,
           property.entityOrdinal,
           property.propertyOrdinal,
-          property.modifierFlags,
           property.name,
           property.type,
           sqliteBoolean(property.optional, "UML property optional flag"),
@@ -2265,7 +2385,6 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           method.entityKind,
           method.entityOrdinal,
           method.methodOrdinal,
-          method.modifierFlags,
           method.name,
           method.returnType,
           sqliteBoolean(method.returnTypeIdsPresent, "UML return-type-IDs presence flag"),
@@ -2280,6 +2399,18 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           typeId.methodOrdinal,
           typeId.typeIdOrdinal,
           typeId.typeId,
+        );
+      }
+      for (const modifier of graph.memberModifiers) {
+        insertUmlMemberModifier.run(
+          ...umlIdentity,
+          modifier.declarationOrdinal,
+          modifier.entityKind,
+          modifier.entityOrdinal,
+          modifier.memberKind,
+          modifier.memberOrdinal,
+          modifier.modifierOrdinal,
+          modifier.modifier,
         );
       }
       for (const item of graph.enumItems) {
@@ -2303,7 +2434,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           clause.clauseTypeId,
           clause.className,
           clause.classTypeId,
-          clause.clauseType,
+          clause.relation,
         );
       }
       for (const group of graph.declarationHeritageGroups) {
@@ -2325,7 +2456,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           clause.clauseTypeId,
           clause.className,
           clause.classTypeId,
-          clause.clauseType,
+          clause.relation,
         );
       }
       for (const association of graph.memberAssociations) {
@@ -2486,6 +2617,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
           returnTypeIdsPresent: row.returnTypeIdsPresent !== 0,
         })),
         methodReturnTypeIds: selectUmlMethodReturnTypeIds.all(...identity),
+        memberModifiers: selectUmlMemberModifiers.all(...identity),
         enumItems: selectUmlEnumItems.all(...identity),
         entityHeritageClauses: selectUmlEntityHeritage.all(...identity),
         declarationHeritageGroups: selectUmlDeclarationHeritageGroups.all(...identity),
@@ -2547,6 +2679,7 @@ function assertGraphIdentity(
       "propertyTypeIds",
       "methods",
       "methodReturnTypeIds",
+      "memberModifiers",
       "enumItems",
       "entityHeritageClauses",
       "declarationHeritageGroups",
@@ -2569,6 +2702,7 @@ function assertGraphIdentity(
       || "propertyTypeIds" in candidate
       || "methods" in candidate
       || "methodReturnTypeIds" in candidate
+      || "memberModifiers" in candidate
       || "enumItems" in candidate
       || "entityHeritageClauses" in candidate
       || "declarationHeritageGroups" in candidate
@@ -2784,20 +2918,33 @@ constructor(dbPath: string) {
     ON CONFLICT(generation_id, kind, scope_path) DO UPDATE SET
       response_json = excluded.response_json
   `);
-  const upsertFile = db.query<never, [number, string, string | null, string | null, string | null, string | null]>(`
+  const upsertFile = db.query<
+    never,
+    [
+      number,
+      string,
+      string | null,
+      string | null,
+      string | null,
+      string | null,
+      LanguageId | null,
+    ]
+  >(`
     INSERT INTO files(
       generation_id,
       path,
       raw_content,
       display_content,
       source_error,
-      format_error
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      format_error,
+      language
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(generation_id, path) DO UPDATE SET
       raw_content = excluded.raw_content,
       display_content = excluded.display_content,
       source_error = excluded.source_error,
-      format_error = excluded.format_error
+      format_error = excluded.format_error,
+      language = excluded.language
   `);
   const deleteScopeGotoDefs = db.query<never, [number, string]>(`
     DELETE FROM GotoDef WHERE generation_id = ? AND source_path = ?
@@ -2891,7 +3038,7 @@ constructor(dbPath: string) {
     LIMIT 1
   `);
   const selectFile = db.query<FileRow, [number, string]>(`
-    SELECT path, raw_content, display_content, source_error, format_error
+    SELECT path, raw_content, display_content, source_error, format_error, language
     FROM files
     WHERE generation_id = ? AND path = ?
   `);
@@ -3299,6 +3446,7 @@ constructor(dbPath: string) {
         file.displayContent,
         file.sourceError,
         file.formatError,
+        file.language,
       );
       for (const definition of scope.definitions) {
         this.insertGotoDefinition.run(
@@ -3475,6 +3623,7 @@ readFile(generationId: number, path: string): CacheFileWrite | null {
     displayContent: row.display_content,
     sourceError: row.source_error,
     formatError: row.format_error,
+    language: row.language,
   };
 }
 

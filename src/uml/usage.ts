@@ -1,15 +1,16 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
+import { firstAncestor, namedChildren } from "../lang/ast.ts";
 import {
   annotationType,
   declarationName,
   ENTITY_KIND_BY_NODE,
-  firstAncestor,
   isAccessor,
   METHOD_NODE_TYPES,
   memberName,
-  namedChildren,
   topLevelDeclarations,
 } from "../lang/typescript.ts";
+import { analysisLanguageForPath } from "../lang/registry.ts";
+import { rustTopLevelItems } from "../lang/rust.ts";
 import { isDeclarationPath } from "../source.ts";
 import type {
   GotoDefinition,
@@ -33,6 +34,7 @@ import type {
   UmlReference,
 } from "./model.ts";
 import { parseSourceUnits } from "./parse.ts";
+import { classifyRustReferenceOwner, rustMethodReturnAnnotations } from "./rust-usage.ts";
 import { buildSymbolTable, type EntityReference, type SymbolTable } from "./resolve.ts";
 
 type ReferenceOwner = {
@@ -312,6 +314,25 @@ function classifyReferenceOwner(
   return undefined;
 }
 
+/** The Rust classifier's result in the shape `collectUsageGraph` consumes. */
+function rustReferenceOwner(
+  reference: Node,
+  file: string,
+  sourceDir: string,
+): ReferenceOwner | undefined {
+  const owner = classifyRustReferenceOwner(reference);
+  if (!owner) return undefined;
+  return {
+    scopePath: scopeRelativePath(sourceDir, file),
+    signature: owner.signature,
+    kind: owner.kind,
+    source: referenceSource(sourceDir, file, owner.source),
+    ...(owner.ownerName === undefined
+      ? {}
+      : { ownerEntityKey: umlEntityKey(file, bareUmlName(owner.ownerName)) }),
+  };
+}
+
 function collectUsageGraph(
   sourceDir: string,
   inScopeFiles: ReadonlySet<string>,
@@ -349,7 +370,9 @@ function collectUsageGraph(
   }>();
 
   for (const reference of references) {
-    const user = classifyReferenceOwner(reference.node, reference.file, sourceDir, entityKeyOf);
+    const user = analysisLanguageForPath(reference.file) === "rust"
+      ? rustReferenceOwner(reference.node, reference.file, sourceDir)
+      : classifyReferenceOwner(reference.node, reference.file, sourceDir, entityKeyOf);
     if (!user) continue;
     const ownerDeclaration = enclosingEntityDeclaration(reference.node);
     const userEntity = user.ownerEntityKey ? entities.get(user.ownerEntityKey) : undefined;
@@ -496,9 +519,31 @@ export function analyzeUmlTypes(input: UmlAnalysisInput): {
 
     const methodReturnDependencies: UmlDependency[] = [];
     const dependencyKeys = new Set<string>();
+    const addMethodReturns = (path: string, source: UmlReference, annotation: Node): void => {
+      for (const target of symbols.resolveTypeReferences(path, annotation)) {
+        if (source.id === target.id) continue;
+        const dependencyKey = `${source.id}\0${target.id}`;
+        if (dependencyKeys.has(dependencyKey)) continue;
+        dependencyKeys.add(dependencyKey);
+        methodReturnDependencies.push({
+          sourceId: source.id,
+          sourceName: source.name,
+          targetId: target.id,
+          targetName: target.name,
+        });
+      }
+    };
     for (const file of sourceFiles) {
       const unit = parsed.byKey.get(umlFileKey(file));
       if (!unit) continue;
+      if (analysisLanguageForPath(unit.path) === "rust") {
+        for (const owner of rustMethodReturnAnnotations(rustTopLevelItems(unit.root))) {
+          const source = entities.get(umlEntityKey(unit.path, bareUmlName(owner.ownerName)));
+          if (!source) continue;
+          addMethodReturns(unit.path, source, owner.annotation);
+        }
+        continue;
+      }
       for (const declaration of topLevelDeclarations(unit.root)) {
         if (!ENTITY_DECLARATION_TYPES.has(declaration.type)) continue;
         const key = entityKeyOf(declaration, unit.path);
@@ -511,18 +556,7 @@ export function analyzeUmlTypes(input: UmlAnalysisInput): {
         for (const method of methodNodes(declaration)) {
           const annotation = annotationType(method, "return_type");
           if (!annotation) continue;
-          for (const target of symbols.resolveTypeReferences(unit.path, annotation)) {
-            if (source.id === target.id) continue;
-            const dependencyKey = `${source.id}\0${target.id}`;
-            if (dependencyKeys.has(dependencyKey)) continue;
-            dependencyKeys.add(dependencyKey);
-            methodReturnDependencies.push({
-              sourceId: source.id,
-              sourceName: source.name,
-              targetId: target.id,
-              targetName: target.name,
-            });
-          }
+          addMethodReturns(unit.path, source, annotation);
         }
       }
     }

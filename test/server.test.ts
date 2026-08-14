@@ -1027,7 +1027,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     const unsupported = await fetch(`${base}/api/file?path=packages%2Fdemo%2Fsrc%2Fliteral.txt`);
     expect(unsupported.status).toBe(422);
     expect(await unsupported.json()).toEqual({
-      error: "only TypeScript and JavaScript source files can be viewed",
+      error: "only TypeScript, JavaScript, and Rust source files can be viewed",
     });
 
     const removedRoutes = [

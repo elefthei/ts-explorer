@@ -5,8 +5,14 @@ import {
   type UmlEntityKind,
 } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
+import { analysisLanguageForPath } from "./lang/registry.ts";
 import { resolveInside } from "./paths.ts";
-import { decodeSourceBytes, isDeclarationPath, isUmlIgnoredPath } from "./source.ts";
+import {
+  decodeSourceBytes,
+  isCargoTargetPath,
+  isDeclarationPath,
+  isUmlIgnoredPath,
+} from "./source.ts";
 import type { PackageInfo } from "./types.ts";
 import { parseUmlAssociations, removeSelfMemberAssociations } from "./uml/associations.ts";
 import { UML_ENTITY_COLLECTIONS } from "./uml/entities.ts";
@@ -38,14 +44,28 @@ const CATEGORY_ENTITY_COLLECTIONS = [
   UML_ENTITY_COLLECTIONS[0],
 ] as const;
 
+/** Language of a declaration file; every UML declaration comes from an analysable source file. */
+function declarationLanguage(fileName: string): UmlDiagramGraph["declarations"][number]["language"] {
+  const language = analysisLanguageForPath(fileName);
+  if (!language) throw new Error(`UML declaration file has no language: ${fileName}`);
+  return language;
+}
 
-async function findTsFiles(scope: string): Promise<string[]> {
+async function findSourceFiles(scope: string): Promise<string[]> {
   const info = await stat(scope);
-  if (info.isFile()) return isDeclarationPath(scope) || isUmlIgnoredPath(scope) ? [] : [scope];
+  if (info.isFile()) {
+    return isDeclarationPath(scope)
+        || isUmlIgnoredPath(scope)
+        || isCargoTargetPath(scope)
+        || analysisLanguageForPath(scope) === undefined
+      ? []
+      : [scope];
+  }
   const files: string[] = [];
-  const glob = new Bun.Glob("**/*.{ts,tsx,mts,cts}");
+  const glob = new Bun.Glob("**/*.{ts,tsx,mts,cts,rs}");
   for await (const file of glob.scan({ cwd: scope, absolute: true, onlyFiles: true, dot: true })) {
-    if (!isDeclarationPath(file) && !isUmlIgnoredPath(file)) files.push(file);
+    if (isDeclarationPath(file) || isUmlIgnoredPath(file) || isCargoTargetPath(file)) continue;
+    files.push(file);
   }
   return files.sort();
 }
@@ -144,6 +164,7 @@ type UmlModelRows = Pick<
   | "propertyTypeIds"
   | "methods"
   | "methodReturnTypeIds"
+  | "memberModifiers"
   | "enumItems"
   | "entityHeritageClauses"
   | "declarationHeritageGroups"
@@ -160,6 +181,7 @@ function emptyUmlModelRows(): UmlModelRows {
     propertyTypeIds: [],
     methods: [],
     methodReturnTypeIds: [],
+    memberModifiers: [],
     enumItems: [],
     entityHeritageClauses: [],
     declarationHeritageGroups: [],
@@ -172,17 +194,17 @@ function serializeHeritageClause(
   clause: HeritageClause,
 ): Pick<
   UmlDiagramGraph["entityHeritageClauses"][number],
-  "clause" | "clauseTypeId" | "className" | "classTypeId" | "clauseType"
+  "clause" | "clauseTypeId" | "className" | "classTypeId" | "relation"
 > {
-  if (clause.type !== 0 && clause.type !== 1) {
-    throw new Error(`Invalid UML heritage clause type: ${String(clause.type)}`);
+  if (clause.relation !== "extends" && clause.relation !== "implements") {
+    throw new Error(`Invalid UML heritage clause relation: ${String(clause.relation)}`);
   }
   return {
     clause: clause.clause,
     clauseTypeId: clause.clauseTypeId,
     className: clause.className,
     classTypeId: clause.classTypeId,
-    clauseType: clause.type,
+    relation: clause.relation,
   };
 }
 
@@ -217,11 +239,21 @@ function serializeEntity(
       entityKind,
       entityOrdinal,
       propertyOrdinal,
-      modifierFlags: property.modifierFlags,
       name: property.name,
       type: property.type ?? null,
       optional: property.optional,
     });
+    for (const [modifierOrdinal, modifier] of property.modifiers.entries()) {
+      rows.memberModifiers.push({
+        declarationOrdinal,
+        entityKind,
+        entityOrdinal,
+        memberKind: "property",
+        memberOrdinal: propertyOrdinal,
+        modifierOrdinal,
+        modifier,
+      });
+    }
     for (const [typeIdOrdinal, typeId] of property.typeIds.entries()) {
       rows.propertyTypeIds.push({
         declarationOrdinal,
@@ -239,11 +271,21 @@ function serializeEntity(
       entityKind,
       entityOrdinal,
       methodOrdinal,
-      modifierFlags: method.modifierFlags,
       name: method.name,
       returnType: method.returnType ?? null,
       returnTypeIdsPresent: method.returnTypeIds !== undefined,
     });
+    for (const [modifierOrdinal, modifier] of method.modifiers.entries()) {
+      rows.memberModifiers.push({
+        declarationOrdinal,
+        entityKind,
+        entityOrdinal,
+        memberKind: "method",
+        memberOrdinal: methodOrdinal,
+        modifierOrdinal,
+        modifier,
+      });
+    }
     for (const [typeIdOrdinal, typeId] of (method.returnTypeIds ?? []).entries()) {
       rows.methodReturnTypeIds.push({
         declarationOrdinal,
@@ -272,6 +314,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
     rows.declarations.push({
       declarationOrdinal,
       fileName: declaration.fileName,
+      language: declarationLanguage(declaration.fileName),
       memberAssociationsPresent: declaration.memberAssociations !== undefined,
     });
     const heritageOwners = new Map<
@@ -387,8 +430,8 @@ export async function extractUmlDiagramGraph(
 ): Promise<UmlDiagramGraph> {
   const canonicalSourceDir = await resolveInside(sourceDir, "", true);
   const selected = scopePath ? await resolveInside(canonicalSourceDir, scopePath, true) : canonicalSourceDir;
-  const files = await findTsFiles(selected);
-  const projectFiles = selected === canonicalSourceDir ? files : await findTsFiles(canonicalSourceDir);
+  const files = await findSourceFiles(selected);
+  const projectFiles = selected === canonicalSourceDir ? files : await findSourceFiles(canonicalSourceDir);
   const normalizedScopePath = posix(scopePath);
   const selectedPackage = packageForScope(normalizedScopePath, packages);
   const packageSourcePath = selectedPackage

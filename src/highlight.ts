@@ -24,12 +24,13 @@ async function loadHighlighter(id: LanguageId): Promise<Highlighter> {
 }
 
 // Resolved at module scope so `computeHighlightSpans` stays synchronous.
-const [typescript, tsx, javascript] = await Promise.all([
+const [typescript, tsx, javascript, rust] = await Promise.all([
   loadHighlighter("typescript"),
   loadHighlighter("tsx"),
   loadHighlighter("javascript"),
+  loadHighlighter("rust"),
 ]);
-const HIGHLIGHTERS: Record<LanguageId, Highlighter> = { typescript, tsx, javascript };
+const HIGHLIGHTERS: Record<LanguageId, Highlighter> = { typescript, tsx, javascript, rust };
 
 export function computeHighlightSpans(path: string, content: string): HighlightSpan[] {
   if (content.length > HIGHLIGHT_MAX_LENGTH) return [];

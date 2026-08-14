@@ -1,61 +1,59 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
+import { children, namedChildren, renderedTypeName } from "../lang/ast.ts";
+import { analysisLanguageForPath } from "../lang/registry.ts";
+import { parseRustSource } from "../lang/rust.ts";
 import {
   annotationType,
-  children,
   declarationName,
   isAccessor,
   METHOD_NODE_TYPES,
   memberName,
-  namedChildren,
   parseTypeScriptSource,
-  renderedTypeName,
   topLevelDeclarations,
 } from "../lang/typescript.ts";
-import { bareUmlName, posix, syntheticTypeId, umlEntityKey, umlFileKey } from "./keys.ts";
+import { createDeclarationBuilder, type DeclarationBuilder } from "./declaration.ts";
+import { bareUmlName, posix, syntheticTypeId, umlFileKey } from "./keys.ts";
 import {
   type FileDeclaration,
   type HeritageClause,
   type MethodDetails,
+  orderUmlModifiers,
+  type PendingTypeReference,
   type PropertyDetails,
   type SourceUnit,
-  UML_MODIFIER_ABSTRACT,
-  UML_MODIFIER_ACCESSOR,
-  UML_MODIFIER_AMBIENT,
-  UML_MODIFIER_ASYNC,
-  UML_MODIFIER_OVERRIDE,
-  UML_MODIFIER_PRIVATE,
-  UML_MODIFIER_PROTECTED,
-  UML_MODIFIER_PUBLIC,
-  UML_MODIFIER_READONLY,
-  UML_MODIFIER_STATIC,
   type UmlEntityModel,
+  type UmlModifier,
   type UmlReference,
 } from "./model.ts";
 import type { SymbolTable } from "./resolve.ts";
+import { parseRustFileDeclaration } from "./rust-parse.ts";
 
-const ACCESSIBILITY_FLAGS: Record<string, number> = {
-  public: UML_MODIFIER_PUBLIC,
-  private: UML_MODIFIER_PRIVATE,
-  protected: UML_MODIFIER_PROTECTED,
+const ACCESSIBILITY_MODIFIERS: Record<string, UmlModifier> = {
+  public: "public",
+  private: "private",
+  protected: "protected",
 };
 
-const TOKEN_FLAGS: Record<string, number> = {
-  readonly: UML_MODIFIER_READONLY,
-  override: UML_MODIFIER_OVERRIDE,
-  abstract: UML_MODIFIER_ABSTRACT,
-  declare: UML_MODIFIER_AMBIENT,
-  static: UML_MODIFIER_STATIC,
-  accessor: UML_MODIFIER_ACCESSOR,
-  async: UML_MODIFIER_ASYNC,
+const TOKEN_MODIFIERS: Record<string, UmlModifier> = {
+  readonly: "readonly",
+  override: "override",
+  abstract: "abstract",
+  declare: "ambient",
+  static: "static",
+  accessor: "accessor",
+  async: "async",
 };
 
-function memberModifierFlags(node: Node): number {
-  let flags = node.type === "abstract_method_signature" ? UML_MODIFIER_ABSTRACT : 0;
+function memberModifiers(node: Node): UmlModifier[] {
+  const collected: UmlModifier[] = [];
+  if (node.type === "abstract_method_signature") collected.push("abstract");
   for (const child of children(node)) {
-    if (child.type === "accessibility_modifier") flags |= ACCESSIBILITY_FLAGS[child.text] ?? 0;
-    else flags |= TOKEN_FLAGS[child.type] ?? 0;
+    const modifier = child.type === "accessibility_modifier"
+      ? ACCESSIBILITY_MODIFIERS[child.text]
+      : TOKEN_MODIFIERS[child.type];
+    if (modifier) collected.push(modifier);
   }
-  return flags;
+  return orderUmlModifiers(collected);
 }
 
 function hasToken(node: Node, token: string): boolean {
@@ -66,22 +64,6 @@ function hasToken(node: Node, token: string): boolean {
 }
 
 const OPTIONAL_UNDEFINED_SUFFIX = " | undefined";
-
-type PendingMemberTypes = {
-  kind: "member";
-  file: string;
-  annotation: Node;
-  assign: (typeIds: string[]) => void;
-};
-
-type PendingHeritage = {
-  kind: "heritage";
-  file: string;
-  base: Node;
-  clause: HeritageClause;
-};
-
-type PendingTypeReference = PendingMemberTypes | PendingHeritage;
 
 export type ParsedUmlProject = {
   declarations: FileDeclaration[];
@@ -97,7 +79,7 @@ export type ParsedSourceUnits = {
   dispose(): void;
 };
 
-/** Parses every TypeScript file in `files` that has content; non-TS paths are skipped. */
+/** Parses every analysable source file in `files` that has content; other paths are skipped. */
 export function parseSourceUnits(
   files: readonly string[],
   contents: ReadonlyMap<string, string>,
@@ -114,7 +96,9 @@ export function parseSourceUnits(
     for (const file of files) {
       const source = contents.get(umlFileKey(file));
       if (source === undefined) continue;
-      const parsed = parseTypeScriptSource(file, source);
+      const parsed = analysisLanguageForPath(file) === "rust"
+        ? parseRustSource(source)
+        : parseTypeScriptSource(file, source);
       if (!parsed) continue;
       disposers.push(parsed.dispose);
       const unit: SourceUnit = { path: posix(file), root: parsed.root };
@@ -128,7 +112,7 @@ export function parseSourceUnits(
   return { units, byKey, dispose };
 }
 
-function parseProperty(node: Node, name: string, pending: PendingTypeReference[], file: string): PropertyDetails {
+function parseProperty(node: Node, name: string, builder: DeclarationBuilder): PropertyDetails {
   const annotation = annotationType(node, "type");
   const optional = hasToken(node, "?");
   let type = annotation?.text;
@@ -136,40 +120,30 @@ function parseProperty(node: Node, name: string, pending: PendingTypeReference[]
     type = type.slice(0, type.length - OPTIONAL_UNDEFINED_SUFFIX.length);
   }
   const details: PropertyDetails = {
-    modifierFlags: memberModifierFlags(node),
+    modifiers: memberModifiers(node),
     name,
     ...(type === undefined ? {} : { type }),
     typeIds: [],
     optional,
   };
   if (annotation) {
-    pending.push({
-      kind: "member",
-      file,
-      annotation,
-      assign: (typeIds) => {
-        details.typeIds = typeIds;
-      },
+    builder.memberTypes(annotation, (typeIds) => {
+      details.typeIds = typeIds;
     });
   }
   return details;
 }
 
-function parseMethod(node: Node, name: string, pending: PendingTypeReference[], file: string): MethodDetails {
+function parseMethod(node: Node, name: string, builder: DeclarationBuilder): MethodDetails {
   const annotation = annotationType(node, "return_type");
   const details: MethodDetails = {
-    modifierFlags: memberModifierFlags(node),
+    modifiers: memberModifiers(node),
     name,
     ...(annotation === undefined ? {} : { returnType: annotation.text, returnTypeIds: [] }),
   };
   if (annotation) {
-    pending.push({
-      kind: "member",
-      file,
-      annotation,
-      assign: (typeIds) => {
-        details.returnTypeIds = typeIds;
-      },
+    builder.memberTypes(annotation, (typeIds) => {
+      details.returnTypeIds = typeIds;
     });
   }
   return details;
@@ -177,8 +151,7 @@ function parseMethod(node: Node, name: string, pending: PendingTypeReference[], 
 
 function classMembers(
   body: Node,
-  pending: PendingTypeReference[],
-  file: string,
+  builder: DeclarationBuilder,
 ): { properties: PropertyDetails[]; methods: MethodDetails[] } {
   const properties: PropertyDetails[] = [];
   const candidates: { node: Node; name: string }[] = [];
@@ -186,7 +159,7 @@ function classMembers(
   for (const member of namedChildren(body)) {
     if (member.type === "public_field_definition") {
       const name = memberName(member)?.name;
-      if (name !== undefined) properties.push(parseProperty(member, name, pending, file));
+      if (name !== undefined) properties.push(parseProperty(member, name, builder));
       continue;
     }
     if (!METHOD_NODE_TYPES.has(member.type) || isAccessor(member)) continue;
@@ -204,7 +177,7 @@ function classMembers(
   );
   const methods = candidates
     .filter(({ node, name }) => node.type === "method_definition" || !implemented.has(name))
-    .map(({ node, name }) => parseMethod(node, name, pending, file));
+    .map(({ node, name }) => parseMethod(node, name, builder));
 
   if (constructorNode) {
     const parameters = constructorNode.childForFieldName("parameters");
@@ -213,7 +186,7 @@ function classMembers(
       if (!children(parameter).some((child) => child.type === "accessibility_modifier")) continue;
       const name = parameter.childForFieldName("pattern")?.text;
       if (name === undefined) continue;
-      properties.push(parseProperty(parameter, name, pending, file));
+      properties.push(parseProperty(parameter, name, builder));
     }
   }
   return { properties, methods };
@@ -221,16 +194,15 @@ function classMembers(
 
 function signatureMembers(
   body: Node,
-  pending: PendingTypeReference[],
-  file: string,
+  builder: DeclarationBuilder,
 ): { properties: PropertyDetails[]; methods: MethodDetails[] } {
   const properties: PropertyDetails[] = [];
   const methods: MethodDetails[] = [];
   for (const member of namedChildren(body)) {
     const name = memberName(member)?.name;
     if (name === undefined) continue;
-    if (member.type === "property_signature") properties.push(parseProperty(member, name, pending, file));
-    else if (member.type === "method_signature") methods.push(parseMethod(member, name, pending, file));
+    if (member.type === "property_signature") properties.push(parseProperty(member, name, builder));
+    else if (member.type === "method_signature") methods.push(parseMethod(member, name, builder));
   }
   return { properties, methods };
 }
@@ -239,27 +211,14 @@ function heritageBaseName(node: Node): Node {
   return node.type === "generic_type" ? node.childForFieldName("name") ?? node : node;
 }
 
-function collectHeritage(
-  declaration: Node,
-  entity: UmlEntityModel,
-  pending: PendingTypeReference[],
-  file: string,
-): void {
-  const push = (base: Node, type: 0 | 1): void => {
-    const clause: HeritageClause = {
-      clause: "",
-      clauseTypeId: "",
-      className: entity.name,
-      classTypeId: entity.id,
-      type,
-    };
-    entity.heritageClauses.push(clause);
-    pending.push({ kind: "heritage", file, base: heritageBaseName(base), clause });
+function collectHeritage(declaration: Node, entity: UmlEntityModel, builder: DeclarationBuilder): void {
+  const push = (base: Node, relation: HeritageClause["relation"]): void => {
+    builder.heritage(entity, heritageBaseName(base), relation);
   };
   if (declaration.type === "interface_declaration") {
     for (const child of namedChildren(declaration)) {
       if (child.type !== "extends_type_clause") continue;
-      for (const base of namedChildren(child)) push(base, 1);
+      for (const base of namedChildren(child)) push(base, "implements");
     }
     return;
   }
@@ -268,16 +227,12 @@ function collectHeritage(
     for (const group of namedChildren(child)) {
       if (group.type === "extends_clause") {
         const value = group.childForFieldName("value");
-        if (value) push(value, 0);
+        if (value) push(value, "extends");
       } else if (group.type === "implements_clause") {
-        for (const base of namedChildren(group)) push(base, 1);
+        for (const base of namedChildren(group)) push(base, "implements");
       }
     }
   }
-}
-
-function emptyEntity(name: string, id: string): UmlEntityModel {
-  return { name, id, properties: [], methods: [], heritageClauses: [], items: [] };
 }
 
 function parseFileDeclaration(
@@ -285,15 +240,10 @@ function parseFileDeclaration(
   entities: Map<string, UmlReference>,
   pending: PendingTypeReference[],
 ): FileDeclaration {
-  const fileName = unit.path;
-  const declaration: FileDeclaration = {
-    fileName,
-    classes: [],
-    interfaces: [],
-    enums: [],
-    types: [],
-    heritageClauses: [],
-  };
+  if (analysisLanguageForPath(unit.path) === "rust") {
+    return parseRustFileDeclaration(unit, entities, pending);
+  }
+  const builder = createDeclarationBuilder(unit.path, entities, pending);
   for (const node of topLevelDeclarations(unit.root)) {
     const isClass = node.type === "class_declaration"
       || node.type === "abstract_class_declaration"
@@ -301,28 +251,27 @@ function parseFileDeclaration(
     const bare = declarationName(node) ?? (node.type === "class" ? "default" : undefined);
     if (bare === undefined) continue;
     const name = renderedTypeName(bare, node);
-    const id = syntheticTypeId(fileName, name);
-    const entity = emptyEntity(name, id);
 
     if (isClass) {
+      const entity = builder.entity(name, "classes");
       const body = node.childForFieldName("body");
       if (body?.type === "class_body") {
-        const members = classMembers(body, pending, fileName);
+        const members = classMembers(body, builder);
         entity.properties = members.properties;
         entity.methods = members.methods;
       }
-      collectHeritage(node, entity, pending, fileName);
-      declaration.classes.push(entity);
+      collectHeritage(node, entity, builder);
     } else if (node.type === "interface_declaration") {
+      const entity = builder.entity(name, "interfaces");
       const body = node.childForFieldName("body");
       if (body?.type === "interface_body") {
-        const members = signatureMembers(body, pending, fileName);
+        const members = signatureMembers(body, builder);
         entity.properties = members.properties;
         entity.methods = members.methods;
       }
-      collectHeritage(node, entity, pending, fileName);
-      declaration.interfaces.push(entity);
+      collectHeritage(node, entity, builder);
     } else if (node.type === "enum_declaration") {
+      const entity = builder.entity(name, "enums");
       const body = node.childForFieldName("body");
       for (const item of body ? namedChildren(body) : []) {
         if (item.type === "enum_assignment") {
@@ -332,23 +281,17 @@ function parseFileDeclaration(
           entity.items.push(item.text);
         }
       }
-      declaration.enums.push(entity);
     } else if (node.type === "type_alias_declaration") {
+      // Only an object-shaped alias is an entity, and the guard must precede registration.
       const value = node.childForFieldName("value");
       if (value?.type !== "object_type") continue;
-      const members = signatureMembers(value, pending, fileName);
+      const entity = builder.entity(name, "types");
+      const members = signatureMembers(value, builder);
       entity.properties = members.properties;
       entity.methods = members.methods;
-      declaration.types.push(entity);
-    } else {
-      continue;
     }
-    entities.set(umlEntityKey(fileName, bareUmlName(name)), { id: entity.id, name: entity.name });
   }
-  for (const entity of [...declaration.classes, ...declaration.interfaces]) {
-    if (entity.heritageClauses.length) declaration.heritageClauses.push(entity.heritageClauses);
-  }
-  return declaration;
+  return builder.finish();
 }
 
 export function parseUmlProject(

@@ -1,4 +1,5 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
+import { namedChildren } from "./ast.ts";
 import { definitionLanguageForPath } from "./registry.ts";
 import { loadLanguage, parseTree } from "./runtime.ts";
 
@@ -28,31 +29,6 @@ const GRAMMARS = {
   typescript: await loadLanguage("typescript"),
   tsx: await loadLanguage("tsx"),
 };
-
-export function namedChildren(node: Node): Node[] {
-  const result: Node[] = [];
-  for (const child of node.namedChildren) {
-    if (child) result.push(child);
-  }
-  return result;
-}
-
-export function children(node: Node): Node[] {
-  const result: Node[] = [];
-  for (const child of node.children) {
-    if (child) result.push(child);
-  }
-  return result;
-}
-
-export function firstAncestor(node: Node, match: (candidate: Node) => boolean): Node | undefined {
-  let current = node.parent;
-  while (current) {
-    if (match(current)) return current;
-    current = current.parent;
-  }
-  return undefined;
-}
 
 /** `undefined` when `path` is not TypeScript/TSX. Caller MUST `dispose()`. */
 export function parseTypeScriptSource(
@@ -101,17 +77,6 @@ export function topLevelDeclarations(root: Node): Node[] {
 /** Bare declared name of any named declaration node. */
 export function declarationName(node: Node): string | undefined {
   return node.childForFieldName("name")?.text;
-}
-
-export function renderedTypeName(bare: string, declaration: Node): string {
-  const parameters = declaration.childForFieldName("type_parameters");
-  if (!parameters) return bare;
-  const rendered: string[] = [];
-  for (const parameter of namedChildren(parameters)) {
-    if (parameter.type !== "type_parameter") continue;
-    rendered.push(parameter.childForFieldName("name")?.text ?? "");
-  }
-  return rendered.length ? `${bare}<${rendered.join(",")}>` : bare;
 }
 
 /** Canonical member name and the node carrying it, or `undefined` for computed names. */

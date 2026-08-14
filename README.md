@@ -1,13 +1,13 @@
 # TypeScript Explorer
 
-A local TypeScript project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for TypeScript files.
+A local TypeScript and Rust project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for source files. TypeScript and Rust feed one shared dependency graph: a directory holding both `.ts` and `.rs` sources renders a single diagram from a single symbol table, with name resolution kept inside each language.
 
 The explorer never imports or executes the inspected project.
 
 ## Requirements
 
 - [Bun](https://bun.sh/) 1.3.14 or newer
-- A TypeScript workspace or source directory to inspect
+- A TypeScript or Rust workspace, or a source directory to inspect
 
 ## Install
 
@@ -73,8 +73,8 @@ Use `--host 0.0.0.0` only when you intentionally want the server reachable beyon
 - **Packages** shows workspace package dependencies as a Mermaid graph.
 - **UML** shows class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
 - The file tree lists packages, folders, and files. Use the filter to narrow it.
-- Select a TypeScript or JavaScript source file to open it in the read-only editor; other files are not viewable.
-- The editor shows the Prettier-formatted source produced during preprocessing, syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
+- Select a TypeScript, JavaScript, or Rust source file to open it in the read-only editor; other files are not viewable.
+- The editor shows the Prettier-formatted source produced during preprocessing (Rust is served exactly as written), syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
 - Class, interface, enum, type, and method names are underlined in the editor. Click one to jump straight to its declaration; the target comes from a definition index written at the start of every preprocessing generation, so the jump never waits on UML extraction of the target file.
 - Search matches file contents and definition names. Selecting a definition result opens the declaration in the editor or highlights it in the UML diagram.
 - The graph supports wheel zoom, pointer-drag panning, and reset-to-fit controls.

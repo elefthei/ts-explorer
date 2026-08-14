@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { highlightLanguageForPath } from "./lang/registry.ts";
+
 const TRAVERSAL_IGNORED_SEGMENTS = new Set([
   ".git",
   "node_modules",
@@ -10,29 +13,37 @@ const TRAVERSAL_IGNORED_SEGMENTS = new Set([
 ]);
 const UML_IGNORED_SEGMENTS = new Set([".git", "node_modules", ".explore"]);
 
-const SOURCE_EXTENSIONS = [
-  ".ts",
-  ".tsx",
-  ".mts",
-  ".cts",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-] as const;
-
-const TYPESCRIPT_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
-
 function hasIgnoredSegment(path: string, ignored: ReadonlySet<string>): boolean {
   return path.split(/[\\/]+/).some((segment) => ignored.has(segment));
 }
 
-export function isSourcePath(path: string): boolean {
-  return SOURCE_EXTENSIONS.some((extension) => path.endsWith(extension));
+// A directory named `target` is Cargo's build output only when a `Cargo.toml` sits beside it;
+// `src/target` in a TypeScript project is an ordinary source directory and must stay visible.
+const cargoTargetDirectories = new Map<string, boolean>();
+
+export function isCargoTargetPath(absolutePath: string): boolean {
+  const segments = absolutePath.split(/[\\/]+/);
+  for (let index = segments.length - 1; index >= 1; index -= 1) {
+    if (segments[index] !== "target") continue;
+    const directory = segments.slice(0, index).join("/");
+    let cached = cargoTargetDirectories.get(directory);
+    if (cached === undefined) {
+      cached = existsSync(`${directory}/Cargo.toml`);
+      cargoTargetDirectories.set(directory, cached);
+    }
+    if (cached) return true;
+  }
+  return false;
 }
 
-export function isTypeScriptPath(path: string): boolean {
-  return TYPESCRIPT_EXTENSIONS.some((extension) => path.endsWith(extension));
+export function isSourcePath(path: string): boolean {
+  return highlightLanguageForPath(path) !== undefined;
+}
+
+/** Only these files are handed to Prettier; Rust is served exactly as written. */
+export function isPrettierFormattablePath(path: string): boolean {
+  const id = highlightLanguageForPath(path);
+  return id !== undefined && id !== "rust";
 }
 
 export function isDeclarationPath(path: string): boolean {

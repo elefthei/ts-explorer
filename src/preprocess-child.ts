@@ -11,6 +11,7 @@ import {
 import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
 import { computeHighlightSpans } from "./highlight.ts";
+import { analysisLanguageForPath, highlightLanguageForPath } from "./lang/registry.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
@@ -33,8 +34,8 @@ import { isRecord } from "./preprocess-protocol.ts";
 import {
   decodeSourceBytes,
   isDeclarationPath,
+  isPrettierFormattablePath,
   isSourcePath,
-  isTypeScriptPath,
 } from "./source.ts";
 import { buildTree, collectTreeEntries, computeSourceFingerprint, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
@@ -323,7 +324,7 @@ async function indexDefinitions(
 ): Promise<{ definitionCount: number }> {
   const files = (await collectTreeEntries(preprocessState.sourceDir, "")).filter((entry) =>
     entry.kind === "file"
-    && isTypeScriptPath(entry.path)
+    && analysisLanguageForPath(entry.path) !== undefined
     && !isDeclarationPath(entry.path)
   );
   const definitions: DefinitionIndexWrite[] = [];
@@ -429,11 +430,13 @@ async function preprocessFile(
         displayContent: null,
         sourceError: decoded.failure,
         formatError: null,
+        language: highlightLanguageForPath(path) ?? null,
       },
       definitions: [],
     };
   }
   const rawContent = decoded.text;
+  const language = highlightLanguageForPath(path) ?? null;
   let file: CacheFileWrite;
   if (!isSourcePath(path)) {
     file = {
@@ -442,6 +445,17 @@ async function preprocessFile(
       displayContent: null,
       sourceError: null,
       formatError: null,
+      language,
+    };
+  } else if (!isPrettierFormattablePath(path)) {
+    // Rust is served exactly as written: there is no formatter in this pipeline.
+    file = {
+      path,
+      rawContent,
+      displayContent: rawContent,
+      sourceError: null,
+      formatError: null,
+      language,
     };
   } else {
     try {
@@ -451,6 +465,7 @@ async function preprocessFile(
         displayContent: await format(rawContent, { filepath: absolutePath }),
         sourceError: null,
         formatError: null,
+        language,
       };
     } catch (error) {
       file = {
@@ -459,6 +474,7 @@ async function preprocessFile(
         displayContent: rawContent,
         sourceError: null,
         formatError: errorMessage(error),
+        language,
       };
     }
   }
@@ -515,7 +531,7 @@ async function preprocessScope(
   }
 
   const shouldBuildUml = isDirectoryScope
-    || (isTypeScriptPath(scope.path) && !isDeclarationPath(scope.path));
+    || (analysisLanguageForPath(scope.path) !== undefined && !isDeclarationPath(scope.path));
   const resource = scope.path ? `./${scope.path}` : ".";
   const extractDiagram = () => extractScopeDiagram(
     preprocessState,
@@ -645,7 +661,7 @@ async function readCachedFile(
   if (!isSourcePath(path)) {
     throw new PreprocessRequestError(
       "INVALID_INPUT",
-      "only TypeScript and JavaScript source files can be viewed",
+      "only TypeScript, JavaScript, and Rust source files can be viewed",
     );
   }
   const record = preprocessState.cache.readFile(generationId, path);
@@ -665,7 +681,7 @@ async function readCachedFile(
   }
 
   const rawOffset = rawOffsetForLocation(record.rawContent, location);
-  if (record.formatError) {
+  if (record.formatError || !isPrettierFormattablePath(path)) {
     return {
       path,
       content: record.rawContent,
