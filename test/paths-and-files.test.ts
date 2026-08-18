@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  ensureRegularFile,
   normalizeRelativePath,
   type PathErrorCode,
   resolveInside,
@@ -78,4 +79,42 @@ test("resolves ordinary files but rejects traversal, absolute paths, and symlink
   });
   expect(await resolveInside(root, "src/ok.ts", true)).toBe(canonicalFile);
   expect(await resolveInside(canonicalRoot, "src/ok.ts", true)).toBe(canonicalFile);
+});
+
+test("resolveInside reports a missing root and resolves not-yet-existing targets when mustExist is false", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-"));
+  roots.push(root);
+  await mkdir(join(root, "src"));
+
+  await expect(resolveInside(join(root, "does-not-exist"), "file.ts", true)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+
+  const canonicalRoot = await realpath(root);
+  const notYetCreated = await resolveInside(root, "src/new-file.ts", false);
+  expect(notYetCreated).toBe(join(canonicalRoot, "src", "new-file.ts"));
+
+  await expect(resolveInside(root, "missing-dir/new-file.ts", false)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+
+  await expect(resolveInside(root, "../new-file.ts", false)).rejects.toMatchObject({
+    code: "FORBIDDEN",
+  });
+});
+
+test("ensureRegularFile accepts regular files but rejects directories and missing paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-"));
+  roots.push(root);
+  await mkdir(join(root, "src"));
+  const file = join(root, "src", "ok.ts");
+  await writeFile(file, "export const ok = 1;\n");
+
+  await expect(ensureRegularFile(file)).resolves.toBeUndefined();
+  await expect(ensureRegularFile(join(root, "src"))).rejects.toMatchObject({
+    code: "BAD_REQUEST",
+  });
+  await expect(ensureRegularFile(join(root, "missing.ts"))).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
 });
