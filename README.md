@@ -1,13 +1,13 @@
 # TypeScript Explorer
 
-A local TypeScript project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for TypeScript files.
+A local TypeScript and Rust project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for source files. TypeScript and Rust feed one shared dependency graph: a directory holding both `.ts` and `.rs` sources renders a single diagram from a single symbol table, with name resolution kept inside each language.
 
 The explorer never imports or executes the inspected project.
 
 ## Requirements
 
 - [Bun](https://bun.sh/) 1.3.14 or newer
-- A TypeScript workspace or source directory to inspect
+- A TypeScript or Rust workspace, or a source directory to inspect
 
 ## Install
 
@@ -15,7 +15,7 @@ The explorer never imports or executes the inspected project.
 bun install
 ```
 
-To put the `tse` command on your PATH, link the package globally (creates the shim in Bun's global bin directory):
+To put the `ts-explorer` command (and its `tse` alias) on your PATH, link the package globally (creates the shim in Bun's global bin directory):
 
 ```sh
 bun link
@@ -28,7 +28,7 @@ Remove it again with `bun unlink` from this directory.
 After linking, run the explorer from anywhere:
 
 ```sh
-tse --dir /path/to/project
+tse /path/to/project
 ```
 
 It launches your default browser at <http://127.0.0.1:8080>. Pass `--no-open` to keep the terminal-only behavior.
@@ -36,28 +36,34 @@ It launches your default browser at <http://127.0.0.1:8080>. Pass `--no-open` to
 The source path may use `~`:
 
 ```sh
-tse --dir ~/git/junco-runtime
+tse ~/git/junco-runtime
 ```
 
 Without linking, run it from this repository:
 
 ```sh
-bun run start -- --dir /path/to/project
+bun run start -- /path/to/project
 ```
 
 ### CLI options
 
-| Option | Default | Description |
+```sh
+tse <dir> [options]
+```
+
+| Argument | Default | Description |
 | --- | --- | --- |
-| `--dir` | _required_ | Source directory to inspect |
+| `<dir>` | _required_ | Source directory to inspect (positional) |
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8080` | HTTP/WebSocket port |
 | `--open` | `true` | Launch the default browser at the served URL; disable with `--no-open` |
+| `-v`, `--version` | | Print the version from `package.json` and exit |
+| `-h`, `--help` | | Print usage and exit |
 
 For example, to use a different local port:
 
 ```sh
-tse --dir ~/git/my-project --host 127.0.0.1 --port 8081
+tse ~/git/my-project --host 127.0.0.1 --port 8081
 ```
 
 Use `--host 0.0.0.0` only when you intentionally want the server reachable beyond the local machine.
@@ -65,10 +71,10 @@ Use `--host 0.0.0.0` only when you intentionally want the server reachable beyon
 ## Explorer workflow
 
 - **Packages** shows workspace package dependencies as a Mermaid graph.
-- **UML** shows TsUML2 class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
+- **UML** shows class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
 - The file tree lists packages, folders, and files. Use the filter to narrow it.
-- Select a TypeScript or JavaScript source file to open it in the read-only editor; other files are not viewable.
-- The editor shows the Prettier-formatted source produced during preprocessing. It is never editable, and the explorer never writes to the inspected project.
+- Select a TypeScript, JavaScript, or Rust source file to open it in the read-only editor; other files are not viewable.
+- The editor shows the Prettier-formatted source produced during preprocessing (Rust is served exactly as written), syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
 - Class, interface, enum, type, and method names are underlined in the editor. Click one to jump straight to its declaration; the target comes from a definition index written at the start of every preprocessing generation, so the jump never waits on UML extraction of the target file.
 - Search matches file contents and definition names. Selecting a definition result opens the declaration in the editor or highlights it in the UML diagram.
 - The graph supports wheel zoom, pointer-drag panning, and reset-to-fit controls.

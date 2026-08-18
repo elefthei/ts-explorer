@@ -10,6 +10,8 @@ import {
 } from "./cache.ts";
 import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
+import { computeHighlightSpans } from "./highlight.ts";
+import { analysisLanguageForPath, highlightLanguageForPath } from "./lang/registry.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
@@ -29,8 +31,13 @@ import type {
   PreprocessErrorCode,
 } from "./preprocess-protocol.ts";
 import { isRecord } from "./preprocess-protocol.ts";
-import { isDeclarationPath, isSourcePath, isTypeScriptPath } from "./source.ts";
-import { buildTree, collectTreeEntries, readDirectoryEntries } from "./tree.ts";
+import {
+  decodeSourceBytes,
+  isDeclarationPath,
+  isPrettierFormattablePath,
+  isSourcePath,
+} from "./source.ts";
+import { buildTree, collectTreeEntries, computeSourceFingerprint, readDirectoryEntries } from "./tree.ts";
 import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
 import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
 import { renderUmlDiagramGraph } from "./uml/render.ts";
@@ -317,7 +324,7 @@ async function indexDefinitions(
 ): Promise<{ definitionCount: number }> {
   const files = (await collectTreeEntries(preprocessState.sourceDir, "")).filter((entry) =>
     entry.kind === "file"
-    && isTypeScriptPath(entry.path)
+    && analysisLanguageForPath(entry.path) !== undefined
     && !isDeclarationPath(entry.path)
   );
   const definitions: DefinitionIndexWrite[] = [];
@@ -325,9 +332,10 @@ async function indexDefinitions(
     const batch = files.slice(start, start + DEFINITION_INDEX_READ_BATCH);
     const contents = await Promise.all(batch.map(async (entry) => {
       try {
-        const text = new TextDecoder("utf-8", { fatal: true })
-          .decode(await readFileBytes(join(preprocessState.sourceDir, entry.path)));
-        return text.includes("\0") ? null : text;
+        const decoded = decodeSourceBytes(
+          await readFileBytes(join(preprocessState.sourceDir, entry.path)),
+        );
+        return "failure" in decoded ? null : decoded.text;
       } catch {
         return null;
       }
@@ -411,33 +419,24 @@ async function preprocessFile(
   path: string,
   rawDefinitions: readonly GotoDefinition[],
 ): Promise<PreprocessedFile> {
-  let rawContent: string;
-  try {
-    rawContent = new TextDecoder("utf-8", { fatal: true }).decode(await readFileBytes(absolutePath));
-  } catch {
+  const decoded = await readFileBytes(absolutePath).then(decodeSourceBytes, () => ({
+    failure: "file is not valid UTF-8 text" as const,
+  }));
+  if ("failure" in decoded) {
     return {
       file: {
         path,
         rawContent: null,
         displayContent: null,
-        sourceError: "file is not valid UTF-8 text",
+        sourceError: decoded.failure,
         formatError: null,
+        language: highlightLanguageForPath(path) ?? null,
       },
       definitions: [],
     };
   }
-  if (rawContent.includes("\0")) {
-    return {
-      file: {
-        path,
-        rawContent: null,
-        displayContent: null,
-        sourceError: "file contains NUL bytes",
-        formatError: null,
-      },
-      definitions: [],
-    };
-  }
+  const rawContent = decoded.text;
+  const language = highlightLanguageForPath(path) ?? null;
   let file: CacheFileWrite;
   if (!isSourcePath(path)) {
     file = {
@@ -446,6 +445,17 @@ async function preprocessFile(
       displayContent: null,
       sourceError: null,
       formatError: null,
+      language,
+    };
+  } else if (!isPrettierFormattablePath(path)) {
+    // Rust is served exactly as written: there is no formatter in this pipeline.
+    file = {
+      path,
+      rawContent,
+      displayContent: rawContent,
+      sourceError: null,
+      formatError: null,
+      language,
     };
   } else {
     try {
@@ -455,6 +465,7 @@ async function preprocessFile(
         displayContent: await format(rawContent, { filepath: absolutePath }),
         sourceError: null,
         formatError: null,
+        language,
       };
     } catch (error) {
       file = {
@@ -463,6 +474,7 @@ async function preprocessFile(
         displayContent: rawContent,
         sourceError: null,
         formatError: errorMessage(error),
+        language,
       };
     }
   }
@@ -519,7 +531,7 @@ async function preprocessScope(
   }
 
   const shouldBuildUml = isDirectoryScope
-    || (isTypeScriptPath(scope.path) && !isDeclarationPath(scope.path));
+    || (analysisLanguageForPath(scope.path) !== undefined && !isDeclarationPath(scope.path));
   const resource = scope.path ? `./${scope.path}` : ".";
   const extractDiagram = () => extractScopeDiagram(
     preprocessState,
@@ -649,7 +661,7 @@ async function readCachedFile(
   if (!isSourcePath(path)) {
     throw new PreprocessRequestError(
       "INVALID_INPUT",
-      "only TypeScript and JavaScript source files can be viewed",
+      "only TypeScript, JavaScript, and Rust source files can be viewed",
     );
   }
   const record = preprocessState.cache.readFile(generationId, path);
@@ -659,17 +671,36 @@ async function readCachedFile(
     throw new PreprocessRequestError("INVALID_INPUT", "source file has no display content");
   }
   const definitions = preprocessState.cache.readDefinitions(generationId, path);
-  if (!location) return { path, content: record.displayContent, definitions };
+  if (!location) {
+    return {
+      path,
+      content: record.displayContent,
+      definitions,
+      highlights: computeHighlightSpans(path, record.displayContent),
+    };
+  }
 
   const rawOffset = rawOffsetForLocation(record.rawContent, location);
-  if (record.formatError) {
-    return { path, content: record.rawContent, definitions, cursorOffset: rawOffset };
+  if (record.formatError || !isPrettierFormattablePath(path)) {
+    return {
+      path,
+      content: record.rawContent,
+      definitions,
+      highlights: computeHighlightSpans(path, record.rawContent),
+      cursorOffset: rawOffset,
+    };
   }
   const result = await formatWithCursor(record.rawContent, {
     filepath: absolutePath,
     cursorOffset: rawOffset,
   });
-  return { path, content: result.formatted, definitions, cursorOffset: result.cursorOffset };
+  return {
+    path,
+    content: result.formatted,
+    definitions,
+    highlights: computeHighlightSpans(path, result.formatted),
+    cursorOffset: result.cursorOffset,
+  };
 }
 
 function success<Type extends PreprocessRequest["type"]>(
@@ -683,13 +714,17 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
   if (request.type === "init") {
     if (state) throw new PreprocessRequestError("BAD_REQUEST", "preprocess child is already initialized");
     const sourceDir = await resolveInside(request.sourceDir, "", true);
+    const sourceFingerprint = await computeSourceFingerprint(sourceDir);
     const cache = new Cache(request.dbPath);
     try {
       const activeGenerationId = request.recover
-        ? cache.recover()
+        ? cache.recover(sourceFingerprint)
         : cache.getActiveGenerationId();
       state = { sourceDir, cache };
-      return success(request, { activeGenerationId });
+      return success(request, {
+        activeGenerationId,
+        hasFailedDiagrams: activeGenerationId !== null && cache.hasFailedDiagrams(activeGenerationId),
+      });
     } catch (error) {
       cache.close();
       throw error;
@@ -707,7 +742,10 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
   switch (request.type) {
     case "begin-generation":
       return success(request, {
-        generationId: preprocessState.cache.beginGeneration(request.cause),
+        generationId: preprocessState.cache.beginGeneration(
+          request.cause,
+          await computeSourceFingerprint(preprocessState.sourceDir),
+        ),
       });
     case "discover-packages":
       return success(request, await discoverAndPersist(preprocessState, request.generationId));

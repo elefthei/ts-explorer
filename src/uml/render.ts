@@ -1,40 +1,34 @@
-import { getMermaidDSL, TsUML2Settings } from "tsuml2";
-import {
-  Clazz,
-  Enum,
-  Interface,
-  MemberAssociation,
-  TypeAlias,
-  type FileDeclaration,
-  type HeritageClause,
-  type MethodDetails,
-  type PropertyDetails,
-} from "tsuml2/dist/core/model";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type RenderedDiagram,
   type UmlDiagramGraph,
   type UmlEntityKind,
 } from "../diagram-graph.ts";
+import { HIGHLIGHT_QUERY_SOURCE } from "../lang/registry.ts";
+import { emitMermaidClassDiagram } from "./emit.ts";
 import { hydrateUmlGraph, type UmlGraph } from "./graph.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
 import { STYLE_DEFS, escapeMermaidLabel, mermaidEntityId } from "./mermaid.ts";
-import type {
-  CategoryMap,
-  ExternalUserNode,
-  LocalUserNode,
-  UmlDependency,
+import {
+  type CategoryMap,
+  type ExternalUserNode,
+  type FileDeclaration,
+  type HeritageClause,
+  type LocalUserNode,
+  type MethodDetails,
+  type PropertyDetails,
+  UML_MODIFIERS,
+  type UmlDependency,
+  type UmlEntityModel,
+  type UmlModifier,
 } from "./model.ts";
 
 
 function cloneWith<T extends object>(value: T, overrides: Partial<T>): T {
-  return Object.assign(Object.create(Object.getPrototypeOf(value)) as T, value, overrides);
+  return { ...value, ...overrides };
 }
 
-type StructuredEntityInstance = Clazz | Interface | TypeAlias;
-
 type RenderInput = {
-  settings: TsUML2Settings;
   categories: CategoryMap;
   methodReturnDependencies: readonly UmlDependency[];
   usageEdges: readonly UmlDependency[];
@@ -42,7 +36,7 @@ type RenderInput = {
   externalUserNodes: readonly ExternalUserNode[];
 };
 
-function cloneMermaidEntity<T extends StructuredEntityInstance>(entity: T): T {
+function cloneMermaidEntity(entity: UmlEntityModel): UmlEntityModel {
   const clone = cloneWith(entity, {});
   clone.name = mermaidEntityId(entity.name);
   clone.heritageClauses = entity.heritageClauses.map((clause) => cloneWith(clause, {
@@ -123,7 +117,7 @@ function renderUmlDsl(
     }
   }
   let dsl = (presentIds.size
-    ? getMermaidDSL(renderDeclarations, model.settings).trimEnd()
+    ? emitMermaidClassDiagram(renderDeclarations).trimEnd()
     : "classDiagram") + entityLabels;
 
   for (const dependency of model.methodReturnDependencies) {
@@ -238,10 +232,10 @@ function partitionUmlCommunities(
   return communities;
 }
 
-type EntityInstance = StructuredEntityInstance | Enum;
-
 
 const UML_ENTITY_KINDS = new Set(UML_ENTITY_COLLECTIONS.map(({ kind }) => kind));
+const UML_MODIFIER_SET: ReadonlySet<string> = new Set(UML_MODIFIERS);
+const UML_LANGUAGES: ReadonlySet<string> = new Set(Object.keys(HIGHLIGHT_QUERY_SOURCE));
 const UML_CATEGORY_KINDS = new Set(["interface", "type", "enum", "abstract", "concrete"]);
 const UML_USER_KINDS = new Set([
   "method",
@@ -276,6 +270,20 @@ function propertyOccurrenceKey(row: PropertyOccurrence): string {
 
 function methodOccurrenceKey(row: MethodOccurrence): string {
   return rowKey(row.declarationOrdinal, row.entityKind, row.entityOrdinal, row.methodOrdinal);
+}
+
+function memberOccurrenceKey(
+  row: EntityOccurrence,
+  memberKind: "property" | "method",
+  memberOrdinal: number,
+): string {
+  return rowKey(
+    row.declarationOrdinal,
+    row.entityKind,
+    row.entityOrdinal,
+    memberKind,
+    memberOrdinal,
+  );
 }
 
 function assertString(value: unknown, description: string, allowEmpty = false): asserts value is string {
@@ -367,11 +375,39 @@ function hydrateStructuredMembers(
   propertyTypeIdRows: UmlDiagramGraph["propertyTypeIds"],
   methods: UmlDiagramGraph["methods"],
   methodReturnTypeIdRows: UmlDiagramGraph["methodReturnTypeIds"],
+  memberModifierRows: UmlDiagramGraph["memberModifiers"],
 ): ReadonlyMap<string, { properties: PropertyDetails[]; methods: MethodDetails[] }> {
   const result = new Map<string, { properties: PropertyDetails[]; methods: MethodDetails[] }>();
   for (const [key, entity] of entitiesByOccurrence) {
     if (entity.entityKind !== "enum") result.set(key, { properties: [], methods: [] });
   }
+
+  const memberModifiers = orderedGroups(
+    memberModifierRows,
+    (row) => memberOccurrenceKey(row, row.memberKind, row.memberOrdinal),
+    (row) => row.modifierOrdinal,
+    "UML member modifier",
+  );
+  const takeModifiers = (
+    row: EntityOccurrence,
+    memberKind: "property" | "method",
+    memberOrdinal: number,
+  ): UmlModifier[] => {
+    const key = memberOccurrenceKey(row, memberKind, memberOrdinal);
+    const rows = memberModifiers.get(key) ?? [];
+    memberModifiers.delete(key);
+    const modifiers: UmlModifier[] = [];
+    for (const modifier of rows) {
+      if (!UML_MODIFIER_SET.has(modifier.modifier)) {
+        throw new Error(`Invalid UML member modifier: ${String(modifier.modifier)}`);
+      }
+      if (modifiers.includes(modifier.modifier)) {
+        throw new Error(`Duplicate UML member modifier: ${key}`);
+      }
+      modifiers.push(modifier.modifier);
+    }
+    return modifiers;
+  };
 
   assertOrderedOrdinals(
     properties,
@@ -387,14 +423,13 @@ function hydrateStructuredMembers(
     if (!entity || entity.entityKind === "enum" || !members) {
       throw new Error(`Invalid UML property parent: ${entityKey}`);
     }
-    assertNonnegativeInteger(property.modifierFlags, "UML property modifier flags");
     assertString(property.name, "UML property name");
     if (property.type !== null) assertString(property.type, "UML property type", true);
     assertBoolean(property.optional, "UML property optional flag");
     const key = propertyOccurrenceKey(property);
     if (propertyDetails.has(key)) throw new Error(`Duplicate UML property occurrence: ${key}`);
     const details: PropertyDetails = {
-      modifierFlags: property.modifierFlags,
+      modifiers: takeModifiers(property, "property", property.propertyOrdinal),
       name: property.name,
       ...(property.type === null ? {} : { type: property.type }),
       typeIds: [],
@@ -431,14 +466,13 @@ function hydrateStructuredMembers(
     if (!entity || entity.entityKind === "enum" || !members) {
       throw new Error(`Invalid UML method parent: ${entityKey}`);
     }
-    assertNonnegativeInteger(method.modifierFlags, "UML method modifier flags");
     assertString(method.name, "UML method name");
     if (method.returnType !== null) assertString(method.returnType, "UML method return type", true);
     assertBoolean(method.returnTypeIdsPresent, "UML method return type ID presence flag");
     const key = methodOccurrenceKey(method);
     if (methodDetails.has(key)) throw new Error(`Duplicate UML method occurrence: ${key}`);
     const details: MethodDetails = {
-      modifierFlags: method.modifierFlags,
+      modifiers: takeModifiers(method, "method", method.methodOrdinal),
       name: method.name,
       ...(method.returnType === null ? {} : { returnType: method.returnType }),
       ...(method.returnTypeIdsPresent ? { returnTypeIds: [] } : {}),
@@ -459,6 +493,7 @@ function hydrateStructuredMembers(
     for (const typeId of typeIds) assertString(typeId.typeId, "UML method return type ID");
     method.returnTypeIds.push(...typeIds.map(({ typeId }) => typeId));
   }
+  if (memberModifiers.size) throw new Error("UML member modifier references a missing member");
   return result;
 }
 
@@ -576,53 +611,6 @@ function hydrateUsers(
   return { users, topologyNodeIds };
 }
 
-function hydrateSettings(record: UmlDiagramGraph): TsUML2Settings {
-  if (!record.settings) throw new Error("Missing normal UML settings");
-  const source = record.settings;
-  assertString(source.glob, "UML settings glob", true);
-  if (source.tsconfig !== null) assertString(source.tsconfig, "UML settings tsconfig");
-  assertString(source.outFile, "UML settings output file", true);
-  assertString(source.outDsl, "UML settings DSL output", true);
-  assertString(source.outMermaidDsl, "UML settings Mermaid output", true);
-  assertBoolean(source.propertyTypes, "UML propertyTypes setting");
-  assertBoolean(source.modifiers, "UML modifiers setting");
-  assertBoolean(source.typeLinks, "UML typeLinks setting");
-  assertBoolean(source.memberAssociations, "UML memberAssociations setting");
-  assertBoolean(source.exportedTypesOnly, "UML exportedTypesOnly setting");
-
-  assertOrderedOrdinals(
-    record.settingLines,
-    (line) => line.settingKind,
-    (line) => line.lineOrdinal,
-    "UML setting line",
-  );
-  const nomnoml: string[] = [];
-  const mermaid: string[] = [];
-  for (const line of record.settingLines) {
-    if (line.settingKind !== "nomnoml" && line.settingKind !== "mermaid") {
-      throw new Error(`Invalid UML setting line kind: ${String(line.settingKind)}`);
-    }
-    assertString(line.value, "UML setting line", true);
-    (line.settingKind === "nomnoml" ? nomnoml : mermaid).push(line.value);
-  }
-
-  const settings = new TsUML2Settings();
-  settings.glob = source.glob;
-  if (source.tsconfig === null) delete settings.tsconfig;
-  else settings.tsconfig = source.tsconfig;
-  settings.outFile = source.outFile;
-  settings.propertyTypes = source.propertyTypes;
-  settings.modifiers = source.modifiers;
-  settings.typeLinks = source.typeLinks;
-  settings.nomnoml = nomnoml;
-  settings.outDsl = source.outDsl;
-  settings.outMermaidDsl = source.outMermaidDsl;
-  settings.mermaid = mermaid;
-  settings.memberAssociations = source.memberAssociations;
-  settings.exportedTypesOnly = source.exportedTypesOnly;
-  return settings;
-}
-
 function hydrateHeritageClause(
   row:
     | UmlDiagramGraph["entityHeritageClauses"][number]
@@ -632,15 +620,15 @@ function hydrateHeritageClause(
   assertString(row.clauseTypeId, "UML heritage target ID");
   assertString(row.className, "UML heritage owner name");
   assertString(row.classTypeId, "UML heritage owner ID");
-  if (row.clauseType !== 0 && row.clauseType !== 1) {
-    throw new Error(`Invalid UML heritage clause type: ${String(row.clauseType)}`);
+  if (row.relation !== "extends" && row.relation !== "implements") {
+    throw new Error(`Invalid UML heritage clause relation: ${String(row.relation)}`);
   }
   return {
     clause: row.clause,
     clauseTypeId: row.clauseTypeId,
     className: row.className,
     classTypeId: row.classTypeId,
-    type: row.clauseType,
+    relation: row.relation,
   };
 }
 
@@ -652,11 +640,10 @@ function sameHeritageClause(
     && left.clauseTypeId === right.clauseTypeId
     && left.className === right.className
     && left.classTypeId === right.classTypeId
-    && left.clauseType === right.clauseType;
+    && left.relation === right.relation;
 }
 
 function hydrateModel(record: UmlDiagramGraph) {
-  const settings = hydrateSettings(record);
   const topology = hydrateUmlGraph(record.nodes, record.aliases, record.edges, record.relations);
   const topologyNodes = new Map(record.nodes.map((node) => [node.nodeId, node]));
 
@@ -667,6 +654,9 @@ function hydrateModel(record: UmlDiagramGraph) {
       );
     }
     assertString(declaration.fileName, "UML declaration file name");
+    if (!UML_LANGUAGES.has(declaration.language)) {
+      throw new Error(`Invalid UML declaration language: ${String(declaration.language)}`);
+    }
     assertBoolean(declaration.memberAssociationsPresent, "UML association presence flag");
   }
   const fileNames = new Set(record.declarations.map((declaration) => declaration.fileName));
@@ -708,6 +698,7 @@ function hydrateModel(record: UmlDiagramGraph) {
     record.propertyTypeIds,
     record.methods,
     record.methodReturnTypeIds,
+    record.memberModifiers,
   );
   const enumItems = orderedGroups(
     record.enumItems,
@@ -744,7 +735,7 @@ function hydrateModel(record: UmlDiagramGraph) {
     heritageClauses: [],
     ...(declaration.memberAssociationsPresent ? { memberAssociations: [] } : {}),
   }));
-  const instances = new Map<string, EntityInstance>();
+  const instances = new Map<string, UmlEntityModel>();
   for (const entity of record.entities) {
     const key = entityOccurrenceKey(entity);
     const node = topologyNodes.get(entity.nodeId);
@@ -757,25 +748,28 @@ function hydrateModel(record: UmlDiagramGraph) {
     const properties = members?.properties ?? [];
     const methods = members?.methods ?? [];
     const heritageClauses = (entityHeritage.get(key) ?? []).map(hydrateHeritageClause);
-    let instance: EntityInstance;
+    let instance: UmlEntityModel;
     if (entity.entityKind === "class") {
-      instance = new Clazz({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.classes[entity.entityOrdinal] = instance;
     } else if (entity.entityKind === "interface") {
-      instance = new Interface({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.interfaces[entity.entityOrdinal] = instance;
     } else if (entity.entityKind === "type") {
-      instance = new TypeAlias({ name: node.name, id: entity.nodeId, properties, methods, heritageClauses });
+      instance = { name: node.name, id: entity.nodeId, properties, methods, heritageClauses, items: [] };
       declaration.types[entity.entityOrdinal] = instance;
     } else {
       if (properties.length || methods.length || heritageClauses.length) {
         throw new Error(`Enum UML occurrence has structured members: ${key}`);
       }
-      instance = new Enum({
+      instance = {
         name: node.name,
         id: entity.nodeId,
-        enumItems: (enumItems.get(key) ?? []).map((item) => item.value),
-      });
+        properties: [],
+        methods: [],
+        heritageClauses: [],
+        items: (enumItems.get(key) ?? []).map((item) => item.value),
+      };
       declaration.enums[entity.entityOrdinal] = instance;
     }
     instances.set(key, instance);
@@ -828,13 +822,7 @@ function hydrateModel(record: UmlDiagramGraph) {
       throw new Error(`Mismatched UML declaration heritage group: ${groupKey}`);
     }
     const instance = instances.get(ownerKey);
-    if (
-      !(instance instanceof Clazz)
-      && !(instance instanceof Interface)
-      && !(instance instanceof TypeAlias)
-    ) {
-      throw new Error(`Invalid UML declaration heritage instance: ${ownerKey}`);
-    }
+    if (!instance) throw new Error(`Invalid UML declaration heritage instance: ${ownerKey}`);
     const declaration = declarations[group.declarationOrdinal];
     if (!declaration) {
       throw new Error(`Missing UML heritage group declaration: ${group.declarationOrdinal}`);
@@ -874,22 +862,20 @@ function hydrateModel(record: UmlDiagramGraph) {
     if (!memberAssociations) {
       throw new Error(`Invalid UML association declaration: ${association.declarationOrdinal}`);
     }
-    memberAssociations.push(
-      new MemberAssociation(
-        {
-          typeId: association.aTypeId,
-          name: association.aName,
-          ...(association.aMultiplicity === null ? {} : { multiplicity: association.aMultiplicity }),
-        },
-        {
-          typeId: association.bTypeId,
-          name: association.bName,
-          ...(association.bMultiplicity === null ? {} : { multiplicity: association.bMultiplicity }),
-        },
-        association.associationType,
-        association.inherited,
-      ),
-    );
+    memberAssociations.push({
+      a: {
+        typeId: association.aTypeId,
+        name: association.aName,
+        ...(association.aMultiplicity === null ? {} : { multiplicity: association.aMultiplicity }),
+      },
+      b: {
+        typeId: association.bTypeId,
+        name: association.bName,
+        ...(association.bMultiplicity === null ? {} : { multiplicity: association.bMultiplicity }),
+      },
+      associationType: association.associationType,
+      inherited: association.inherited,
+    });
   }
 
 
@@ -1013,7 +999,6 @@ function hydrateModel(record: UmlDiagramGraph) {
 
   return {
     topology,
-    settings,
     declarations,
     categories,
     methodReturnDependencies,
@@ -1025,19 +1010,18 @@ function hydrateModel(record: UmlDiagramGraph) {
 }
 
 function assertBareUmlGraph(record: UmlDiagramGraph): void {
-  if (record.settings !== null) throw new Error("Bare UML graph cannot contain settings");
   const rowCollections: readonly (readonly unknown[])[] = [
     record.nodes,
     record.aliases,
     record.edges,
     record.relations,
-    record.settingLines,
     record.declarations,
     record.entities,
     record.properties,
     record.propertyTypeIds,
     record.methods,
     record.methodReturnTypeIds,
+    record.memberModifiers,
     record.enumItems,
     record.entityHeritageClauses,
     record.declarationHeritageGroups,

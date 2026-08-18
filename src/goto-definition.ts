@@ -1,5 +1,22 @@
-import ts from "typescript";
-import { isDeclarationPath, isTypeScriptPath } from "./source.ts";
+import type { Node } from "@vscode/tree-sitter-wasm";
+import { namedChildren, renderedTypeName } from "./lang/ast.ts";
+import { analysisLanguageForPath } from "./lang/registry.ts";
+import {
+  parseRustSource,
+  RUST_ENTITY_KIND_BY_NODE,
+  rustBodyMethods,
+  rustImplTargetName,
+  rustTopLevelItems,
+} from "./lang/rust.ts";
+import {
+  ENTITY_KIND_BY_NODE,
+  isAccessor,
+  METHOD_NODE_TYPES,
+  memberName,
+  parseTypeScriptSource,
+  topLevelDeclarations,
+} from "./lang/typescript.ts";
+import { isDeclarationPath } from "./source.ts";
 import type { GotoDefinitionKind } from "./types.ts";
 
 export type ParsedEntityKind = Exclude<GotoDefinitionKind, "method">;
@@ -21,87 +38,57 @@ export type ParsedDefinitionSpan = {
   to: number;
 };
 
-
-function entityKind(node: ts.Statement): ParsedEntityKind | undefined {
-  if (ts.isClassDeclaration(node)) return "class";
-  if (ts.isInterfaceDeclaration(node)) return "interface";
-  if (ts.isEnumDeclaration(node)) return "enum";
-  if (ts.isTypeAliasDeclaration(node)) return "type";
-  return undefined;
-}
-
-function methodName(node: ts.PropertyName): string | undefined {
-  if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) {
-    return node.text;
+function entityMethodNodes(declaration: Node, kind: ParsedEntityKind): Node[] {
+  const body = declaration.childForFieldName("body");
+  const methods: Node[] = [];
+  if (kind === "class") {
+    if (body?.type !== "class_body") return methods;
+    for (const member of namedChildren(body)) {
+      if (!METHOD_NODE_TYPES.has(member.type) || isAccessor(member)) continue;
+      methods.push(member);
+    }
+    return methods;
   }
-  return undefined;
-}
-
-function renderedEntityName(
-  name: string,
-  typeParameters: ts.NodeArray<ts.TypeParameterDeclaration> | undefined,
-): string {
-  if (!typeParameters?.length) return name;
-  return `${name}<${typeParameters.map((parameter) => parameter.name.text).join(",")}>`;
-}
-
-function entityMethods(
-  node: ts.ClassDeclaration | ts.InterfaceDeclaration | ts.TypeAliasDeclaration | ts.EnumDeclaration,
-): readonly (ts.MethodDeclaration | ts.MethodSignature)[] {
-  if (ts.isClassDeclaration(node)) return node.members.filter(ts.isMethodDeclaration);
-  if (ts.isInterfaceDeclaration(node)) return node.members.filter(ts.isMethodSignature);
-  if (ts.isTypeAliasDeclaration(node) && ts.isTypeLiteralNode(node.type)) {
-    return node.type.members.filter(ts.isMethodSignature);
+  if (kind === "interface") {
+    if (body?.type !== "interface_body") return methods;
+    for (const member of namedChildren(body)) {
+      if (member.type === "method_signature") methods.push(member);
+    }
+    return methods;
   }
-  return [];
+  if (kind === "type") {
+    const value = declaration.childForFieldName("value");
+    if (value?.type !== "object_type") return methods;
+    for (const member of namedChildren(value)) {
+      if (member.type === "method_signature") methods.push(member);
+    }
+  }
+  return methods;
 }
 
-function location(
-  sourceFile: ts.SourceFile,
-  node: ts.Node,
-): Pick<ParsedDefinitionSpan, "line" | "column" | "from" | "to"> {
-  const from = node.getStart(sourceFile);
-  const { line, character } = sourceFile.getLineAndCharacterOfPosition(from);
-  return {
-    line: line + 1,
-    column: character + 1,
-    from,
-    to: node.getEnd(),
-  };
-}
+/** One declared entity and the members the definition index addresses under it, in source order. */
+type DefinitionEntity = {
+  kind: ParsedEntityKind;
+  nameNode: Node;
+  renderedName: string;
+  members: { name: string; node: Node }[];
+};
 
-export function parseDefinitionSpans(path: string, content: string): ParsedDefinitionSpan[] {
-  if (!isTypeScriptPath(path) || isDeclarationPath(path)) return [];
-  const sourceFile = ts.createSourceFile(
-    path,
-    content,
-    ts.ScriptTarget.Latest,
-    true,
-    path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-  );
+/**
+ * Language-neutral span builder. `key` is the persisted `DefinitionIndex.key` and is asserted
+ * verbatim by the definition-lookup suites, so its shape must not move.
+ */
+function definitionSpans(entities: readonly DefinitionEntity[]): ParsedDefinitionSpan[] {
   const entityOccurrences = new Map<string, number>();
   const memberOccurrences = new Map<string, number>();
-  const definitions: ParsedDefinitionSpan[] = [];
-
-  for (const statement of sourceFile.statements) {
-    const kind = entityKind(statement);
-    if (!kind || !(
-      ts.isClassDeclaration(statement)
-      || ts.isInterfaceDeclaration(statement)
-      || ts.isEnumDeclaration(statement)
-      || ts.isTypeAliasDeclaration(statement)
-    )) continue;
-    const nameNode = statement.name;
-    if (!nameNode) continue;
+  const spans: ParsedDefinitionSpan[] = [];
+  for (const entity of entities) {
+    const { kind, nameNode, renderedName } = entity;
     const name = nameNode.text;
     const entityCounterKey = `${kind}\0${name}`;
     const entityOccurrence = entityOccurrences.get(entityCounterKey) ?? 0;
     entityOccurrences.set(entityCounterKey, entityOccurrence + 1);
-    const renderedName = renderedEntityName(
-      name,
-      "typeParameters" in statement ? statement.typeParameters : undefined,
-    );
-    definitions.push({
+    spans.push({
       key: JSON.stringify([kind, name, entityOccurrence, null, null]),
       kind,
       name,
@@ -110,35 +97,130 @@ export function parseDefinitionSpans(path: string, content: string): ParsedDefin
       entityName: name,
       renderedEntityName: renderedName,
       entityOccurrence,
-      ...location(sourceFile, nameNode),
+      line: nameNode.startPosition.row + 1,
+      column: nameNode.startPosition.column + 1,
+      from: nameNode.startIndex,
+      to: nameNode.endIndex,
     });
-
-    for (const method of entityMethods(statement)) {
-      const name = methodName(method.name);
-      if (name === undefined) continue;
-      const memberCounterKey = `${kind}\0${statement.name.text}\0${name}`;
+    for (const member of entity.members) {
+      const memberCounterKey = `${kind}\0${name}\0${member.name}`;
       const sourceMemberOccurrence = memberOccurrences.get(memberCounterKey) ?? 0;
       memberOccurrences.set(memberCounterKey, sourceMemberOccurrence + 1);
-      definitions.push({
-        key: JSON.stringify([
-          kind,
-          statement.name.text,
-          entityOccurrence,
-          name,
-          sourceMemberOccurrence,
-        ]),
+      spans.push({
+        key: JSON.stringify([kind, name, entityOccurrence, member.name, sourceMemberOccurrence]),
         kind: "method",
-        name,
-        qualifiedName: `${statement.name.text}.${name}`,
+        name: member.name,
+        qualifiedName: `${name}.${member.name}`,
         entityKind: kind,
-        entityName: statement.name.text,
+        entityName: name,
         renderedEntityName: renderedName,
         entityOccurrence,
-        memberName: name,
+        memberName: member.name,
         sourceMemberOccurrence,
-        ...location(sourceFile, method.name),
+        line: member.node.startPosition.row + 1,
+        column: member.node.startPosition.column + 1,
+        from: member.node.startIndex,
+        to: member.node.endIndex,
       });
     }
   }
-  return definitions;
+  return spans;
+}
+
+function typescriptDefinitionEntities(root: Node): DefinitionEntity[] {
+  const entities: DefinitionEntity[] = [];
+  for (const declaration of topLevelDeclarations(root)) {
+    const kind = ENTITY_KIND_BY_NODE[declaration.type];
+    if (!kind) continue;
+    const nameNode = declaration.childForFieldName("name");
+    if (!nameNode) continue;
+    const members: DefinitionEntity["members"] = [];
+    for (const method of entityMethodNodes(declaration, kind)) {
+      const member = memberName(method);
+      // The definition index addresses members by source name; `#private` members are unaddressable.
+      if (!member || member.node.type === "private_property_identifier") continue;
+      if (member.name === "constructor") continue;
+      members.push(member);
+    }
+    entities.push({
+      kind,
+      nameNode,
+      renderedName: renderedTypeName(nameNode.text, declaration),
+      members,
+    });
+  }
+  return entities;
+}
+
+/** Same-file `impl` blocks keyed by the bare name of the type they apply to, in source order. */
+function rustImplBlocks(items: readonly Node[]): Map<string, Node[]> {
+  const blocks = new Map<string, Node[]>();
+  for (const item of items) {
+    if (item.type !== "impl_item") continue;
+    const name = rustImplTargetName(item);
+    if (name === undefined) continue;
+    const existing = blocks.get(name);
+    if (existing) existing.push(item);
+    else blocks.set(name, [item]);
+  }
+  return blocks;
+}
+
+/** Methods a Rust entity contributes: trait requirements, or every same-file `impl` block's. */
+function rustEntityMethodNodes(
+  declaration: Node,
+  implBlocks: ReadonlyMap<string, Node[]>,
+  bareName: string,
+): Node[] {
+  if (declaration.type === "trait_item") {
+    return rustBodyMethods(declaration.childForFieldName("body"));
+  }
+  const methods: Node[] = [];
+  if (declaration.type === "type_item") return methods;
+  for (const block of implBlocks.get(bareName) ?? []) {
+    methods.push(...rustBodyMethods(block.childForFieldName("body")));
+  }
+  return methods;
+}
+
+function rustDefinitionEntities(root: Node): DefinitionEntity[] {
+  const items = rustTopLevelItems(root);
+  const implBlocks = rustImplBlocks(items);
+  const entities: DefinitionEntity[] = [];
+  for (const declaration of items) {
+    const kind = RUST_ENTITY_KIND_BY_NODE[declaration.type];
+    if (!kind) continue;
+    const nameNode = declaration.childForFieldName("name");
+    if (!nameNode) continue;
+    const members: DefinitionEntity["members"] = [];
+    for (const method of rustEntityMethodNodes(declaration, implBlocks, nameNode.text)) {
+      const memberNode = method.childForFieldName("name");
+      if (!memberNode) continue;
+      members.push({ name: memberNode.text, node: memberNode });
+    }
+    entities.push({
+      kind,
+      nameNode,
+      renderedName: renderedTypeName(nameNode.text, declaration),
+      members,
+    });
+  }
+  return entities;
+}
+
+export function parseDefinitionSpans(path: string, content: string): ParsedDefinitionSpan[] {
+  if (isDeclarationPath(path)) return [];
+  const language = analysisLanguageForPath(path);
+  if (language === undefined) return [];
+  const parsed = language === "rust" ? parseRustSource(content) : parseTypeScriptSource(path, content);
+  if (!parsed) return [];
+  try {
+    return definitionSpans(
+      language === "rust"
+        ? rustDefinitionEntities(parsed.root)
+        : typescriptDefinitionEntities(parsed.root),
+    );
+  } finally {
+    parsed.dispose();
+  }
 }

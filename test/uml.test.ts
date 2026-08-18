@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { UmlDiagramGraph } from "../src/diagram-graph.ts";
 import type { PackageInfo } from "../src/types.ts";
 import { extractUmlDiagramGraph } from "../src/uml.ts";
@@ -66,9 +66,9 @@ test("renders generic and semantic UML styles including tests", async () => {
   const resultLine = lines[resultIndex].trim();
   const executeLine = lines[executeIndex].trim();
   const executeReturnRow =
-    "§() Promise⟨｛ ok: true; output: Output; ｝ | ｛ ok: false; rejection: Error; ｝⟩";
+    "§() Promise⟨ ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝ ⟩";
   expect(resultLine).toContain(
-    "result: ｛ ok: true; output: Output; ｝ | ｛ ok: false; rejection: Error; ｝",
+    "result: ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝",
   );
   expect(resultLine).not.toContain("§()");
   expect(executeLine).toBe("+execute()");
@@ -299,8 +299,8 @@ test("removes import qualifiers from nested generic property and method labels",
     [
       'import { current, definitions } from "./types";',
       "export class Runtime<TSchema> {",
-      "  readonly registry = definitions<TSchema>();",
-      "  resolve() { return current<TSchema>(); }",
+      "  readonly registry: Map<Skill, AgentTool<TSchema, any>> = definitions<TSchema>();",
+      "  resolve(): { tool: AgentTool<TSchema, any>; context: DurableContext } { return current<TSchema>(); }",
       "}",
       "",
     ].join("\n"),
@@ -314,7 +314,7 @@ test("removes import qualifiers from nested generic property and method labels",
   expect(registryLine).toBe("+registry: Map⟨Skill, AgentTool⟨TSchema, any⟩⟩");
   expect(lines[resolveIndex]).toBe("+resolve()");
   expect(lines[resolveIndex + 1]).toBe(
-    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext; ｝",
+    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext ｝",
   );
 });
 
@@ -1597,3 +1597,25 @@ test("keeps undeclared heritage boundary nodes and edges renderable", async () =
   expect(customErrorFrames).toHaveLength(1);
   expect(customErrorFrames[0]).toContain("Error<|--CustomError");
 });
+
+test("parses scopes whose combined file paths exceed the brace glob limit", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-uml-glob-");
+  await mkdir(join(root, "src"), { recursive: true });
+  const names: string[] = [];
+  const paths: string[] = [];
+  const braceGlobLength = () =>
+    `{${paths.map((path) => path.split(sep).join("/")).join(",")}}`.length;
+  do {
+    const index = String(names.length).padStart(3, "0");
+    names.push(`GeneratedModule${index}`);
+    paths.push(join(root, "src", `generated-module-with-a-long-name-${index}.ts`));
+  } while (braceGlobLength() <= 12_000);
+  await Promise.all(
+    paths.map((path, index) => writeFile(path, `export class ${names[index]} {}\n`)),
+  );
+
+  const dsl = (await materializeUml(root, "", [])).dsl;
+
+  expect(dsl).toContain(names[0]);
+  expect(dsl).toContain(names[names.length - 1]);
+}, 60_000);

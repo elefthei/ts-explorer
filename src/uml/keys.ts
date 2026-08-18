@@ -5,12 +5,12 @@ export function posix(path: string): string {
 }
 
 export function isTestPath(path: string): boolean {
-  return /(^|[\\/])(test|tests|__tests__)([\\/]|$)|\.(test|spec)\.[cm]?[tj]sx?$/.test(path);
+  return /(^|[\\/])(test|tests|__tests__)([\\/]|$)|\.(test|spec)\.[cm]?[tj]sx?$|(^|[\\/])tests\.rs$/
+    .test(path);
 }
 
 export function umlEntityKey(fileName: string, name: string): string {
-  const path = posix(fileName);
-  return `${process.platform === "win32" ? path.toLowerCase() : path}\0${name}`;
+  return `${umlFileKey(fileName)}\0${name}`;
 }
 
 export function bareUmlName(name: string): string {
@@ -25,4 +25,11 @@ export function umlFileKey(fileName: string): string {
 
 export function scopeRelativePath(sourceDir: string, path: string): string {
   return posix(relative(sourceDir, path));
+}
+
+export function syntheticTypeId(filePath: string, renderedName: string): string {
+  const normalized = posix(filePath);
+  const extension = normalized.lastIndexOf(".");
+  const withoutExtension = extension < 0 ? normalized : normalized.slice(0, extension);
+  return `"${withoutExtension}".${renderedName}`;
 }

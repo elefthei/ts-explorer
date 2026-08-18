@@ -334,11 +334,212 @@ test("excludes declarations that have no canonical UML definition target", () =>
   }
 });
 
-test("accepts every supported TypeScript source extension", () => {
+test("accepts every supported source extension", () => {
   for (const path of ["component.ts", "component.tsx", "component.mts", "component.cts"]) {
     expect(
       parseDefinitionSpans(path, "export class Component {}\n").map(({ key }) => key),
       path,
     ).toEqual(['["class","Component",0,null,null]']);
   }
+  expect(
+    parseDefinitionSpans("component.rs", "pub struct Component;\n").map(({ key }) => key),
+  ).toEqual(['["class","Component",0,null,null]']);
+});
+
+test("CRLF sources keep one-based line and column", () => {
+  const lines = [
+    "export class Box {",
+    "  run(): void {}",
+    "}",
+    "export interface Service {",
+    "  execute(): void;",
+    "}",
+    "",
+  ];
+  const lf = lines.join("\n");
+  const crlf = lines.join("\r\n");
+
+  expect(contractRows("model.ts", crlf)).toEqual(contractRows("model.ts", lf));
+  expect(parseDefinitionSpans("model.ts", lf).map(({ from, to }) => [from, to])).toEqual([
+    [13, 16],
+    [21, 24],
+    [55, 62],
+    [67, 74],
+  ]);
+  // characterizes: only the raw offsets absorb the extra carriage returns
+  expect(parseDefinitionSpans("model.ts", crlf).map(({ from, to }) => [from, to])).toEqual([
+    [13, 16],
+    [22, 25],
+    [58, 65],
+    [71, 78],
+  ]);
+});
+
+test("Unicode and astral identifiers report UTF-16 columns", () => {
+  const source = [
+    "export class Ünïcode {",
+    "  ströme(): void {}",
+    "}",
+    "",
+  ].join("\n");
+
+  expect(contractRows("model.ts", source)).toEqual([
+    {
+      key: '["class","Ünïcode",0,null,null]',
+      kind: "class",
+      name: "Ünïcode",
+      qualifiedName: "Ünïcode",
+      entityKind: "class",
+      renderedEntityName: "Ünïcode",
+      entityOccurrence: 0,
+      memberName: undefined,
+      sourceMemberOccurrence: undefined,
+      line: 1,
+      column: 14,
+      token: "Ünïcode",
+    },
+    {
+      key: '["class","Ünïcode",0,"ströme",0]',
+      kind: "method",
+      name: "ströme",
+      qualifiedName: "Ünïcode.ströme",
+      entityKind: "class",
+      renderedEntityName: "Ünïcode",
+      entityOccurrence: 0,
+      memberName: "ströme",
+      sourceMemberOccurrence: 0,
+      line: 2,
+      column: 3,
+      token: "ströme",
+    },
+  ]);
+
+  // characterizes: columns count UTF-16 code units, so the astral name shifts `run` by two
+  const astral = "export class A\u{1D465}B { run(): void {} }\n";
+  expect(contractRows("model.ts", astral).map(({ name, line, column }) => ({
+    name,
+    line,
+    column,
+  }))).toEqual([
+    { name: "A\u{1D465}B", line: 1, column: 14 },
+    { name: "run", line: 1, column: 21 },
+  ]);
+
+  // characterizes: a leading BOM is counted as a column on the first line
+  const bom = "\uFEFFexport class Bommed {\n  run(): void {}\n}\n";
+  expect(contractRows("model.ts", bom).map(({ name, line, column }) => ({
+    name,
+    line,
+    column,
+  }))).toEqual([
+    { name: "Bommed", line: 1, column: 15 },
+    { name: "run", line: 2, column: 3 },
+  ]);
+});
+
+test("tabs, missing trailing newline and blank leading lines", () => {
+  const tabbed = "export class Tabbed {\n\trun(): void {}\n}\n";
+  const unterminated = "export class NoNewline {\n  run(): void {}\n}";
+  const leadingBlanks = "\n\nexport class Late {\n  run(): void {}\n}\n";
+
+  // characterizes: a tab is one column, exactly like any other single code unit
+  expect(contractRows("model.ts", tabbed).map(({ name, line, column }) => ({
+    name,
+    line,
+    column,
+  }))).toEqual([
+    { name: "Tabbed", line: 1, column: 14 },
+    { name: "run", line: 2, column: 2 },
+  ]);
+  expect(contractRows("model.ts", unterminated).map(({ name, line, column }) => ({
+    name,
+    line,
+    column,
+  }))).toEqual([
+    { name: "NoNewline", line: 1, column: 14 },
+    { name: "run", line: 2, column: 3 },
+  ]);
+  expect(contractRows("model.ts", leadingBlanks).map(({ name, line, column }) => ({
+    name,
+    line,
+    column,
+  }))).toEqual([
+    { name: "Late", line: 3, column: 14 },
+    { name: "run", line: 4, column: 3 },
+  ]);
+});
+
+test("decorators and leading modifiers do not move the name span", () => {
+  const source = [
+    "declare const dec: ClassDecorator;",
+    "@dec export abstract class Decorated {",
+    "  abstract run(): void;",
+    "}",
+    "export default abstract class Named {",
+    "  run(): void {}",
+    "}",
+    "declare class Ambient {",
+    "  run(): void;",
+    "}",
+    "",
+  ].join("\n");
+
+  // characterizes: the span always lands on the name token, whatever precedes it on the line
+  expect(contractRows("model.ts", source).map(({ key, line, column, token }) => ({
+    key,
+    line,
+    column,
+    token,
+  }))).toEqual([
+    { key: '["class","Decorated",0,null,null]', line: 2, column: 28, token: "Decorated" },
+    { key: '["class","Decorated",0,"run",0]', line: 3, column: 12, token: "run" },
+    { key: '["class","Named",0,null,null]', line: 5, column: 31, token: "Named" },
+    { key: '["class","Named",0,"run",0]', line: 6, column: 3, token: "run" },
+    { key: '["class","Ambient",0,null,null]', line: 8, column: 15, token: "Ambient" },
+    { key: '["class","Ambient",0,"run",0]', line: 9, column: 3, token: "run" },
+  ]);
+});
+
+test("namespace-nested and ambient-module declarations stay excluded", () => {
+  const source = [
+    "namespace N {",
+    "  export class Inner {}",
+    "  export interface Shape {}",
+    "}",
+    'declare module "m" {',
+    "  export class Ambient {}",
+    "  export interface Contract {}",
+    "}",
+    "",
+  ].join("\n");
+
+  expect(contractRows("model.ts", source)).toEqual([]);
+});
+
+test("TSX generic arrow syntax parses as TSX", () => {
+  const withTrailingComma = "const f = <T,>(v: T) => v;\nexport class Component {\n  run(): void {}\n}\n";
+  const withoutTrailingComma = "const f = <T>(v: T) => v;\nexport class Component {\n  run(): void {}\n}\n";
+
+  expect(contractRows("component.tsx", withTrailingComma).map(({ key, line, column }) => ({
+    key,
+    line,
+    column,
+  }))).toEqual([
+    { key: '["class","Component",0,null,null]', line: 2, column: 14 },
+    { key: '["class","Component",0,"run",0]', line: 3, column: 3 },
+  ]);
+  // characterizes: tree-sitter-tsx accepts the ambiguous generic arrow instead of reading `<T>`
+  // as the start of a JSX element, so the declarations after it stay navigable in both parsers
+  expect(contractRows("component.tsx", withoutTrailingComma).map(({ key, line, column }) => ({
+    key,
+    line,
+    column,
+  }))).toEqual([
+    { key: '["class","Component",0,null,null]', line: 2, column: 14 },
+    { key: '["class","Component",0,"run",0]', line: 3, column: 3 },
+  ]);
+  expect(contractRows("component.ts", withoutTrailingComma).map(({ key }) => key)).toEqual([
+    '["class","Component",0,null,null]',
+    '["class","Component",0,"run",0]',
+  ]);
 });

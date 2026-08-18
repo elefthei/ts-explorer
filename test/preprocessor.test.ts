@@ -56,23 +56,10 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       sourceNodeId: "a",
       targetNodeId: "b",
     }],
-    settings: {
-      glob: scopePath,
-      tsconfig: null,
-      outFile: "",
-      propertyTypes: true,
-      modifiers: true,
-      typeLinks: true,
-      outDsl: "",
-      outMermaidDsl: "",
-      memberAssociations: true,
-      exportedTypesOnly: false,
-    },
-    settingLines: [],
     declarations: [
-      { declarationOrdinal: 0, fileName: "alpha.ts", memberAssociationsPresent: false },
-      { declarationOrdinal: 1, fileName: "beta.ts", memberAssociationsPresent: false },
-      { declarationOrdinal: 2, fileName: "gamma.ts", memberAssociationsPresent: false },
+      { declarationOrdinal: 0, fileName: "alpha.ts", language: "typescript", memberAssociationsPresent: false },
+      { declarationOrdinal: 1, fileName: "beta.ts", language: "typescript", memberAssociationsPresent: false },
+      { declarationOrdinal: 2, fileName: "gamma.ts", language: "typescript", memberAssociationsPresent: false },
     ],
     entities: [
       { declarationOrdinal: 0, entityKind: "class", entityOrdinal: 0, nodeId: "a" },
@@ -86,7 +73,6 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       entityKind: "class",
       entityOrdinal: 0,
       methodOrdinal: 0,
-      modifierFlags: 0,
       name: "beta",
       returnType: "Beta",
       returnTypeIdsPresent: true,
@@ -99,6 +85,7 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
       typeIdOrdinal: 0,
       typeId: "b",
     }],
+    memberModifiers: [],
     enumItems: [],
     entityHeritageClauses: [],
     declarationHeritageGroups: [],
@@ -117,6 +104,13 @@ function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
     externalUserTargets: [],
     definitions: [],
   };
+}
+
+/** Stamps a distinguishing marker into a stored graph so persisted scopes can be told apart. */
+function setFixtureMarker(graph: UmlDiagramGraph, marker: string): void {
+  const [declaration] = graph.declarations;
+  if (declaration === undefined) throw new Error("UML graph has no declaration to mark");
+  declaration.fileName = `${marker}.ts`;
 }
 
 function renderFixtureGraph(graph: DiagramGraph): RenderedDiagram {
@@ -507,7 +501,7 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
   expect(await initResponse).toEqual({
     id: 1,
     ok: true,
-    value: { activeGenerationId: null },
+    value: { activeGenerationId: null, hasFailedDiagrams: false },
   });
 
   const beginResponse = waitForResponse(2);
@@ -587,7 +581,7 @@ test("exits when the parent IPC channel disconnects", async () => {
   expect(await initResponse).toEqual({
     id: 1,
     ok: true,
-    value: { activeGenerationId: null },
+    value: { activeGenerationId: null, hasFailedDiagrams: false },
   });
 
   subprocess.disconnect();
@@ -841,16 +835,19 @@ test("preprocesses each visible scope once and serves formatted files and litera
     path: "root.ts",
     content: formattedRootSource,
     definitions: rootDefinitions,
+    highlights: expect.any(Array),
   });
   expect(await preprocessor.readFile("packages/b/index.js")).toEqual({
     path: "packages/b/index.js",
     content: 'export const jsValue = { text: "js-untracked" };\n',
     definitions: [],
+    highlights: expect.any(Array),
   });
   expect(await preprocessor.readFile("malformed.js")).toEqual({
     path: "malformed.js",
     content: malformedSource,
     definitions: [],
+    highlights: expect.any(Array),
   });
 
   const positioned = await preprocessor.readFile("root.ts", { line: 10, column: 14 });
@@ -977,7 +974,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
   openDatabase(dbPath, (db) => {
     expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 4,
+      user_version: 7,
     });
     expect(db.query<{
       name: string;
@@ -1304,12 +1301,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     const originalDefinitions = activeCache.readDefinitions(generationId, "root.ts");
 
     const rendererFailureGraph = structuredClone(rootGraph);
-    const rendererFailureSettings = rendererFailureGraph.settings;
-    if (rendererFailureSettings === null) throw new Error("fixture UML graph has no settings");
-    rendererFailureGraph.settings = {
-      ...rendererFailureSettings,
-      outFile: "renderer-failure-must-roll-back",
-    };
+    setFixtureMarker(rendererFailureGraph, "renderer-failure-must-roll-back");
     const rendererCall: { graph: DiagramGraph | null } = { graph: null };
     expect(() => activeCache.writeScope(generationId, {
       entries: [],
@@ -1320,6 +1312,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: "renderer failure must roll back",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [],
     }, (reloaded) => {
@@ -1348,12 +1341,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       uml: { scopePath: "root.ts", entityName: "SearchNeedleEntity<T>" },
     };
     const definitionFailureGraph = structuredClone(rootGraph);
-    const definitionFailureSettings = definitionFailureGraph.settings;
-    if (definitionFailureSettings === null) throw new Error("fixture UML graph has no settings");
-    definitionFailureGraph.settings = {
-      ...definitionFailureSettings,
-      outFile: "definition-failure-must-roll-back",
-    };
+    setFixtureMarker(definitionFailureGraph, "definition-failure-must-roll-back");
     let definitionRendererCalled = false;
     expect(() => activeCache.writeScope(generationId, {
       entries: [],
@@ -1364,6 +1352,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: "definition failure must roll back",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [invalidDefinition],
     }, (reloaded) => {
@@ -1411,6 +1400,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         displayContent: replacementContent,
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [replacementDefinition],
     }, renderDiagramGraph);
@@ -1420,6 +1410,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       displayContent: replacementContent,
       sourceError: null,
       formatError: null,
+      language: "typescript",
     });
     expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
     expect(activeCache.searchFiles(
@@ -1453,17 +1444,13 @@ test("rejects unavailable or inconsistent fallback sources without replacing tar
   const cache = new Cache(dbPath);
   let activeCache = cache;
   try {
-    const sourceGenerationId = activeCache.beginGeneration("startup");
-    const targetGenerationId = activeCache.beginGeneration("watch");
+    const sourceGenerationId = activeCache.beginGeneration("startup", "");
+    const targetGenerationId = activeCache.beginGeneration("watch", "");
     const sourceGraph = fixtureUmlGraph("source.ts");
     const targetSourceGraph = fixtureUmlGraph("source.ts");
-    const targetSourceSettings = targetSourceGraph.settings;
-    if (targetSourceSettings === null) throw new Error("fixture UML graph has no settings");
-    targetSourceGraph.settings = { ...targetSourceSettings, outFile: "target-source" };
+    setFixtureMarker(targetSourceGraph, "target-source");
     const targetOtherGraph = fixtureUmlGraph("other.ts");
-    const targetOtherSettings = targetOtherGraph.settings;
-    if (targetOtherSettings === null) throw new Error("fixture UML graph has no settings");
-    targetOtherGraph.settings = { ...targetOtherSettings, outFile: "target-other" };
+    setFixtureMarker(targetOtherGraph, "target-other");
 
     activeCache.writeScope(sourceGenerationId, {
       entries: [],
@@ -1568,7 +1555,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
   const dbPath = join(root, "invalid-graph.db");
   const cache = new Cache(dbPath);
   try {
-    const generationId = cache.beginGeneration("startup");
+    const generationId = cache.beginGeneration("startup", "");
     const scopePath = "constraints.ts";
     const validGraph = fixtureUmlGraph(scopePath);
     cache.writeScope(generationId, {
@@ -1580,6 +1567,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
         displayContent: "baseline",
         sourceError: null,
         formatError: null,
+        language: "typescript",
       },
       definitions: [],
     }, renderFixtureGraph);
@@ -1637,6 +1625,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
             displayContent: name,
             sourceError: null,
             formatError: null,
+            language: "typescript",
           },
           definitions: [],
         }, (reloaded) => {
@@ -1717,12 +1706,6 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
         },
       },
       {
-        name: "normal graph has no settings",
-        mutate: (graph) => {
-          graph.settings = null;
-        },
-      },
-      {
         name: "bare graph retains model rows",
         mutate: (graph) => {
           graph.renderMode = "bare";
@@ -1750,6 +1733,7 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
           displayContent: name,
           sourceError: null,
           formatError: null,
+          language: "typescript",
         },
         definitions: [],
       }, (reloaded) => {
@@ -2028,17 +2012,21 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   expect(firstErrors).toEqual([]);
   await closePreprocessor(first);
 
-  const activeId = openDatabase(dbPath, (db) => {
-    const activeGeneration = db.query<{ id: number }, []>(`
-      SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
+  const active = openDatabase(dbPath, (db) => {
+    const activeGeneration = db.query<{ id: number; started_at: number }, []>(`
+      SELECT generations.id AS id, generations.started_at AS started_at
+      FROM cache_meta
+      JOIN generations ON generations.id = CAST(cache_meta.value AS INTEGER)
+      WHERE cache_meta.key = 'active_generation'
     `).get();
     if (activeGeneration === null) throw new Error("active generation was not persisted");
-    return activeGeneration.id;
+    return activeGeneration;
   });
+  const activeId = active.id;
   const orphanCache = new Cache(dbPath);
   let orphanId: number;
   try {
-    orphanId = orphanCache.beginGeneration("watch");
+    orphanId = orphanCache.beginGeneration("watch", "");
     orphanCache.writeScope(orphanId, {
       entries: [],
       diagram: { graph: fixtureUmlGraph("orphan.ts"), outcome: { status: "ready" } },
@@ -2103,15 +2091,19 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   const second = trackedPreprocessor(root, () => undefined, (error) => secondErrors.push(error));
   await second.ready();
   await second.whenIdle();
-  expect((await second.search("initial-cache", false)).files).toEqual(["app.js"]);
-  expect((await second.search("after-orphan-recovery", false)).files).toEqual([]);
+  expect((await second.search("after-orphan-recovery", false)).files).toEqual(["app.js"]);
+  expect((await second.search("initial-cache", false)).files).toEqual([]);
   expect(secondErrors).toEqual([]);
-  openDatabase(dbPath, (db) => {
-    expect(db.query<{ id: number; state: string; cause: string }, []>(`
-      SELECT id, state, cause FROM generations ORDER BY id
-    `).all()).toEqual([
-      { id: seeded.activeId, state: "active", cause: "startup" },
-    ]);
+  const restartedId = openDatabase(dbPath, (db) => {
+    const generations = db.query<{ id: number; state: string; cause: string; started_at: number }, []>(`
+      SELECT id, state, cause, started_at FROM generations ORDER BY id
+    `).all();
+    expect(generations).toHaveLength(1);
+    const [generation] = generations;
+    if (generation === undefined) throw new Error("startup generation was not rebuilt");
+    expect(generation).toMatchObject({ state: "active", cause: "startup" });
+    expect(generation.started_at).toBeGreaterThan(active.started_at);
+    return generation.id;
   });
 
   second.rebuild("watch");
@@ -2129,7 +2121,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     const [generation] = generations;
     if (generation === undefined) throw new Error("watch generation was not promoted");
     expect(generation).toMatchObject({ state: "active", cause: "watch" });
-    expect(generation.id).not.toBe(seeded.activeId);
+    expect(generation.id).not.toBe(restartedId);
     expectOnlyNormalizedGeneration(db, generation.id);
   });
 
@@ -2137,7 +2129,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   const invalidPointerCache = new Cache(dbPath);
   let invalidPointerOrphanId: number;
   try {
-    invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch");
+    invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch", "");
     invalidPointerCache.writeScope(invalidPointerOrphanId, {
       entries: [],
       diagram: {
@@ -2194,6 +2186,182 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     }
   });
 }, 30_000);
+
+test("startup retries diagram scopes whose cached outcome is an error", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-failure-retry-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "retry-workspace" }));
+  await writeFixtureFile(root, "app.ts", "export class RetryTarget {}\n");
+
+  const first = trackedPreprocessor(root, () => undefined, () => undefined);
+  await first.ready();
+  await first.whenIdle();
+  await closePreprocessor(first);
+  const readActiveId = () =>
+    openDatabase(dbPath, (db) =>
+      db.query<{ id: number }, []>(
+        `SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'`,
+      ).get()?.id);
+  const seededId = readActiveId();
+  if (seededId === undefined) throw new Error("active generation was not persisted");
+
+  // A healthy warm cache is reused: no new generation.
+  const second = trackedPreprocessor(root, () => undefined, () => undefined);
+  await second.ready();
+  await second.whenIdle();
+  await closePreprocessor(second);
+  expect(readActiveId()).toBe(seededId);
+
+  // Poison the cached outcome for the root UML scope.
+  const changes = openDatabase(dbPath, (db) =>
+    db.query<never, [number]>(`
+      UPDATE diagrams
+      SET response_json = json_set(
+        response_json, '$.status', 'error', '$.error', 'seeded stale failure'
+      )
+      WHERE generation_id = ? AND kind = 'uml' AND scope_path = ''
+    `).run(seededId).changes);
+  expect(changes).toBe(1);
+
+  const thirdErrors: Error[] = [];
+  const third = trackedPreprocessor(root, () => undefined, (error) => thirdErrors.push(error));
+  await third.ready();
+  await third.whenIdle();
+  const repaired = await third.getDiagram("uml", "");
+  await closePreprocessor(third);
+  expect(thirdErrors).toEqual([]);
+  expect(repaired.status).toBe("ready");
+  expect(repaired.error).toBeUndefined();
+  expect(readActiveId()).not.toBe(seededId);
+}, 60_000);
+
+test("serves packages from a building generation before the watch rebuild promotes", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-packages-rebuild-");
+  const dbPath = join(root, ".explore", "explore.db");
+  const blockerSource = Array.from(
+    { length: 1_000 },
+    (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  await writeFixtureFile(
+    root,
+    "package.json",
+    JSON.stringify({ name: "packages-root", workspaces: ["packages/*"] }),
+  );
+  await writeFixtureFile(root, "packages/a/package.json", JSON.stringify({ name: "a" }));
+  await writeFixtureFile(root, "packages/a/a-blocker.ts", `${blockerSource}\n`);
+
+  const readActiveId = () =>
+    openDatabase(dbPath, (db) =>
+      db.query<{ id: number }, []>(
+        `SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'`,
+      ).get()?.id);
+
+  const promotions: string[] = [];
+  const errors: Error[] = [];
+  const rebuildScopeStarted = Promise.withResolvers<void>();
+  let watchingRebuild = false;
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => promotions.push("promoted"),
+    (error) => errors.push(error),
+    1,
+    (event) => {
+      if (
+        watchingRebuild && event.cause === "watch" && event.event === "start" &&
+        event.component === "code"
+      ) {
+        rebuildScopeStarted.resolve();
+      }
+    },
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+  expect((await preprocessor.getPackages()).map((pkg) => pkg.name)).toEqual(["a"]);
+  const seededId = readActiveId();
+  if (seededId === undefined) throw new Error("active generation was not persisted");
+  const promotionsBeforeRebuild = promotions.length;
+
+  // A live change adds a second workspace package, then a rebuild starts.
+  await writeFixtureFile(root, "packages/b/package.json", JSON.stringify({ name: "b" }));
+  await writeFixtureFile(root, "packages/b/b-blocker.ts", `${blockerSource}\n`);
+  watchingRebuild = true;
+  preprocessor.rebuild("watch");
+  let idleResolved = false;
+  const idle = preprocessor.whenIdle().then(() => {
+    idleResolved = true;
+  });
+
+  // A scope job for the rebuild means discovery already finished and the remaining scope work is
+  // still queued: exactly the window in which /api/packages used to block until promotion.
+  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+  const rebuilding = await preprocessor.getPackages();
+  expect(rebuilding.map((pkg) => pkg.name).sort()).toEqual(["a", "b"]);
+  expect(readActiveId()).toBe(seededId);
+  expect(promotions.length).toBe(promotionsBeforeRebuild);
+  expect(idleResolved).toBe(false);
+
+  await idle;
+  expect(readActiveId()).not.toBe(seededId);
+  expect((await preprocessor.getPackages()).map((pkg) => pkg.name).sort()).toEqual(["a", "b"]);
+  await closePreprocessor(preprocessor);
+  expect(errors).toEqual([]);
+}, 60_000);
+
+test("reserves a subprocess slot so background scope work never saturates the pool", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-interactive-slot-");
+  const blockerSource = Array.from(
+    { length: 400 },
+    (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  const targetPath = "z-slot-target.ts";
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "interactive-slot" }));
+  for (const name of ["a", "b", "c"]) {
+    await writeFixtureFile(root, `${name}-blocker.ts`, `${blockerSource}\n`);
+  }
+  await writeFixtureFile(root, targetPath, "export class SlotTarget { locate() { return 1; } }\n");
+
+  const poolSize = 2;
+  const errors: Error[] = [];
+  let activeScopes = 0;
+  let peakScopes = 0;
+  const rebuildScopeStarted = Promise.withResolvers<void>();
+  let watchingRebuild = false;
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => errors.push(error),
+    poolSize,
+    (event) => {
+      if (event.component !== "code") return;
+      if (event.event === "start") {
+        activeScopes += 1;
+        peakScopes = Math.max(peakScopes, activeScopes);
+        if (watchingRebuild && event.cause === "watch") rebuildScopeStarted.resolve();
+      } else {
+        activeScopes -= 1;
+      }
+    },
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+
+  watchingRebuild = true;
+  preprocessor.rebuild("watch");
+  let idleResolved = false;
+  const idle = preprocessor.whenIdle().then(() => {
+    idleResolved = true;
+  });
+  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+
+  // Issued while the rebuild owns the pool: the reserved slot has to serve it anyway.
+  await preprocessor.getDefinition(targetPath, { line: 1, column: 14 });
+  expect(idleResolved).toBe(false);
+
+  await idle;
+  expect(peakScopes).toBe(poolSize - 1);
+  await closePreprocessor(preprocessor);
+  expect(errors).toEqual([]);
+}, 60_000);
 
 test("defers recovered readiness when a watch rebuild is requested before bootstrap completes", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-recovery-race-");

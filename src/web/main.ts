@@ -2,9 +2,6 @@ import mermaid from "mermaid";
 import { basicSetup, EditorView } from "codemirror";
 import { Decoration } from "@codemirror/view";
 import { EditorSelection, EditorState } from "@codemirror/state";
-import { javascript } from "@codemirror/lang-javascript";
-import { forceParsing, syntaxHighlighting } from "@codemirror/language";
-import { classHighlighter } from "@lezer/highlight";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
@@ -13,6 +10,7 @@ import type {
   GotoDefinition,
   GotoDefinitionLookupResponse,
   PackageDiagramNode,
+  PackageInfo,
   PreprocessControlRequest,
   PreprocessPriorityResponse,
   SearchResponse,
@@ -29,6 +27,7 @@ import {
   formatUmlMethodReturnLabel,
   localUserIdFromNodeId,
   packageNodeIdFromNodeId,
+  hasDiagramBody,
   hasPassedDragThreshold,
   matchesSearchQuery,
   panViewport,
@@ -39,10 +38,10 @@ import {
 } from "./diagram-interactions.ts";
 
 function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
-const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>()};
+const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>(),packages:[] as readonly PackageInfo[]};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
-const PRINT_PARSE_BUDGET_MS=5_000;
+const EMPTY_DIAGRAM_MESSAGE="No diagram content for this scope";
 const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
 const diagramRequests=new RequestSequence();
 const searchRequests=new RequestSequence();
@@ -52,6 +51,7 @@ const editorRequests=new RequestSequence();
 const emittedUmlScopes=new Set<string>();
 const diagramLoadingState={loading:false,showMessage:false};
 let activeScopeSyncToken:number|undefined;
+let diagramError:string|undefined;
 let deferredOpenFileRefresh=false;
 mermaid.initialize({startOnLoad:false,securityLevel:"strict",theme:"dark"});
 async function api<T>(url:string,init?:RequestInit):Promise<T>{const response=await fetch(url,init);const body=await response.json() as T & {error?:string};if(!response.ok)throw new Error(body.error??`Request failed (${response.status})`);return body;}
@@ -83,7 +83,8 @@ async function prioritizeScope(
   return{cancelled:false,response};
 }
 function setStatus(text:string,error=false){const node=$("#status");node.textContent=text;node.classList.toggle("error",error);}
-function showError(error:string|undefined){const panel=$("#error-panel");panel.textContent=error??"";panel.hidden=!error;}
+function renderErrorPanel():void{const panel=$("#error-panel");const text=(diagramLoadingState.loading||activeScopeSyncToken!==undefined)?undefined:diagramError;panel.textContent=text??"";panel.hidden=!text;}
+function showError(error:string|undefined){diagramError=error;renderErrorPanel();}
 function applyDiagramLoading():void{
   const loading=diagramLoadingState.loading||activeScopeSyncToken!==undefined;
   const showMessage=diagramLoadingState.showMessage||activeScopeSyncToken!==undefined;
@@ -92,7 +93,7 @@ function applyDiagramLoading():void{
   const stage=$("#diagram-stage");
   stage.setAttribute("aria-busy",String(loading));
   stage.classList.toggle("loading",loading);
-  if(loading)showError(undefined);
+  renderErrorPanel();
 }
 function setDiagramLoading(loading:boolean,showMessage=false):void{
   diagramLoadingState.loading=loading;
@@ -255,6 +256,7 @@ function renderTree(){
   applySearchHighlights();
 }
 function collectDirectoryPaths(node:TreeNode,paths=new Set<string>()):Set<string>{if(node.kind==="directory")paths.add(node.path);for(const child of node.children??[])collectDirectoryPaths(child,paths);return paths;}
+function isPackageParentDirectory(path:string):boolean{return state.packages.some((pkg)=>pkg.path.includes("/")&&pkg.path.slice(0,pkg.path.lastIndexOf("/"))===path);}
 let treeRefreshPromise:Promise<void>|undefined;
 let treeRefreshRequested=false;
 function loadTree():Promise<void>{
@@ -273,6 +275,8 @@ function loadTree():Promise<void>{
         state.tree=response.root;
         state.version=response.version;
         $("#source-label").textContent=response.root.name;
+        const packagesResponse=await api<{version:number;packages:PackageInfo[]}>("/api/packages").catch(()=>null);
+        if(packagesResponse)state.packages=packagesResponse.packages;
         renderTree();
       }catch(error){
         if(treeRefreshRequested)continue;
@@ -301,18 +305,23 @@ async function renderUmlScope(
     frame.setAttribute("role","listitem");
     frame.setAttribute("aria-label",`UML diagram ${nextFrameIndex+1}`);
     frame.dataset.index=String(nextFrameIndex);
-    try{
-      const rendered=await mermaid.render(`diagram-${renderToken}-${directoryIndex}-${frameIndex}`,dsl);
-      if(!isCurrent())return{nextFrameIndex,complete:false};
-      frame.innerHTML=rendered.svg;
-      decorateUmlDefinitions(frame,diagram.definitions);
-      decorateUmlUsers(frame,diagram.localUsers,diagram.externalUsers);
-    }catch(error){
-      if(!isCurrent())return{nextFrameIndex,complete:false};
-      const message=error instanceof Error?error.message:String(error);
-      frame.classList.add("error");
-      frame.textContent=`Diagram ${frameIndex+1}: ${message}`;
-      errors.push(scopedErrors?`[${scope}] diagram ${frameIndex+1}: ${message}`:`Diagram ${frameIndex+1}: ${message}`);
+    if(!hasDiagramBody(dsl)){
+      frame.classList.add("empty");
+      frame.textContent=EMPTY_DIAGRAM_MESSAGE;
+    }else{
+      try{
+        const rendered=await mermaid.render(`diagram-${renderToken}-${directoryIndex}-${frameIndex}`,dsl);
+        if(!isCurrent())return{nextFrameIndex,complete:false};
+        frame.innerHTML=rendered.svg;
+        decorateUmlDefinitions(frame,diagram.definitions);
+        decorateUmlUsers(frame,diagram.localUsers,diagram.externalUsers);
+      }catch(error){
+        if(!isCurrent())return{nextFrameIndex,complete:false};
+        const message=error instanceof Error?error.message:String(error);
+        frame.classList.add("error");
+        frame.textContent=`Diagram ${frameIndex+1}: ${message}`;
+        errors.push(scopedErrors?`[${scope}] diagram ${frameIndex+1}: ${message}`:`Diagram ${frameIndex+1}: ${message}`);
+      }
     }
     holder.append(frame);
     nextFrameIndex++;
@@ -328,7 +337,7 @@ async function loadDiagram(
     &&(definitionToken===undefined||definitionRequests.isCurrent(definitionToken));
   const showLoading=state.mode==="uml"&&!emittedUmlScopes.has(state.scope);
   if(showLoading)emittedUmlScopes.add(state.scope);
-  if(isCurrent())setDiagramLoading(state.mode==="uml",showLoading);
+  if(isCurrent()){setDiagramLoading(state.mode==="uml",showLoading);showError(undefined);}
   try{
     const query=new URLSearchParams({kind:state.mode,path:state.scope});
     const diagram=await api<DiagramResponse>(`/api/diagram?${query}`);
@@ -337,6 +346,18 @@ async function loadDiagram(
     $("#dsl-content").textContent=diagram.dsl;
     showError(diagram.status==="error"?diagram.error:undefined);
     const holder=$("#svg-holder");
+    if(diagram.status==="error"){
+      holder.classList.add("stacked");
+      holder.setAttribute("role","list");
+      const frame=document.createElement("div");
+      frame.className="uml-frame error";
+      frame.setAttribute("role","listitem");
+      frame.textContent=diagram.error??"Diagram unavailable";
+      holder.replaceChildren(frame);
+      viewport.apply();
+      setStatus("Diagram unavailable",true);
+      return;
+    }
     if(shouldStackDiagram(state.mode)){
       holder.innerHTML="";
       holder.classList.add("stacked");
@@ -362,11 +383,20 @@ async function loadDiagram(
       }else if(errors.length){
         showError(errors.join("\n"));
         setStatus("Mermaid render error",true);
-      }else setStatus(diagram.status==="error"?"Diagram parse error":`Updated · v${diagram.version}`,diagram.status==="error");
+      }else setStatus(`Updated · v${diagram.version}`);
       return;
     }
     holder.classList.remove("stacked");
     holder.removeAttribute("role");
+    if(!hasDiagramBody(diagram.dsl)){
+      const frame=document.createElement("div");
+      frame.className="uml-frame empty";
+      frame.textContent=EMPTY_DIAGRAM_MESSAGE;
+      holder.replaceChildren(frame);
+      viewport.apply();
+      setStatus(`Updated · v${diagram.version}`);
+      return;
+    }
     try{
       const rendered=await mermaid.render(`diagram-${token}`,diagram.dsl);
       if(!isCurrent())return;
@@ -379,7 +409,7 @@ async function loadDiagram(
       if(focus&&!focusUmlDefinition(focus)){
         showError("Definition not found");
         setStatus("Definition not found",true);
-      }else setStatus(diagram.status==="error"?"Diagram parse error":`Updated · v${diagram.version}`,diagram.status==="error");
+      }else setStatus(`Updated · v${diagram.version}`);
     }catch(error){
       if(!isCurrent())return;
       showError(error instanceof Error?error.message:String(error));
@@ -565,7 +595,7 @@ async function selectScope(
     &&(context===undefined||definitionContextCurrent(context));
   searchRequests.next();
   if(!isCurrent())return false;
-  state.mode=requestedMode??(node.path===""?"packages":"uml");
+  state.mode=requestedMode??(node.path===""||(node.kind==="directory"&&isPackageParentDirectory(node.path))?"packages":"uml");
   state.scope=state.mode==="packages"?"":node.path;
   if(state.mode==="uml")state.umlScope=node.path;
   activateView(state.mode);
@@ -605,8 +635,13 @@ function destroyEditor(invalidate=true):void{
 function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
 function printEditor():void{
   if(!state.view)return;
-  forceParsing(state.view,state.view.state.doc.length,PRINT_PARSE_BUDGET_MS);
   window.print();
+}
+function editorHighlightDecorations(file:FileResponse){
+  return Decoration.set(file.highlights.flatMap((span)=>{
+    if(span.from<0||span.to>file.content.length||span.from>=span.to)return[];
+    return[Decoration.mark({class:`tok-${span.token}`}).range(span.from,span.to)];
+  }),true);
 }
 function editorDefinitionDecorations(file:FileResponse){
   return Decoration.set(file.definitions.flatMap((definition)=>{
@@ -667,15 +702,12 @@ async function openFile(
     state.file=file;
     $("#editor-name").textContent=path.split("/").at(-1)??path;
     $("#editor-path").textContent=path;
-    const typescript=/\.(?:ts|tsx|mts|cts)$/.test(path);
-    const jsx=/\.(?:tsx|jsx)$/.test(path);
     const extensions=[
       basicSetup,
-      javascript({typescript,jsx}),
       oneDark,
-      syntaxHighlighting(classHighlighter),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
+      EditorView.decorations.of(editorHighlightDecorations(file)),
       EditorView.decorations.of(editorDefinitionDecorations(file)),
       editorDefinitionHandlers(),
     ];

@@ -25,7 +25,7 @@ async function materializePackageDiagram(
   let cache: Cache | undefined;
   try {
     cache = new Cache(join(cacheRoot, "cache.sqlite"));
-    const generationId = cache.beginGeneration("startup");
+    const generationId = cache.beginGeneration("startup", "");
     const extracted = extractPackageDiagramGraph(packages, renderMode);
     const outcome = renderMode === "bare"
       ? { status: "error" as const, error: "package discovery failed" }

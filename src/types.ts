@@ -64,6 +64,34 @@ export type EditorGotoDefinition = GotoDefinition & {
   displayTo: number;
 };
 
+export const HIGHLIGHT_TOKENS = [
+  "keyword",
+  "comment",
+  "string",
+  "string2",
+  "number",
+  "bool",
+  "atom",
+  "propertyName",
+  "labelName",
+  "typeName",
+  "className",
+  "variableName",
+  "variableName2",
+  "definition",
+  "operator",
+  "punctuation",
+  "invalid",
+] as const;
+
+export type HighlightToken = (typeof HIGHLIGHT_TOKENS)[number];
+
+export type HighlightSpan = {
+  from: number;
+  to: number;
+  token: HighlightToken;
+};
+
 export type GotoDefinitionLookupResponse = {
   version: number;
   definition: GotoDefinition | null;
@@ -128,6 +156,7 @@ export type FileResponse = {
   path: string;
   content: string;
   definitions: EditorGotoDefinition[];
+  highlights: HighlightSpan[];
   cursorOffset?: number;
 };
 

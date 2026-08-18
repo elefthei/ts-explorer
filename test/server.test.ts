@@ -318,7 +318,7 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string, styleS
   expect(mainScript).not.toContain("/api/file/format");
   expect(mainScript).not.toMatch(/\bMod-s\b|method\s*:\s*["']PUT["']|conflict-banner/);
   expect(mainScript).toContain("window.print()");
-  expect(mainScript).toMatch(/forceParsing\s*\(/);
+  expect(mainScript).toContain("editorHighlightDecorations");
 
   expect(styleSheet).toContain("@media print");
   expect(styleSheet).toMatch(/#editor-panel \.tok-keyword\{color:#d73a49\}/);
@@ -798,6 +798,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       path: "packages/demo/src/index.ts",
       content: "export const value = 1;\n",
       definitions: [],
+      highlights: expect.any(Array),
     });
 
     const positionedFileResponse = await fetch(
@@ -809,6 +810,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       path: "packages/demo/src/index.ts",
       content: "export const value = 1;\n",
       definitions: [],
+      highlights: expect.any(Array),
       cursorOffset: 21,
     });
     expect(positioned.content[positioned.cursorOffset ?? -1]).toBe("1");
@@ -972,6 +974,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
         { ...indexedDefinitions[1], displayFrom: 32, displayTo: 40 },
         { ...indexedDefinitions[2], displayFrom: 82, displayTo: 91 },
       ],
+      highlights: expect.any(Array),
     });
 
     const priorityResponse = await fetch(`${base}/api/preprocess`, {
@@ -1024,7 +1027,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     const unsupported = await fetch(`${base}/api/file?path=packages%2Fdemo%2Fsrc%2Fliteral.txt`);
     expect(unsupported.status).toBe(422);
     expect(await unsupported.json()).toEqual({
-      error: "only TypeScript and JavaScript source files can be viewed",
+      error: "only TypeScript, JavaScript, and Rust source files can be viewed",
     });
 
     const removedRoutes = [
@@ -1129,6 +1132,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
       path: "watched/added.ts",
       content: 'export const watchedToken = "WATCHED_LIVE_TOKEN";\n',
       definitions: [],
+      highlights: expect.any(Array),
     });
 
     const graphDbPath = join(root, ".explore", "explore.db");
@@ -1331,11 +1335,6 @@ test("UML extraction errors retain the last promoted normalized graph and respon
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "uml-fallback" }));
   await writeFixtureFile(
     root,
-    "tsconfig.json",
-    JSON.stringify({ compilerOptions: { strict: true } }),
-  );
-  await writeFixtureFile(
-    root,
     "model.ts",
     [
       "export class FallbackTarget {}",
@@ -1359,7 +1358,8 @@ test("UML extraction errors retain the last promoted normalized graph and respon
     const graphDbPath = join(root, ".explore", "explore.db");
     const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
 
-    await writeFile(join(root, "tsconfig.json"), "{ malformed");
+    // The parser rejects invalid UTF-8, which is the only source-level failure it can observe.
+    await writeFile(join(root, "model.ts"), Buffer.from([0x65, 0x78, 0x70, 0xff, 0xfe]));
     await withTimeout(promotions.second, "failed UML cache promotion");
     const failed = await store.getDiagram("uml", "");
     await store.close();
@@ -1491,7 +1491,7 @@ test("a malformed root manifest produces the stable empty package error", async 
   }
 }, 30_000);
 
-test("warm restart trusts recovered package graph until a live change rebuilds it", async () => {
+test("warm restart rebuilds when sources changed while stopped and reuses the cache when they did not", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-package-restart-"));
   await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   await mkdir(join(root, "packages", "a"), { recursive: true });
@@ -1520,7 +1520,35 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
     ]);
     const dbPath = join(root, ".explore", "explore.db");
     const recoveredId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
+    const recoveredStartedAt = openDatabase(dbPath, (db) =>
+      queryAll<{ started_at: number }>(db, "SELECT started_at FROM generations ORDER BY id")
+    );
+    expect(recoveredStartedAt).toHaveLength(1);
 
+    await firstServer.stop();
+    firstServer = undefined;
+
+    firstServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const untouchedBase = `http://127.0.0.1:${firstServer.port}`;
+    const untouchedWatch = await openWatch(untouchedBase);
+    try {
+      await untouchedWatch.waitFor(
+        (message) => message.type === "cache-ready" && message.version === 0,
+      );
+    } finally {
+      await untouchedWatch.close();
+    }
+    const untouchedDiagram = await (
+      await fetch(`${untouchedBase}/api/diagram?kind=packages&path=`)
+    ).json() as DiagramResponse;
+    expect(untouchedDiagram).toEqual(firstDiagram);
+    expect(readActiveNormalizedSnapshot(dbPath, "packages", "").generationId).toBe(recoveredId);
+    expect(openDatabase(dbPath, (db) =>
+      queryAll<{ id: number; state: string; cause: string }>(
+        db,
+        "SELECT id, state, cause FROM generations ORDER BY id",
+      )
+    )).toEqual([{ id: recoveredId, state: "active", cause: "startup" }]);
     await firstServer.stop();
     firstServer = undefined;
 
@@ -1537,17 +1565,26 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
     await watch.waitFor((message) => message.type === "cache-ready" && message.version === 0);
     expect(watch.history()).toContainEqual({ type: "cache-ready", version: 0 });
 
-    const recoveredDiagram = await (
+    const restartedDiagram = await (
       await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(recoveredDiagram).toEqual(firstDiagram);
-    expect(readActiveNormalizedSnapshot(dbPath, "packages", "").generationId).toBe(recoveredId);
-    expect(openDatabase(dbPath, (db) =>
-      queryAll<{ id: number; state: string; cause: string }>(
+    expect(restartedDiagram.packageNodes).toEqual([
+      { nodeId: "p0", name: "a", path: "packages/a" },
+      { nodeId: "p1", name: "b", path: "packages/b" },
+    ]);
+    expect(restartedDiagram.dsl).toContain("p0 --> p1");
+    const restartedGenerations = openDatabase(dbPath, (db) =>
+      queryAll<{ id: number; state: string; cause: string; started_at: number }>(
         db,
-        "SELECT id, state, cause FROM generations ORDER BY id",
+        "SELECT id, state, cause, started_at FROM generations ORDER BY id",
       )
-    )).toEqual([{ id: recoveredId, state: "active", cause: "startup" }]);
+    );
+    expect(restartedGenerations).toHaveLength(1);
+    const [restartedGeneration] = restartedGenerations;
+    if (restartedGeneration === undefined) throw new Error("startup generation was not rebuilt");
+    expect(restartedGeneration).toMatchObject({ state: "active", cause: "startup" });
+    expect(restartedGeneration.started_at).toBeGreaterThan(recoveredStartedAt[0]?.started_at ?? 0);
+    const restartedId = restartedGeneration.id;
 
     const changed = watch.waitFor((message) => {
       if (message.type !== "changed") return false;
@@ -1576,7 +1613,7 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
     expect(rebuiltDiagram.dsl).toContain("p0 --> p1");
     expect(rebuiltDiagram.dsl).not.toBe(firstDiagram.dsl);
     const rebuiltId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
-    expect(rebuiltId).not.toBe(recoveredId);
+    expect(rebuiltId).not.toBe(restartedId);
     expect(openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string }>(
         db,
@@ -1588,6 +1625,58 @@ test("warm restart trusts recovered package graph until a live change rebuilds i
       await watch?.close();
       await secondServer?.stop();
       await firstServer?.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("warm restart serves file content edited while the server was stopped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-restart-file-"));
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "restart-file" }));
+  await mkdir(join(root, "src"), { recursive: true });
+  const filePath = join(root, "src", "a.ts");
+  await writeFile(filePath, "export const EMPTY_BATCH = 1;\nexport const kept = 2;\n");
+
+  let server: RunningServer | undefined;
+  try {
+    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const firstBase = `http://127.0.0.1:${server.port}`;
+    const firstWatch = await openWatch(firstBase);
+    try {
+      await firstWatch.waitFor(
+        (message) => message.type === "cache-ready" && message.version === 0,
+      );
+    } finally {
+      await firstWatch.close();
+    }
+    const staleResponse = await fetch(`${firstBase}/api/file?path=src%2Fa.ts`);
+    expect(staleResponse.status).toBe(200);
+    expect((await staleResponse.json() as FileResponse).content).toContain("EMPTY_BATCH");
+
+    await server.stop();
+    server = undefined;
+
+    await writeFile(filePath, "export const kept = 2;\n");
+
+    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const secondBase = `http://127.0.0.1:${server.port}`;
+    const secondWatch = await openWatch(secondBase);
+    try {
+      await secondWatch.waitFor(
+        (message) => message.type === "cache-ready" && message.version === 0,
+      );
+    } finally {
+      await secondWatch.close();
+    }
+    const freshResponse = await fetch(`${secondBase}/api/file?path=src%2Fa.ts`);
+    expect(freshResponse.status).toBe(200);
+    const fresh = await freshResponse.json() as FileResponse;
+    expect(fresh.content).toContain("kept");
+    expect(fresh.content).not.toContain("EMPTY_BATCH");
+  } finally {
+    try {
+      await server?.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

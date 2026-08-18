@@ -33,14 +33,13 @@ type NormalizedRowByTable = {
   diagram_edges: GraphRow<DiagramGraph["edges"][number]>;
   diagram_edge_relations: GraphRow<DiagramGraph["relations"][number]>;
   package_graph_nodes: PackageRow<PackageDiagramGraph["packageNodes"][number]>;
-  uml_settings: UmlRow<NonNullable<UmlDiagramGraph["settings"]>>;
-  uml_setting_lines: UmlRow<UmlDiagramGraph["settingLines"][number]>;
   uml_declarations: UmlRow<UmlDiagramGraph["declarations"][number]>;
   uml_entities: UmlRow<UmlDiagramGraph["entities"][number]>;
   uml_properties: UmlRow<UmlDiagramGraph["properties"][number]>;
   uml_property_type_ids: UmlRow<UmlDiagramGraph["propertyTypeIds"][number]>;
   uml_methods: UmlRow<UmlDiagramGraph["methods"][number]>;
   uml_method_return_type_ids: UmlRow<UmlDiagramGraph["methodReturnTypeIds"][number]>;
+  uml_member_modifiers: UmlRow<UmlDiagramGraph["memberModifiers"][number]>;
   uml_enum_items: UmlRow<UmlDiagramGraph["enumItems"][number]>;
   uml_entity_heritage_clauses: UmlRow<UmlDiagramGraph["entityHeritageClauses"][number]>;
   uml_declaration_heritage_groups: UmlRow<UmlDiagramGraph["declarationHeritageGroups"][number]>;
@@ -191,51 +190,16 @@ export const NORMALIZED_TABLE_SPECS = {
         }))
       : [],
   ),
-  uml_settings: tableSpec(
-    "uml_settings",
-    [
-      "glob", "tsconfig", "out_file", "property_types", "modifiers", "type_links", "out_dsl",
-      "out_mermaid_dsl", "member_associations", "exported_types_only",
-    ],
-    [],
-    (graph) => graph.kind === "uml" && graph.settings !== null
-      ? [{
-          ...umlIdentity(graph),
-          glob: graph.settings.glob,
-          tsconfig: graph.settings.tsconfig,
-          out_file: graph.settings.outFile,
-          property_types: sqlBoolean(graph.settings.propertyTypes),
-          modifiers: sqlBoolean(graph.settings.modifiers),
-          type_links: sqlBoolean(graph.settings.typeLinks),
-          out_dsl: graph.settings.outDsl,
-          out_mermaid_dsl: graph.settings.outMermaidDsl,
-          member_associations: sqlBoolean(graph.settings.memberAssociations),
-          exported_types_only: sqlBoolean(graph.settings.exportedTypesOnly),
-        }]
-      : [],
-  ),
-  uml_setting_lines: tableSpec(
-    "uml_setting_lines",
-    ["setting_kind", "line_ordinal", "value"],
-    ["setting_kind", "line_ordinal"],
-    (graph) => graph.kind === "uml"
-      ? graph.settingLines.map((row) => ({
-          ...umlIdentity(graph),
-          setting_kind: row.settingKind,
-          line_ordinal: row.lineOrdinal,
-          value: row.value,
-        }))
-      : [],
-  ),
   uml_declarations: tableSpec(
     "uml_declarations",
-    ["declaration_ordinal", "file_name", "member_associations_present"],
+    ["declaration_ordinal", "file_name", "language", "member_associations_present"],
     ["declaration_ordinal"],
     (graph) => graph.kind === "uml"
       ? graph.declarations.map((row) => ({
           ...umlIdentity(graph),
           declaration_ordinal: row.declarationOrdinal,
           file_name: row.fileName,
+          language: row.language,
           member_associations_present: sqlBoolean(row.memberAssociationsPresent),
         }))
       : [],
@@ -258,7 +222,7 @@ export const NORMALIZED_TABLE_SPECS = {
     "uml_properties",
     [
       "declaration_ordinal", "entity_kind", "entity_ordinal", "property_ordinal",
-      "modifier_flags", "name", "type", "optional",
+      "name", "type", "optional",
     ],
     ["declaration_ordinal", "entity_kind", "entity_ordinal", "property_ordinal"],
     (graph) => graph.kind === "uml"
@@ -268,7 +232,6 @@ export const NORMALIZED_TABLE_SPECS = {
           entity_kind: row.entityKind,
           entity_ordinal: row.entityOrdinal,
           property_ordinal: row.propertyOrdinal,
-          modifier_flags: row.modifierFlags,
           name: row.name,
           type: row.type,
           optional: sqlBoolean(row.optional),
@@ -297,7 +260,7 @@ export const NORMALIZED_TABLE_SPECS = {
   uml_methods: tableSpec(
     "uml_methods",
     [
-      "declaration_ordinal", "entity_kind", "entity_ordinal", "method_ordinal", "modifier_flags",
+      "declaration_ordinal", "entity_kind", "entity_ordinal", "method_ordinal",
       "name", "return_type", "return_type_ids_present",
     ],
     ["declaration_ordinal", "entity_kind", "entity_ordinal", "method_ordinal"],
@@ -308,7 +271,6 @@ export const NORMALIZED_TABLE_SPECS = {
           entity_kind: row.entityKind,
           entity_ordinal: row.entityOrdinal,
           method_ordinal: row.methodOrdinal,
-          modifier_flags: row.modifierFlags,
           name: row.name,
           return_type: row.returnType,
           return_type_ids_present: sqlBoolean(row.returnTypeIdsPresent),
@@ -334,6 +296,29 @@ export const NORMALIZED_TABLE_SPECS = {
         }))
       : [],
   ),
+  uml_member_modifiers: tableSpec(
+    "uml_member_modifiers",
+    [
+      "declaration_ordinal", "entity_kind", "entity_ordinal", "member_kind", "member_ordinal",
+      "modifier_ordinal", "modifier",
+    ],
+    [
+      "declaration_ordinal", "entity_kind", "entity_ordinal", "member_kind", "member_ordinal",
+      "modifier_ordinal",
+    ],
+    (graph) => graph.kind === "uml"
+      ? graph.memberModifiers.map((row) => ({
+          ...umlIdentity(graph),
+          declaration_ordinal: row.declarationOrdinal,
+          entity_kind: row.entityKind,
+          entity_ordinal: row.entityOrdinal,
+          member_kind: row.memberKind,
+          member_ordinal: row.memberOrdinal,
+          modifier_ordinal: row.modifierOrdinal,
+          modifier: row.modifier,
+        }))
+      : [],
+  ),
   uml_enum_items: tableSpec(
     "uml_enum_items",
     ["declaration_ordinal", "entity_kind", "entity_ordinal", "item_ordinal", "value"],
@@ -353,7 +338,7 @@ export const NORMALIZED_TABLE_SPECS = {
     "uml_entity_heritage_clauses",
     [
       "declaration_ordinal", "entity_kind", "entity_ordinal", "clause_ordinal", "clause",
-      "clause_type_id", "class_name", "class_type_id", "clause_type",
+      "clause_type_id", "class_name", "class_type_id", "relation",
     ],
     ["declaration_ordinal", "entity_kind", "entity_ordinal", "clause_ordinal"],
     (graph) => graph.kind === "uml"
@@ -367,7 +352,7 @@ export const NORMALIZED_TABLE_SPECS = {
           clause_type_id: row.clauseTypeId,
           class_name: row.className,
           class_type_id: row.classTypeId,
-          clause_type: row.clauseType,
+          relation: row.relation,
         }))
       : [],
   ),
@@ -389,7 +374,7 @@ export const NORMALIZED_TABLE_SPECS = {
     "uml_declaration_heritage_clauses",
     [
       "declaration_ordinal", "group_ordinal", "clause_ordinal", "clause", "clause_type_id",
-      "class_name", "class_type_id", "clause_type",
+      "class_name", "class_type_id", "relation",
     ],
     ["declaration_ordinal", "group_ordinal", "clause_ordinal"],
     (graph) => graph.kind === "uml"
@@ -402,7 +387,7 @@ export const NORMALIZED_TABLE_SPECS = {
           clause_type_id: row.clauseTypeId,
           class_name: row.className,
           class_type_id: row.classTypeId,
-          clause_type: row.clauseType,
+          relation: row.relation,
         }))
       : [],
   ),

@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   browserOpenCommand,
   browserUrl,
+  cliVersion,
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
@@ -11,7 +13,7 @@ import {
 test("parses explicit directory, host, and port options", () => {
   const directory = join("fixtures", "project");
 
-  expect(parseCliOptions(["--dir", directory, "--host", "0.0.0.0", "--port", "4242"])).toEqual({
+  expect(parseCliOptions([directory, "--host", "0.0.0.0", "--port", "4242"])).toEqual({
     sourceDir: resolve(directory),
     host: "0.0.0.0",
     port: 4242,
@@ -20,7 +22,7 @@ test("parses explicit directory, host, and port options", () => {
 });
 
 test("resolves the current directory while retaining host and port defaults", () => {
-  expect(parseCliOptions(["--dir", "."])).toEqual({
+  expect(parseCliOptions(["."])).toEqual({
     sourceDir: resolve("."),
     host: "127.0.0.1",
     port: 8080,
@@ -28,16 +30,32 @@ test("resolves the current directory while retaining host and port defaults", ()
   });
 });
 
-test("requires --dir", () => {
-  expect(() => parseCliOptions([])).toThrow("Missing required argument: dir");
+test("requires the directory positional", () => {
+  expect(() => parseCliOptions([])).toThrow(
+    "Not enough non-option arguments: got 0, need at least 1",
+  );
 });
 
-test("rejects the legacy --source option", () => {
-  expect(() => parseCliOptions(["--dir", ".", "--source", "."])).toThrow("Unknown argument: source");
+test.each(["--source", "--dir"])("rejects the legacy %s option", (option) => {
+  expect(() => parseCliOptions([".", option, "."])).toThrow(
+    `Unknown argument: ${option.slice(2)}`,
+  );
+});
+
+test("does not accept the directory as a --dir value", () => {
+  expect(() => parseCliOptions(["--dir", "."])).toThrow(
+    "Not enough non-option arguments: got 0, need at least 1",
+  );
+});
+
+test("rejects a second positional argument", () => {
+  expect(() => parseCliOptions([".", "extra"])).toThrow(
+    "Too many non-option arguments: got 2, maximum of 1",
+  );
 });
 
 test("disables the browser launch with --no-open", () => {
-  expect(parseCliOptions(["--dir", ".", "--no-open"])?.open).toBe(false);
+  expect(parseCliOptions([".", "--no-open"])?.open).toBe(false);
 });
 
 test("browses the loopback address when bound to a wildcard host", () => {
@@ -59,13 +77,25 @@ test.each([
 });
 
 test.each(["0", "65536", "1.5"])("rejects invalid port %s", (port) => {
-  expect(() => parseCliOptions(["--dir", ".", "--port", port])).toThrow(
+  expect(() => parseCliOptions([".", "--port", port])).toThrow(
     /^port must be an integer between 1 and 65535$/,
   );
 });
 
-test.each(["--help", "-h"])("returns null for %s without requiring --dir", (helpFlag) => {
-  expect(parseCliOptions([helpFlag])).toBeNull();
+test.each(["--help", "-h", "--version", "-v"])(
+  "returns null for %s without requiring the directory positional",
+  (flag) => {
+    expect(parseCliOptions([flag])).toBeNull();
+  },
+);
+
+test("reports the version declared in package.json", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version: string };
+
+  expect(cliVersion).toBe(manifest.version);
+  expect(cliVersion).toMatch(/^\d+\.\d+\.\d+/);
 });
 
 test("formats generation-aware phase progress exactly", () => {

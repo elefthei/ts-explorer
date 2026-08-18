@@ -1,10 +1,10 @@
 import { UndirectedGraph } from "graphology";
 import louvain from "graphology-communities-louvain";
-import type { FileDeclaration } from "tsuml2/dist/core/model";
 import type { UmlDiagramGraph } from "../diagram-graph.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
 import type {
   ExternalUserNode,
+  FileDeclaration,
   LocalUserNode,
   UmlDependency,
 } from "./model.ts";

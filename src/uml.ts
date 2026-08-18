@@ -1,37 +1,40 @@
-import { access, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { parseProject, TsUML2Settings } from "tsuml2";
-import {
-  Enum,
-  TypeAlias,
-  type Clazz,
-  type FileDeclaration,
-  type HeritageClause,
-  type Interface,
-} from "tsuml2/dist/core/model";
+import { readFile, stat } from "node:fs/promises";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type UmlDiagramGraph,
   type UmlEntityKind,
 } from "./diagram-graph.ts";
 import { parseDefinitionSpans } from "./goto-definition.ts";
+import { analysisLanguageForPath } from "./lang/registry.ts";
 import { resolveInside } from "./paths.ts";
-import { isDeclarationPath, isUmlIgnoredPath } from "./source.ts";
+import {
+  decodeSourceBytes,
+  isCargoTargetPath,
+  isDeclarationPath,
+  isUmlIgnoredPath,
+} from "./source.ts";
 import type { PackageInfo } from "./types.ts";
-import { extractUmlTopology } from "./uml/graph.ts";
+import { parseUmlAssociations, removeSelfMemberAssociations } from "./uml/associations.ts";
 import { UML_ENTITY_COLLECTIONS } from "./uml/entities.ts";
+import { extractUmlTopology } from "./uml/graph.ts";
 import {
   bareUmlName,
   isTestPath,
   posix,
   scopeRelativePath,
+  syntheticTypeId,
   umlFileKey,
 } from "./uml/keys.ts";
-import {
-  escapeStructuredMemberTypes,
-  removeSelfMemberAssociations,
-} from "./uml/mermaid.ts";
-import type { CategoryMap, UmlReference } from "./uml/model.ts";
+import { escapeStructuredMemberTypes } from "./uml/mermaid.ts";
+import type {
+  CategoryMap,
+  FileDeclaration,
+  HeritageClause,
+  UmlEntityModel,
+  UmlReference,
+} from "./uml/model.ts";
+import { parseUmlProject, resolveUmlTypeReferences } from "./uml/parse.ts";
+import { buildSymbolTable } from "./uml/resolve.ts";
 import { analyzeUmlTypes } from "./uml/usage.ts";
 
 const CATEGORY_ENTITY_COLLECTIONS = [
@@ -41,14 +44,28 @@ const CATEGORY_ENTITY_COLLECTIONS = [
   UML_ENTITY_COLLECTIONS[0],
 ] as const;
 
+/** Language of a declaration file; every UML declaration comes from an analysable source file. */
+function declarationLanguage(fileName: string): UmlDiagramGraph["declarations"][number]["language"] {
+  const language = analysisLanguageForPath(fileName);
+  if (!language) throw new Error(`UML declaration file has no language: ${fileName}`);
+  return language;
+}
 
-async function findTsFiles(scope: string): Promise<string[]> {
+async function findSourceFiles(scope: string): Promise<string[]> {
   const info = await stat(scope);
-  if (info.isFile()) return isDeclarationPath(scope) || isUmlIgnoredPath(scope) ? [] : [scope];
+  if (info.isFile()) {
+    return isDeclarationPath(scope)
+        || isUmlIgnoredPath(scope)
+        || isCargoTargetPath(scope)
+        || analysisLanguageForPath(scope) === undefined
+      ? []
+      : [scope];
+  }
   const files: string[] = [];
-  const glob = new Bun.Glob("**/*.{ts,tsx,mts,cts}");
+  const glob = new Bun.Glob("**/*.{ts,tsx,mts,cts,rs}");
   for await (const file of glob.scan({ cwd: scope, absolute: true, onlyFiles: true, dot: true })) {
-    if (!isDeclarationPath(file) && !isUmlIgnoredPath(file)) files.push(file);
+    if (isDeclarationPath(file) || isUmlIgnoredPath(file) || isCargoTargetPath(file)) continue;
+    files.push(file);
   }
   return files.sort();
 }
@@ -67,22 +84,6 @@ function packageForScope(
     .sort((left, right) => right.path.length - left.path.length)[0];
 }
 
-async function getTsConfig(
-  sourceDir: string,
-  scopePath: string,
-  packages: readonly PackageInfo[],
-): Promise<string | undefined> {
-  const selected = packageForScope(scopePath, packages);
-  const candidates = [
-    selected ? join(sourceDir, selected.path, "tsconfig.json") : undefined,
-    join(sourceDir, "tsconfig.json"),
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  for (const candidate of candidates) {
-    if (await access(candidate).then(() => true).catch(() => false)) return candidate;
-  }
-  return undefined;
-}
-
 function fileDeclarations(declarations: FileDeclaration[]): CategoryMap {
   const result: CategoryMap = new Map();
   for (const declaration of declarations) {
@@ -97,17 +98,11 @@ function fileDeclarations(declarations: FileDeclaration[]): CategoryMap {
   return result;
 }
 
-function syntheticTypeId(filePath: string, renderedName: string): string {
-  const normalized = posix(filePath);
-  const extension = normalized.lastIndexOf(".");
-  const withoutExtension = extension < 0 ? normalized : normalized.slice(0, extension);
-  return `"${withoutExtension}".${renderedName}`;
-}
-
-async function addMissingTypeAliases(
+function addMissingTypeAliases(
   files: readonly string[],
   declarations: FileDeclaration[],
-): Promise<void> {
+  contents: ReadonlyMap<string, string>,
+): void {
   const byFile = new Map(declarations.map((declaration) => [
     umlFileKey(declaration.fileName),
     declaration,
@@ -115,7 +110,7 @@ async function addMissingTypeAliases(
   for (const file of files) {
     const declaration = byFile.get(umlFileKey(file));
     if (!declaration) continue;
-    const parsed = parseDefinitionSpans(file, await readFile(file, "utf8"))
+    const parsed = parseDefinitionSpans(file, contents.get(umlFileKey(file)) ?? "")
       .filter((definition) => definition.kind === "type");
     const order = new Map(parsed.map((definition, index) => [
       `${definition.entityName}\0${definition.entityOccurrence}`,
@@ -132,13 +127,14 @@ async function addMissingTypeAliases(
     for (const definition of parsed) {
       const key = `${definition.entityName}\0${definition.entityOccurrence}`;
       if (existing.has(key)) continue;
-      declaration.types.push(new TypeAlias({
+      declaration.types.push({
         name: definition.renderedEntityName,
         id: syntheticTypeId(file, definition.renderedEntityName),
         properties: [],
         methods: [],
         heritageClauses: [],
-      }));
+        items: [],
+      });
       existing.add(key);
     }
     const typeOccurrences = new Map<string, number>();
@@ -168,6 +164,7 @@ type UmlModelRows = Pick<
   | "propertyTypeIds"
   | "methods"
   | "methodReturnTypeIds"
+  | "memberModifiers"
   | "enumItems"
   | "entityHeritageClauses"
   | "declarationHeritageGroups"
@@ -184,6 +181,7 @@ function emptyUmlModelRows(): UmlModelRows {
     propertyTypeIds: [],
     methods: [],
     methodReturnTypeIds: [],
+    memberModifiers: [],
     enumItems: [],
     entityHeritageClauses: [],
     declarationHeritageGroups: [],
@@ -196,17 +194,17 @@ function serializeHeritageClause(
   clause: HeritageClause,
 ): Pick<
   UmlDiagramGraph["entityHeritageClauses"][number],
-  "clause" | "clauseTypeId" | "className" | "classTypeId" | "clauseType"
+  "clause" | "clauseTypeId" | "className" | "classTypeId" | "relation"
 > {
-  if (clause.type !== 0 && clause.type !== 1) {
-    throw new Error(`Invalid UML heritage clause type: ${String(clause.type)}`);
+  if (clause.relation !== "extends" && clause.relation !== "implements") {
+    throw new Error(`Invalid UML heritage clause relation: ${String(clause.relation)}`);
   }
   return {
     clause: clause.clause,
     clauseTypeId: clause.clauseTypeId,
     className: clause.className,
     classTypeId: clause.classTypeId,
-    clauseType: clause.type,
+    relation: clause.relation,
   };
 }
 
@@ -214,7 +212,7 @@ function serializeEntity(
   declarationOrdinal: number,
   entityKind: UmlEntityKind,
   entityOrdinal: number,
-  entity: Clazz | Interface | TypeAlias | Enum,
+  entity: UmlEntityModel,
   rows: UmlModelRows,
 ): void {
   rows.entities.push({
@@ -223,7 +221,7 @@ function serializeEntity(
     entityOrdinal,
     nodeId: entity.id,
   });
-  if (entity instanceof Enum) {
+  if (entityKind === "enum") {
     for (const [itemOrdinal, value] of entity.items.entries()) {
       rows.enumItems.push({
         declarationOrdinal,
@@ -241,11 +239,21 @@ function serializeEntity(
       entityKind,
       entityOrdinal,
       propertyOrdinal,
-      modifierFlags: property.modifierFlags,
       name: property.name,
       type: property.type ?? null,
       optional: property.optional,
     });
+    for (const [modifierOrdinal, modifier] of property.modifiers.entries()) {
+      rows.memberModifiers.push({
+        declarationOrdinal,
+        entityKind,
+        entityOrdinal,
+        memberKind: "property",
+        memberOrdinal: propertyOrdinal,
+        modifierOrdinal,
+        modifier,
+      });
+    }
     for (const [typeIdOrdinal, typeId] of property.typeIds.entries()) {
       rows.propertyTypeIds.push({
         declarationOrdinal,
@@ -263,11 +271,21 @@ function serializeEntity(
       entityKind,
       entityOrdinal,
       methodOrdinal,
-      modifierFlags: method.modifierFlags,
       name: method.name,
       returnType: method.returnType ?? null,
       returnTypeIdsPresent: method.returnTypeIds !== undefined,
     });
+    for (const [modifierOrdinal, modifier] of method.modifiers.entries()) {
+      rows.memberModifiers.push({
+        declarationOrdinal,
+        entityKind,
+        entityOrdinal,
+        memberKind: "method",
+        memberOrdinal: methodOrdinal,
+        modifierOrdinal,
+        modifier,
+      });
+    }
     for (const [typeIdOrdinal, typeId] of (method.returnTypeIds ?? []).entries()) {
       rows.methodReturnTypeIds.push({
         declarationOrdinal,
@@ -296,6 +314,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
     rows.declarations.push({
       declarationOrdinal,
       fileName: declaration.fileName,
+      language: declarationLanguage(declaration.fileName),
       memberAssociationsPresent: declaration.memberAssociations !== undefined,
     });
     const heritageOwners = new Map<
@@ -352,7 +371,7 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
         bName: association.b.name,
         bMultiplicity: association.b.multiplicity ?? null,
         associationType: association.associationType,
-        inherited: association.inerhited,
+        inherited: association.inherited,
       });
     }
   }
@@ -382,8 +401,6 @@ export function bareUmlDiagramGraph(scopePath: string): UmlDiagramGraph {
     aliases: [],
     edges: [],
     relations: [],
-    settings: null,
-    settingLines: [],
     ...emptyUmlModelRows(),
     categories: [],
     methodReturnDependencies: [],
@@ -396,6 +413,16 @@ export function bareUmlDiagramGraph(scopePath: string): UmlDiagramGraph {
   };
 }
 
+async function readUmlSources(files: readonly string[]): Promise<Map<string, string>> {
+  const contents = new Map<string, string>();
+  for (const file of files) {
+    const decoded = decodeSourceBytes(await readFile(file));
+    if ("failure" in decoded) throw new Error(`${decoded.failure}: ${file}`);
+    contents.set(umlFileKey(file), decoded.text);
+  }
+  return contents;
+}
+
 export async function extractUmlDiagramGraph(
   sourceDir: string,
   scopePath: string,
@@ -403,8 +430,8 @@ export async function extractUmlDiagramGraph(
 ): Promise<UmlDiagramGraph> {
   const canonicalSourceDir = await resolveInside(sourceDir, "", true);
   const selected = scopePath ? await resolveInside(canonicalSourceDir, scopePath, true) : canonicalSourceDir;
-  const files = await findTsFiles(selected);
-  const projectFiles = selected === canonicalSourceDir ? files : await findTsFiles(canonicalSourceDir);
+  const files = await findSourceFiles(selected);
+  const projectFiles = selected === canonicalSourceDir ? files : await findSourceFiles(canonicalSourceDir);
   const normalizedScopePath = posix(scopePath);
   const selectedPackage = packageForScope(normalizedScopePath, packages);
   const packageSourcePath = selectedPackage
@@ -427,31 +454,30 @@ export async function extractUmlDiagramGraph(
       }
     }
   }
-  const settings = new TsUML2Settings();
-  const normalizedFiles = files.map(posix);
-  settings.glob = normalizedFiles.length === 1
-    ? normalizedFiles[0]
-    : normalizedFiles.length ? `{${normalizedFiles.join(",")}}` : "";
-  settings.tsconfig = await getTsConfig(sourceDir, scopePath, packages);
-  settings.propertyTypes = true;
-  settings.modifiers = true;
-  settings.typeLinks = true;
-  settings.memberAssociations = true;
-  settings.exportedTypesOnly = false;
-  const declarations = files.length && settings.glob ? parseProject(settings) : [];
-  await addMissingTypeAliases(files, declarations);
+
+  const contents = await readUmlSources(projectFiles);
+  const project = parseUmlProject(files, contents);
+  let declarations: FileDeclaration[];
+  try {
+    resolveUmlTypeReferences(project, buildSymbolTable(project.units, project.entities));
+    parseUmlAssociations(project.declarations);
+    declarations = project.declarations;
+  } finally {
+    project.dispose();
+  }
+  addMissingTypeAliases(files, declarations, contents);
   removeSelfMemberAssociations(declarations);
   escapeStructuredMemberTypes(declarations);
   const categories = fileDeclarations(declarations);
-  const analysis = analyzeUmlTypes(
-    canonicalSourceDir,
-    files,
+  const analysis = analyzeUmlTypes({
+    sourceDir: canonicalSourceDir,
+    sourceFiles: files,
     projectFiles,
+    contents,
     declarations,
-    settings.tsconfig,
     categories,
     ignoredExternalUserFiles,
-  );
+  });
   const localOwnerEntityIds = new Set<string>();
   for (const local of analysis.localUserNodes) {
     if (local.ownerEntityId) localOwnerEntityIds.add(local.ownerEntityId);
@@ -482,30 +508,6 @@ export async function extractUmlDiagramGraph(
     formatVersion: DIAGRAM_GRAPH_FORMAT_VERSION,
     renderMode: "normal",
     ...topology,
-    settings: {
-      glob: settings.glob,
-      tsconfig: settings.tsconfig ?? null,
-      outFile: settings.outFile,
-      propertyTypes: settings.propertyTypes,
-      modifiers: settings.modifiers,
-      typeLinks: settings.typeLinks,
-      outDsl: settings.outDsl,
-      outMermaidDsl: settings.outMermaidDsl,
-      memberAssociations: settings.memberAssociations,
-      exportedTypesOnly: settings.exportedTypesOnly,
-    },
-    settingLines: [
-      ...settings.nomnoml.map((value, lineOrdinal) => ({
-        settingKind: "nomnoml" as const,
-        lineOrdinal,
-        value,
-      })),
-      ...settings.mermaid.map((value, lineOrdinal) => ({
-        settingKind: "mermaid" as const,
-        lineOrdinal,
-        value,
-      })),
-    ],
     ...modelRows,
     categories: [...categories.entries()].map(([entityName, info], categoryOrdinal) => ({
       categoryOrdinal,
@@ -558,4 +560,3 @@ export async function extractUmlDiagramGraph(
     })),
   };
 }
-

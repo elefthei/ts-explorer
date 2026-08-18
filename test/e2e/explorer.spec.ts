@@ -20,6 +20,7 @@ import type { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type {
+  DiagramResponse,
   FileResponse,
   GotoDefinitionLookupResponse,
   PreprocessControlRequest,
@@ -141,7 +142,6 @@ function spawnCli(fixtureRoot: string, port: number): SpawnedCli {
     [
       "run",
       "src/cli.ts",
-      "--dir",
       fixtureRoot,
       "--host",
       "127.0.0.1",
@@ -697,7 +697,7 @@ test.afterEach(async ({ browserName }, testInfo) => {
   await cleanupAll();
 });
 
-test("clicking a nested packages directory selects its UML scope", async ({ browser }) => {
+test("clicking a nested source directory selects its UML scope", async ({ browser }) => {
   const resource = registerResource();
   try {
     const fixtureRoot = await createNestedPackagesFixture(resource);
@@ -727,19 +727,15 @@ test("clicking a nested packages directory selects its UML scope", async ({ brow
       timeout: 30_000,
     });
     await expect(dsl).toContainText("classDiagram");
-    const packagesRow = page.locator(
-      '.tree-row[data-tree-path="junco-runtime/packages"]',
-    );
-    await expect(packagesRow).toBeVisible();
 
     const preprocessRoutePattern = "**/api/preprocess";
-    type HeldPackagePriority = {
+    type HeldSourcePriority = {
       request: Extract<PreprocessControlRequest, { action: "prioritize" }>;
       body: PreprocessPriorityResponse;
       status: number;
     };
-    let resolveCaptured!: (priority: HeldPackagePriority) => void;
-    const captured = new Promise<HeldPackagePriority>((resolve) => {
+    let resolveCaptured!: (priority: HeldSourcePriority) => void;
+    const captured = new Promise<HeldSourcePriority>((resolve) => {
       resolveCaptured = resolve;
     });
     let resolveRelease!: () => void;
@@ -767,7 +763,7 @@ test("clicking a nested packages directory selects its UML scope", async ({ brow
       if (
         held ||
         requestBody.action !== "prioritize" ||
-        requestBody.resource !== "./junco-runtime/packages"
+        requestBody.resource !== "./junco-runtime"
       ) {
         await route.continue();
         return;
@@ -784,38 +780,38 @@ test("clicking a nested packages directory selects its UML scope", async ({ brow
       await route.fulfill({ response: fetchedResponse });
       resolveFinished();
     };
-    const nestedPackageDiagramRequests: Request[] = [];
-    let resolveNestedPackageDiagramRequest!: (request: Request) => void;
-    const nestedPackageDiagramRequest = new Promise<Request>((resolve) => {
-      resolveNestedPackageDiagramRequest = resolve;
+    const nestedSourceDiagramRequests: Request[] = [];
+    let resolveNestedSourceDiagramRequest!: (request: Request) => void;
+    const nestedSourceDiagramRequest = new Promise<Request>((resolve) => {
+      resolveNestedSourceDiagramRequest = resolve;
     });
-    const observeNestedPackageDiagramRequest = (request: Request): void => {
+    const observeNestedSourceDiagramRequest = (request: Request): void => {
       const url = new URL(request.url());
       if (
         url.pathname === "/api/diagram" &&
         url.searchParams.get("kind") === "uml" &&
-        url.searchParams.get("path") === "junco-runtime/packages"
+        url.searchParams.get("path") === "junco-runtime"
       ) {
-        nestedPackageDiagramRequests.push(request);
-        if (nestedPackageDiagramRequests.length === 1) {
-          resolveNestedPackageDiagramRequest(request);
+        nestedSourceDiagramRequests.push(request);
+        if (nestedSourceDiagramRequests.length === 1) {
+          resolveNestedSourceDiagramRequest(request);
         }
       }
     };
-    page.on("request", observeNestedPackageDiagramRequest);
+    page.on("request", observeNestedSourceDiagramRequest);
     await page.route(preprocessRoutePattern, priorityGate);
     try {
-      await packagesRow.click();
+      await runtimeRow.click();
       const heldPriority = await withBound(
         captured,
         10_000,
-        "junco-runtime/packages prioritize response",
+        "junco-runtime prioritize response",
       );
 
       await expect(page.locator("#diagram-loading")).toBeVisible();
       await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
       await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-      expect(nestedPackageDiagramRequests).toHaveLength(0);
+      expect(nestedSourceDiagramRequests).toHaveLength(0);
       await expect(dsl).toContainText("classDiagram");
       await expect(dsl).not.toContainText("flowchart LR");
 
@@ -823,26 +819,26 @@ test("clicking a nested packages directory selects its UML scope", async ({ brow
       await withBound(
         finished,
         10_000,
-        "released junco-runtime/packages prioritize response",
+        "released junco-runtime prioritize response",
       );
       expect(heldPriority.request).toEqual({
         action: "prioritize",
-        resource: "./junco-runtime/packages",
+        resource: "./junco-runtime",
       });
       expect(heldPriority.status).toBe(200);
-      expect(heldPriority.body.resource).toBe("junco-runtime/packages");
+      expect(heldPriority.body.resource).toBe("junco-runtime");
       expect(Number.isSafeInteger(heldPriority.body.requestId)).toBe(true);
       expect(heldPriority.body.requestId).toBeGreaterThan(0);
       expect(["queued", "processing", "done"]).toContain(heldPriority.body.status);
 
       const diagramRequest = await withBound(
-        nestedPackageDiagramRequest,
+        nestedSourceDiagramRequest,
         30_000,
-        "junco-runtime/packages UML diagram request after priority completion",
+        "junco-runtime UML diagram request after priority completion",
       );
       const diagramUrl = new URL(diagramRequest.url());
       expect(diagramUrl.searchParams.get("kind")).toBe("uml");
-      expect(diagramUrl.searchParams.get("path")).toBe("junco-runtime/packages");
+      expect(diagramUrl.searchParams.get("path")).toBe("junco-runtime");
       expect((await diagramRequest.response())?.status()).toBe(200);
       await expect(dsl).toContainText("classDiagram");
       await expect(dsl).toContainText("JuncoRuntimeDemo");
@@ -855,7 +851,127 @@ test("clicking a nested packages directory selects its UML scope", async ({ brow
     } finally {
       release();
       await page.unroute(preprocessRoutePattern, priorityGate);
-      page.off("request", observeNestedPackageDiagramRequest);
+      page.off("request", observeNestedSourceDiagramRequest);
+    }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("clicking a packages container directory shows the package graph", async ({ browser }) => {
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createNestedPackagesFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+
+    const runtimeRow = page.locator(
+      '.tree-row[data-tree-path="junco-runtime"]',
+    );
+    await Promise.all([
+      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
+        timeout: 10_000,
+      }),
+      expect(runtimeRow).toBeVisible({ timeout: 10_000 }),
+      withBound(watch.cacheReady, 45_000, "packages container cache-ready version 0"),
+    ]);
+    await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo", {
+      timeout: 30_000,
+    });
+
+    await runtimeRow.click();
+    const dsl = page.locator("#dsl-content");
+    await expect(page.locator("#diagram-loading")).toBeHidden({
+      timeout: 30_000,
+    });
+    await expect(dsl).toContainText("classDiagram");
+
+    const packagesRow = page.locator(
+      '.tree-row[data-tree-path="junco-runtime/packages"]',
+    );
+    await expect(packagesRow).toBeVisible();
+
+    const packagesDiagramResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/api/diagram" &&
+        url.searchParams.get("kind") === "packages" &&
+        url.searchParams.get("path") === "";
+    });
+    await packagesRow.click();
+    expect((await packagesDiagramResponse).status()).toBe(200);
+    await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
+    await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
+    await expect(page.locator("#diagram-loading")).toBeHidden({
+      timeout: 30_000,
+    });
+    await expect(dsl).toContainText("flowchart LR");
+    await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo");
+    await expect(page.locator("#error-panel")).toBeHidden();
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("a failed diagram shows the server error instead of mermaid output", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    const diagramRoute = (url: URL): boolean => url.pathname === "/api/diagram";
+    const failUmlDiagram = async (route: Route): Promise<void> => {
+      if (new URL(route.request().url()).searchParams.get("kind") !== "uml") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(
+          {
+            kind: "uml",
+            scopePath: "",
+            version: 0,
+            status: "error",
+            error: "forced failure",
+            dsl: "classDiagram",
+            dsls: ["classDiagram"],
+            packageNodes: [],
+            definitions: [],
+            externalUsers: [],
+            localUsers: [],
+          } satisfies DiagramResponse,
+        ),
+      });
+    };
+    await page.route(diagramRoute, failUmlDiagram);
+    try {
+      await navigateToCli(page, fixtureRoot, resource);
+      const lateRow = page.locator('.tree-row[data-tree-path="z-late"]');
+      await Promise.all([
+        expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
+          timeout: 10_000,
+        }),
+        expect(lateRow).toBeVisible({ timeout: 10_000 }),
+      ]);
+      await withBound(watch.cacheReady, 45_000, "forced diagram failure cache-ready version 0");
+
+      await lateRow.click();
+      await expect(page.locator(".uml-frame.error")).toContainText("forced failure", {
+        timeout: 60_000,
+      });
+      await expect(page.locator("#error-panel")).toBeVisible();
+      await expect(page.locator("#error-panel")).toContainText("forced failure");
+      await expect(page.locator("#svg-holder")).not.toContainText("Parse error");
+      await expect(page.locator("#status")).toHaveText("Diagram unavailable");
+    } finally {
+      await page.unroute(diagramRoute, failUmlDiagram);
     }
   } finally {
     await cleanupResource(resource);
@@ -1164,6 +1280,24 @@ test("navigates definitions within the active surface and cancels stale priority
         await page.unroute(preprocessRoutePattern, directoryDoneGate.handler);
       }
 
+      const inFlight = new Map<string, number>();
+      const windowStart = Date.now();
+      const stamp = (): string => String(Date.now() - windowStart).padStart(6);
+      page.on("request", (r) => {
+        inFlight.set(r.url(), Date.now());
+        console.log(`${stamp()} REQ  ${new URL(r.url()).pathname} inflight=${inFlight.size}`);
+        if (new URL(r.url()).pathname === "/api/goto-definition") {
+          console.log(`${stamp()} OUTSTANDING: ${[...inFlight.keys()].map((u) => new URL(u).pathname + new URL(u).search.slice(0, 30)).join(" | ")}`);
+        }
+      });
+      page.on("response", (r) => {
+        inFlight.delete(r.url());
+        console.log(`${stamp()} RES  ${r.status()} ${new URL(r.url()).pathname} inflight=${inFlight.size}`);
+      });
+      page.on("requestfailed", (r) => {
+        inFlight.delete(r.url());
+        console.log(`${stamp()} FAIL ${new URL(r.url()).pathname} ${r.failure()?.errorText}`);
+      });
       const definitionResetHistoryStart = watch.history.length;
       await appendFile(
         join(fixtureRoot, lateLocation.path),

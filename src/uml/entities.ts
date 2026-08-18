@@ -1,4 +1,4 @@
-import type { FileDeclaration } from "tsuml2/dist/core/model";
+import type { FileDeclaration } from "./model.ts";
 import type { UmlEntityKind } from "../diagram-graph.ts";
 
 type UmlEntityCollectionDescriptor =
