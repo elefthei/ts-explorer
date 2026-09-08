@@ -22,6 +22,8 @@ export type PackageDiagramNode = {
 
 export type DiagramKind = "packages" | "uml";
 
+export type SearchMode = "content" | "path" | "regex";
+
 export type PreprocessPriorityStatus = "queued" | "processing" | "done";
 
 export type PreprocessPriorityResponse = {
@@ -184,4 +186,3 @@ export type WatchMessage =
     type: "cache-ready";
     version: number;
   };
-
