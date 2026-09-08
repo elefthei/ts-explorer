@@ -184,30 +184,26 @@ export class ExplorerStore {
     this.onError(error, this.version);
   }
 
-  private mapPreprocessorError(error: unknown): never {
-    const code =
-      typeof error === "object" && error !== null && "code" in error
-        ? error.code
-        : undefined;
-    const message = error instanceof Error ? error.message : String(error);
-    if (code === "INVALID_INPUT") throw new InputError(message);
-    if (
-      code === "BAD_REQUEST" ||
-      code === "FORBIDDEN" ||
-      code === "NOT_FOUND"
-    ) {
-      throw new PathError(code, message);
-    }
-    throw error;
-  }
-
   private async fromPreprocessor<T>(
     operation: () => Promise<T>,
   ): Promise<T> {
     try {
       return await operation();
     } catch (error) {
-      this.mapPreprocessorError(error);
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? error.code
+          : undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      if (code === "INVALID_INPUT") throw new InputError(message);
+      if (
+        code === "BAD_REQUEST" ||
+        code === "FORBIDDEN" ||
+        code === "NOT_FOUND"
+      ) {
+        throw new PathError(code, message);
+      }
+      throw error;
     }
   }
 }

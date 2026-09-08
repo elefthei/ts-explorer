@@ -1,6 +1,6 @@
 import type {
   DiagramKind,
-  DiagramResponse,
+  DiagramPayload,
   FileResponse,
   GotoDefinition,
   PackageInfo,
@@ -9,13 +9,16 @@ import type {
   UmlSourceLocation,
 } from "./types.ts";
 
-export type PreprocessErrorCode =
-  | "BAD_REQUEST"
-  | "FORBIDDEN"
-  | "NOT_FOUND"
-  | "INVALID_INPUT"
-  | "SCHEMA_RETRY"
-  | "INTERNAL";
+const PREPROCESS_ERROR_CODES = {
+  BAD_REQUEST: true,
+  FORBIDDEN: true,
+  NOT_FOUND: true,
+  INVALID_INPUT: true,
+  SCHEMA_RETRY: true,
+  INTERNAL: true,
+} as const;
+
+export type PreprocessErrorCode = keyof typeof PREPROCESS_ERROR_CODES;
 
 export type PreprocessCause = "startup" | "watch";
 
@@ -109,7 +112,7 @@ export type PreprocessResultMap = {
   "preprocess-scope": { children: PreprocessScope[] };
   "read-tree": TreeNode;
   "read-packages": PackageInfo[];
-  "read-diagram": Omit<DiagramResponse, "version">;
+  "read-diagram": DiagramPayload;
   "read-file": FileResponse;
   "read-definition": GotoDefinition | null;
   "lookup-definition": UmlSourceLocation | null;
@@ -148,15 +151,6 @@ export type PreprocessProgressEvent = {
   cause: PreprocessCause;
 };
 
-const PREPROCESS_ERROR_CODES = new Set<PreprocessErrorCode>([
-  "BAD_REQUEST",
-  "FORBIDDEN",
-  "NOT_FOUND",
-  "INVALID_INPUT",
-  "SCHEMA_RETRY",
-  "INTERNAL",
-]);
-
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -189,7 +183,7 @@ export function isPreprocessResponse(value: unknown): value is PreprocessRespons
   if (!isRecord(value.error)) return false;
   return (
     typeof value.error.code === "string" &&
-    PREPROCESS_ERROR_CODES.has(value.error.code as PreprocessErrorCode) &&
+    Object.hasOwn(PREPROCESS_ERROR_CODES, value.error.code) &&
     typeof value.error.message === "string"
   );
 }

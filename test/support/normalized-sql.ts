@@ -1,8 +1,7 @@
 import { expect } from "bun:test";
 import type { Database } from "bun:sqlite";
-import type { CacheDiagramResponse } from "../../src/cache.ts";
 import type { DiagramGraph, UmlDiagramGraph } from "../../src/diagram-graph.ts";
-import type { DiagramKind, DiagramResponse } from "../../src/types.ts";
+import type { DiagramKind, DiagramPayload, DiagramResponse } from "../../src/types.ts";
 
 type SqlBoolean = 0 | 1;
 type PackageDiagramGraph = Extract<DiagramGraph, { kind: "packages" }>;
@@ -565,7 +564,7 @@ export type NormalizedGraphSnapshot = {
   scopePath: string;
   header: { format_version: 1; render_mode: "normal" | "bare" };
   records: NormalizedSnapshotRecord[];
-  response: CacheDiagramResponse;
+  response: DiagramPayload;
 };
 
 const NORMALIZED_TABLES = Object.keys(NORMALIZED_TABLE_SPECS) as NormalizedTable[];
@@ -656,7 +655,7 @@ export function readNormalizedGraphSnapshot(
     scopePath,
     header,
     records,
-    response: JSON.parse(responseRow.response_json) as CacheDiagramResponse,
+    response: JSON.parse(responseRow.response_json) as DiagramPayload,
   };
 }
 

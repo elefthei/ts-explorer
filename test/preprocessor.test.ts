@@ -18,6 +18,8 @@ import {
   type PreprocessResponse,
 } from "../src/preprocess-protocol.ts";
 import type { EditorGotoDefinition, GotoDefinition, TreeNode } from "../src/types.ts";
+import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
+import { EMPTY_UML_VIEW_MODEL, renderUmlView } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
 import { renderDiagramGraph } from "./support/normalized-graph.ts";
 import {
@@ -114,14 +116,20 @@ function setFixtureMarker(graph: UmlDiagramGraph, marker: string): void {
 }
 
 function renderFixtureGraph(graph: DiagramGraph): RenderedDiagram {
-  return {
-    dsl: `${graph.kind}:${graph.scopePath}:${graph.nodes.map(({ name }) => name).join(",")}`,
-    dsls: [`${graph.kind}:${graph.scopePath}`],
+  const shared = {
     packageNodes: [],
     definitions: [],
     externalUsers: [],
     localUsers: [],
   };
+  return graph.kind === "packages"
+    ? {
+      kind: "packages",
+      dsl: `${graph.kind}:${graph.scopePath}:${graph.nodes.map(({ name }) => name).join(",")}`,
+      dsls: [`${graph.kind}:${graph.scopePath}`],
+      ...shared,
+    }
+    : { kind: "uml", view: EMPTY_UML_VIEW_MODEL, ...shared };
 }
 
 const fixtures = createFixtureTracker();
@@ -363,6 +371,11 @@ test("validates preprocessing response envelopes", () => {
     {
       name: "non-string error message",
       value: { id: 5, ok: false, error: { code: "INTERNAL", message: 5 } },
+      expected: false,
+    },
+    {
+      name: "inherited object key as error code",
+      value: { id: 8, ok: false, error: { code: "constructor", message: "bad response" } },
       expected: false,
     },
   ];
@@ -794,6 +807,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   ]);
 
   const packageDiagram = await preprocessor.getDiagram("packages", "");
+  if (packageDiagram.kind !== "packages") throw new Error("expected a package diagram");
   expect(packageDiagram).toMatchObject({
     kind: "packages",
     scopePath: "",
@@ -820,14 +834,16 @@ test("preprocesses each visible scope once and serves formatted files and litera
     kind: "uml",
     scopePath: "packages/b/index.js",
     status: "ready",
-    dsl: "classDiagram\n  direction LR",
-    dsls: ["classDiagram\n  direction LR"],
+    view: EMPTY_UML_VIEW_MODEL,
     packageNodes: [],
     definitions: [],
     externalUsers: [],
     localUsers: [],
   });
-  expect(await mermaid.parse(untrackedJavaScriptDiagram.dsl)).toMatchObject({
+  if (untrackedJavaScriptDiagram.kind !== "uml") throw new Error("expected a uml diagram");
+  expect(
+    await mermaid.parse(renderUmlView(untrackedJavaScriptDiagram.view, FULL_UML_VISIBILITY).dsl),
+  ).toMatchObject({
     diagramType: "class",
   });
 
@@ -1259,10 +1275,9 @@ test("preprocesses each visible scope once and serves formatted files and litera
       expect(graph).toMatchObject({ kind, scopePath });
       const rerendered = renderDiagramGraph(graph);
       expect(response).toEqual({
-        kind,
+        ...rerendered,
         scopePath,
         status: response.status,
-        ...rerendered,
         ...(response.status === "error" ? { error: response.error } : {}),
       });
     }

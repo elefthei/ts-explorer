@@ -2,7 +2,8 @@ import { basename, dirname } from "node:path/posix";
 import type { Node } from "@vscode/tree-sitter-wasm";
 import { namedChildren } from "../lang/ast.ts";
 import { rustTopLevelItems } from "../lang/rust.ts";
-import { bareUmlName, posix, umlEntityKey, umlFileKey } from "./keys.ts";
+import { posix, umlEntityKey, umlFileKey } from "./keys.ts";
+import { bareUmlName } from "./mermaid.ts";
 import type { SourceUnit, UmlReference } from "./model.ts";
 
 /** `mod.rs`/`lib.rs`/`main.rs` own their directory; every other file owns `<dir>/<stem>`. */

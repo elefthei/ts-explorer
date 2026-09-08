@@ -145,7 +145,7 @@ function createUmlGraph(
 
   for (const declaration of declarations) {
     for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      for (const entity of descriptor.entities(declaration)) {
+      for (const entity of declaration[descriptor.key]) {
         registerEntity(graph, entityIds, entity.id, entity.name);
       }
     }

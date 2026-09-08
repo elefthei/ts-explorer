@@ -18,14 +18,13 @@ import { parseUmlAssociations, removeSelfMemberAssociations } from "./uml/associ
 import { UML_ENTITY_COLLECTIONS } from "./uml/entities.ts";
 import { extractUmlTopology } from "./uml/graph.ts";
 import {
-  bareUmlName,
   isTestPath,
   posix,
   scopeRelativePath,
   syntheticTypeId,
   umlFileKey,
 } from "./uml/keys.ts";
-import { escapeStructuredMemberTypes } from "./uml/mermaid.ts";
+import { bareUmlName, escapeStructuredMemberTypes } from "./uml/mermaid.ts";
 import type {
   CategoryMap,
   FileDeclaration,
@@ -90,7 +89,7 @@ function fileDeclarations(declarations: FileDeclaration[]): CategoryMap {
     const test = isTestPath(declaration.fileName);
     for (const descriptor of CATEGORY_ENTITY_COLLECTIONS) {
       const category = descriptor.kind === "class" ? "concrete" : descriptor.kind;
-      for (const entity of descriptor.entities(declaration)) {
+      for (const entity of declaration[descriptor.key]) {
         result.set(entity.name, { category, test });
       }
     }
@@ -322,17 +321,13 @@ function serializeDeclarations(declarations: readonly FileDeclaration[]): UmlMod
       { entityKind: UmlEntityKind; entityOrdinal: number }
     >();
     for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      if (descriptor.structured) {
-        for (const [entityOrdinal, entity] of descriptor.entities(declaration).entries()) {
-          serializeEntity(declarationOrdinal, descriptor.kind, entityOrdinal, entity, rows);
+      for (const [entityOrdinal, entity] of declaration[descriptor.key].entries()) {
+        serializeEntity(declarationOrdinal, descriptor.kind, entityOrdinal, entity, rows);
+        if (descriptor.kind !== "enum") {
           heritageOwners.set(entity.heritageClauses, {
             entityKind: descriptor.kind,
             entityOrdinal,
           });
-        }
-      } else {
-        for (const [entityOrdinal, entity] of descriptor.entities(declaration).entries()) {
-          serializeEntity(declarationOrdinal, descriptor.kind, entityOrdinal, entity, rows);
         }
       }
     }

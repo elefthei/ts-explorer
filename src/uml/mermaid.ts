@@ -1,6 +1,10 @@
 import { UML_METHOD_RETURN_MARKER } from "../types.ts";
-import { bareUmlName } from "./keys.ts";
 import type { FileDeclaration } from "./model.ts";
+
+export function bareUmlName(name: string): string {
+  const genericStart = name.indexOf("<");
+  return genericStart === -1 ? name : name.slice(0, genericStart);
+}
 
 export const STYLE_DEFS = [
   ["interface", "fill:#183a66,stroke:#69d2ff,color:#f4f7fb"],

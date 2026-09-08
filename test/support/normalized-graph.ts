@@ -1,17 +1,20 @@
 import { expect } from "bun:test";
 import { join } from "node:path";
-import {
-  Cache,
-  type CacheDiagramResponse,
-} from "../../src/cache.ts";
+import { Cache } from "../../src/cache.ts";
 import type {
   DiagramGraph,
+  PackageDiagramGraph,
   RenderedDiagram,
+  RenderedPackageDiagram,
+  RenderedUmlDiagram,
   UmlDiagramGraph,
 } from "../../src/diagram-graph.ts";
 import { renderPackageDiagramGraph } from "../../src/packages.ts";
 import { hydrateUmlGraph } from "../../src/uml/graph.ts";
+import { FULL_UML_VISIBILITY } from "../../src/uml/model.ts";
 import { renderUmlDiagramGraph } from "../../src/uml/render.ts";
+import { renderUmlView } from "../../src/uml/view.ts";
+import type { DiagramPayload } from "../../src/types.ts";
 
 let cacheOrdinal = 0;
 
@@ -44,6 +47,9 @@ const UML_RECORD_ARRAY_FIELDS = [
     UmlDiagramGraph[Field] extends readonly unknown[] ? Field : never;
 }[keyof UmlDiagramGraph][];
 
+export function renderDiagramGraph(graph: PackageDiagramGraph): RenderedPackageDiagram;
+export function renderDiagramGraph(graph: UmlDiagramGraph): RenderedUmlDiagram;
+export function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram;
 export function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram {
   return graph.kind === "packages"
     ? renderPackageDiagramGraph(graph)
@@ -71,8 +77,12 @@ export async function materializeUmlGraph(
     if (record?.kind !== "uml") {
       throw new Error(`Expected reloaded UML graph for ${extracted.scopePath}`);
     }
+    if (cached.kind !== "uml") {
+      throw new Error(`Expected a cached UML diagram for ${extracted.scopePath}`);
+    }
     return {
       ...cached,
+      ...renderUmlView(cached.view, FULL_UML_VISIBILITY),
       cached,
       extracted,
       record,
@@ -106,15 +116,15 @@ export function expectNormalizedUmlRoundTrip(
   }
 }
 
-type MaterializedRendering = RenderedDiagram & {
-  cached: CacheDiagramResponse;
-  record: DiagramGraph;
+type MaterializedRendering = RenderedUmlDiagram & {
+  cached: DiagramPayload;
+  record: UmlDiagramGraph;
 };
 
 export function expectCachedRendering(materialized: MaterializedRendering): void {
-  const rendered = {
-    dsl: materialized.dsl,
-    dsls: materialized.dsls,
+  const rendered: RenderedUmlDiagram = {
+    kind: "uml",
+    view: materialized.view,
     packageNodes: materialized.packageNodes,
     definitions: materialized.definitions,
     externalUsers: materialized.externalUsers,
@@ -122,9 +132,8 @@ export function expectCachedRendering(materialized: MaterializedRendering): void
   };
   expect(rendered).toEqual(renderDiagramGraph(materialized.record));
   expect(materialized.cached).toEqual({
-    kind: materialized.record.kind,
+    ...rendered,
     scopePath: materialized.record.scopePath,
     status: "ready",
-    ...rendered,
   });
 }

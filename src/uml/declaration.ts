@@ -1,5 +1,6 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
-import { bareUmlName, syntheticTypeId, umlEntityKey } from "./keys.ts";
+import { syntheticTypeId, umlEntityKey } from "./keys.ts";
+import { bareUmlName } from "./mermaid.ts";
 import type {
   FileDeclaration,
   HeritageClause,

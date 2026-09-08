@@ -15,7 +15,7 @@ import { validatePackageDiagramGraph } from "./packages.ts";
 import { buildSearchScopes } from "./search.ts";
 import type {
   DiagramKind,
-  DiagramResponse,
+  DiagramPayload,
   EditorGotoDefinition,
   GotoDefinition,
   GotoDefinitionKind,
@@ -27,8 +27,6 @@ import type {
 import { validateUmlDiagramGraph } from "./uml/render.ts";
 
 const CACHE_SCHEMA_VERSION = 7;
-
-export type CacheDiagramResponse = Omit<DiagramResponse, "version">;
 
 type DiagramErrorOutcome = { status: "error"; error: string };
 
@@ -128,27 +126,7 @@ type GraphHeaderRow = {
   formatVersion: number;
   renderMode: "normal" | "bare";
 };
-type SqlEdgeRow = Omit<DiagramGraph["edges"][number], "directed"> & { directed: number };
-type SqlDeclarationRow = Omit<
-  UmlDiagramGraph["declarations"][number],
-  "memberAssociationsPresent"
-> & { memberAssociationsPresent: number };
-type SqlPropertyRow = Omit<
-  UmlDiagramGraph["properties"][number],
-  "optional"
-> & { optional: number };
-type SqlMethodRow = Omit<
-  UmlDiagramGraph["methods"][number],
-  "returnTypeIdsPresent"
-> & { returnTypeIdsPresent: number };
-type SqlMemberAssociationRow = Omit<
-  UmlDiagramGraph["memberAssociations"][number],
-  "inherited"
-> & { inherited: number };
-type SqlCategoryRow = Omit<
-  UmlDiagramGraph["categories"][number],
-  "isTest"
-> & { isTest: number };
+type SqlBooleanRow<Row, Key extends keyof Row> = Omit<Row, Key> & Record<Key, number>;
 type CacheStatements = {
   selectActiveGeneration: Statement<ActiveGenerationRow, []>;
   deleteActivePointer: Statement<never, []>;
@@ -162,7 +140,7 @@ type CacheStatements = {
   >;
   upsertDiagram: Statement<
     never,
-    [number, CacheDiagramResponse["kind"], string, string]
+    [number, DiagramKind, string, string]
   >;
   upsertFile: Statement<
     never,
@@ -198,7 +176,7 @@ type CacheStatements = {
   >;
   selectTreeEntries: Statement<TreeRow, [number]>;
   selectPackages: Statement<PackageRow, [number]>;
-  selectDiagram: Statement<DiagramRow, [number, CacheDiagramResponse["kind"], string]>;
+  selectDiagram: Statement<DiagramRow, [number, DiagramKind, string]>;
   selectFailedDiagram: Statement<{ scope_path: string }, [number]>;
   selectFile: Statement<FileRow, [number, string]>;
   selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
@@ -1786,7 +1764,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE aliases.generation_id = ? AND aliases.kind = ? AND aliases.scope_path = ?
     ORDER BY nodes.node_ordinal, aliases.alias_ordinal
   `);
-  const selectEdges = db.query<SqlEdgeRow, GraphIdentity>(`
+  const selectEdges = db.query<
+    SqlBooleanRow<DiagramGraph["edges"][number], "directed">,
+    GraphIdentity
+  >(`
     SELECT
       edge_ordinal AS edgeOrdinal,
       source_node_id AS sourceNodeId,
@@ -1823,7 +1804,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE packages.generation_id = ? AND packages.kind = ? AND packages.scope_path = ?
     ORDER BY nodes.node_ordinal
   `);
-  const selectUmlDeclarations = db.query<SqlDeclarationRow, GraphIdentity>(`
+  const selectUmlDeclarations = db.query<
+    SqlBooleanRow<UmlDiagramGraph["declarations"][number], "memberAssociationsPresent">,
+    GraphIdentity
+  >(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
       file_name AS fileName,
@@ -1847,7 +1831,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       END,
       entity_ordinal
   `);
-  const selectUmlProperties = db.query<SqlPropertyRow, GraphIdentity>(`
+  const selectUmlProperties = db.query<
+    SqlBooleanRow<UmlDiagramGraph["properties"][number], "optional">,
+    GraphIdentity
+  >(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
       entity_kind AS entityKind,
@@ -1886,7 +1873,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       property_ordinal,
       type_id_ordinal
   `);
-  const selectUmlMethods = db.query<SqlMethodRow, GraphIdentity>(`
+  const selectUmlMethods = db.query<
+    SqlBooleanRow<UmlDiagramGraph["methods"][number], "returnTypeIdsPresent">,
+    GraphIdentity
+  >(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
       entity_kind AS entityKind,
@@ -2010,7 +2000,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY declaration_ordinal, group_ordinal, clause_ordinal
   `);
-  const selectUmlMemberAssociations = db.query<SqlMemberAssociationRow, GraphIdentity>(`
+  const selectUmlMemberAssociations = db.query<
+    SqlBooleanRow<UmlDiagramGraph["memberAssociations"][number], "inherited">,
+    GraphIdentity
+  >(`
     SELECT
       declaration_ordinal AS declarationOrdinal,
       association_ordinal AS associationOrdinal,
@@ -2026,7 +2019,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY declaration_ordinal, association_ordinal
   `);
-  const selectUmlCategories = db.query<SqlCategoryRow, GraphIdentity>(`
+  const selectUmlCategories = db.query<
+    SqlBooleanRow<UmlDiagramGraph["categories"][number], "isTest">,
+    GraphIdentity
+  >(`
     SELECT
       category_ordinal AS categoryOrdinal,
       entity_name AS entityName,
@@ -2752,13 +2748,36 @@ function validateRenderedDiagram(value: RenderedDiagram): RenderedDiagram {
   if (
     !value
     || typeof value !== "object"
-    || typeof value.dsl !== "string"
-    || !Array.isArray(value.dsls)
-    || value.dsls.some((dsl) => typeof dsl !== "string")
     || !Array.isArray(value.packageNodes)
     || !Array.isArray(value.definitions)
     || !Array.isArray(value.externalUsers)
     || !Array.isArray(value.localUsers)
+  ) {
+    throw new Error("renderer returned an invalid diagram");
+  }
+  if (value.kind === "packages") {
+    if (
+      typeof value.dsl !== "string"
+      || !Array.isArray(value.dsls)
+      || value.dsls.some((dsl) => typeof dsl !== "string")
+    ) {
+      throw new Error("renderer returned an invalid diagram");
+    }
+    return value;
+  }
+  if (value.kind !== "uml") throw new Error("renderer returned an invalid diagram");
+  const view = value.view as Record<string, unknown> | null | undefined;
+  if (
+    !view
+    || typeof view !== "object"
+    || !Array.isArray(view.declarations)
+    || !Array.isArray(view.frames)
+    || !Array.isArray(view.testEntityIds)
+    || !Array.isArray(view.categories)
+    || !Array.isArray(view.methodReturnDependencies)
+    || !Array.isArray(view.usageEdges)
+    || !Array.isArray(view.localUsers)
+    || !Array.isArray(view.externalUsers)
   ) {
     throw new Error("renderer returned an invalid diagram");
   }
@@ -2789,46 +2808,16 @@ private static recreateSchema(db: Database): void {
 
 private readonly db!: Database;
 private readonly graphStore!: PreparedGraphStore;
-private readonly selectActiveGeneration!: CacheStatements["selectActiveGeneration"];
-private readonly deleteActivePointer!: CacheStatements["deleteActivePointer"];
-private readonly deleteGenerationsExcept!: CacheStatements["deleteGenerationsExcept"];
-private readonly deleteAllGenerations!: CacheStatements["deleteAllGenerations"];
-private readonly insertGeneration!: CacheStatements["insertGeneration"];
-private readonly upsertPackages!: CacheStatements["upsertPackages"];
-private readonly upsertTreeEntry!: CacheStatements["upsertTreeEntry"];
-private readonly upsertDiagram!: CacheStatements["upsertDiagram"];
-private readonly upsertFile!: CacheStatements["upsertFile"];
-private readonly deleteScopeGotoDefs!: CacheStatements["deleteScopeGotoDefs"];
-private readonly insertGotoDefinition!: CacheStatements["insertGotoDefinition"];
-private readonly selectTreeEntries!: CacheStatements["selectTreeEntries"];
-private readonly selectPackages!: CacheStatements["selectPackages"];
-private readonly selectDiagram!: CacheStatements["selectDiagram"];
-private readonly selectFailedDiagram!: CacheStatements["selectFailedDiagram"];
-private readonly selectFile!: CacheStatements["selectFile"];
-private readonly selectDefinition!: CacheStatements["selectDefinition"];
-private readonly selectDefinitions!: CacheStatements["selectDefinitions"];
-private readonly selectIndexedSearchCandidates!: CacheStatements["selectIndexedSearchCandidates"];
-private readonly selectScanSearchCandidates!: CacheStatements["selectScanSearchCandidates"];
-private readonly selectIndexedDefinitionCandidates!: CacheStatements["selectIndexedDefinitionCandidates"];
-private readonly selectScanDefinitionCandidates!: CacheStatements["selectScanDefinitionCandidates"];
-private readonly markGenerationActive!: CacheStatements["markGenerationActive"];
-private readonly upsertActivePointer!: CacheStatements["upsertActivePointer"];
-private readonly deleteInactiveGeneration!: CacheStatements["deleteInactiveGeneration"];
-private readonly markGenerationFailed!: CacheStatements["markGenerationFailed"];
-private readonly optimizeSearch!: CacheStatements["optimizeSearch"];
-private readonly optimizeGotoDefinitionSearch!: CacheStatements["optimizeGotoDefinitionSearch"];
-private readonly deleteGenerationDefinitionIndex!: CacheStatements["deleteGenerationDefinitionIndex"];
-private readonly insertDefinitionIndex!: CacheStatements["insertDefinitionIndex"];
-private readonly selectDefinitionIndexEntry!: CacheStatements["selectDefinitionIndexEntry"];
+private readonly cacheStatements!: CacheStatements;
 private readonly statements!: Array<{ finalize(): void }>;
 private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
 private readonly discoveryTransaction!: ImmediateTransaction<
   [number, readonly PackageInfo[], CacheDiagramInput, DiagramRenderer],
-  CacheDiagramResponse
+  DiagramPayload
 >;
 private readonly scopeTransaction!: ImmediateTransaction<
   [number, CacheScopeWrite, DiagramRenderer],
-  CacheDiagramResponse
+  DiagramPayload
 >;
 private readonly definitionIndexTransaction!: ImmediateTransaction<
   [number, readonly DefinitionIndexWrite[]]
@@ -2912,7 +2901,7 @@ constructor(dbPath: string) {
       kind = excluded.kind,
       viewable = excluded.viewable
   `);
-  const upsertDiagram = db.query<never, [number, CacheDiagramResponse["kind"], string, string]>(`
+  const upsertDiagram = db.query<never, [number, DiagramKind, string, string]>(`
     INSERT INTO diagrams(generation_id, kind, scope_path, response_json)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(generation_id, kind, scope_path) DO UPDATE SET
@@ -3025,7 +3014,7 @@ constructor(dbPath: string) {
     FROM package_snapshots
     WHERE generation_id = ?
   `);
-  const selectDiagram = db.query<DiagramRow, [number, CacheDiagramResponse["kind"], string]>(`
+  const selectDiagram = db.query<DiagramRow, [number, DiagramKind, string]>(`
     SELECT response_json
     FROM diagrams
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
@@ -3162,7 +3151,7 @@ constructor(dbPath: string) {
   `);
   const graphStore = prepareGraphStore(db);
 
-  const statements: Array<{ finalize(): void }> = [
+  this.cacheStatements = {
     selectActiveGeneration,
     deleteActivePointer,
     deleteGenerationsExcept,
@@ -3194,50 +3183,19 @@ constructor(dbPath: string) {
     deleteGenerationDefinitionIndex,
     insertDefinitionIndex,
     selectDefinitionIndexEntry,
-    ...graphStore.statements,
-  ];
-  this.selectActiveGeneration = selectActiveGeneration;
-  this.deleteActivePointer = deleteActivePointer;
-  this.deleteGenerationsExcept = deleteGenerationsExcept;
-  this.deleteAllGenerations = deleteAllGenerations;
-  this.insertGeneration = insertGeneration;
-  this.upsertPackages = upsertPackages;
-  this.upsertTreeEntry = upsertTreeEntry;
-  this.upsertDiagram = upsertDiagram;
-  this.upsertFile = upsertFile;
-  this.deleteScopeGotoDefs = deleteScopeGotoDefs;
-  this.insertGotoDefinition = insertGotoDefinition;
-  this.selectTreeEntries = selectTreeEntries;
-  this.selectPackages = selectPackages;
-  this.selectDiagram = selectDiagram;
-  this.selectFailedDiagram = selectFailedDiagram;
-  this.selectFile = selectFile;
-  this.selectDefinition = selectDefinition;
-  this.selectDefinitions = selectDefinitions;
-  this.selectIndexedSearchCandidates = selectIndexedSearchCandidates;
-  this.selectScanSearchCandidates = selectScanSearchCandidates;
-  this.selectIndexedDefinitionCandidates = selectIndexedDefinitionCandidates;
-  this.selectScanDefinitionCandidates = selectScanDefinitionCandidates;
-  this.markGenerationActive = markGenerationActive;
-  this.upsertActivePointer = upsertActivePointer;
-  this.deleteInactiveGeneration = deleteInactiveGeneration;
-  this.markGenerationFailed = markGenerationFailed;
-  this.optimizeSearch = optimizeSearch;
-  this.optimizeGotoDefinitionSearch = optimizeGotoDefinitionSearch;
-  this.deleteGenerationDefinitionIndex = deleteGenerationDefinitionIndex;
-  this.insertDefinitionIndex = insertDefinitionIndex;
-  this.selectDefinitionIndexEntry = selectDefinitionIndexEntry;
+  };
   this.graphStore = graphStore;
-  this.statements = statements;
+  this.statements = Object.values(this.cacheStatements);
+  this.statements.push(...graphStore.statements);
 
 
   this.recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
     if (activeGenerationId === null) {
-      this.deleteActivePointer.run();
-      this.deleteAllGenerations.run();
+      this.cacheStatements.deleteActivePointer.run();
+      this.cacheStatements.deleteAllGenerations.run();
       return;
     }
-    this.deleteGenerationsExcept.run(activeGenerationId);
+    this.cacheStatements.deleteGenerationsExcept.run(activeGenerationId);
   });
   const materializeDiagram = (
     generationId: number,
@@ -3245,7 +3203,7 @@ constructor(dbPath: string) {
     renderer: DiagramRenderer,
     expectedKind?: DiagramKind,
     expectedScopePath?: string,
-  ): CacheDiagramResponse => {
+  ): DiagramPayload => {
     let graph: DiagramGraph | null = null;
     let kind: DiagramKind;
     let scopePath: string;
@@ -3324,7 +3282,7 @@ constructor(dbPath: string) {
       if (!sourceGraph) {
         throw invalidMaterialization("fallback source graph not found");
       }
-      const sourceResponseRow = this.selectDiagram.get(
+      const sourceResponseRow = this.cacheStatements.selectDiagram.get(
         fallbackSource.sourceGenerationId,
         fallbackSource.kind,
         fallbackSource.scopePath,
@@ -3334,7 +3292,7 @@ constructor(dbPath: string) {
       }
       try {
         validateLoadedGraph(sourceGraph);
-        const sourceResponse = parseJson<CacheDiagramResponse>(
+        const sourceResponse = parseJson<DiagramPayload>(
           sourceResponseRow.response_json,
           "fallback diagram",
         );
@@ -3378,15 +3336,16 @@ constructor(dbPath: string) {
       }
       rendered = fallbackRendered;
     }
-    let response: CacheDiagramResponse;
+    if (rendered.kind !== kind) throw invalidMaterialization("diagram renderer kind mismatch");
+    let response: DiagramPayload;
     let responseJson: string;
     try {
       response = {
-        kind,
+        ...(rendered.kind === "packages"
+          ? { kind: "packages" as const, dsl: rendered.dsl, dsls: rendered.dsls }
+          : { kind: "uml" as const, view: rendered.view }),
         scopePath,
         status: input.outcome.status,
-        dsl: rendered.dsl,
-        dsls: rendered.dsls,
         packageNodes: rendered.packageNodes,
         definitions: rendered.definitions,
         externalUsers: rendered.externalUsers,
@@ -3399,7 +3358,7 @@ constructor(dbPath: string) {
     } catch (error) {
       throw invalidMaterialization("diagram response materialization failed", error);
     }
-    this.upsertDiagram.run(generationId, kind, scopePath, responseJson);
+    this.cacheStatements.upsertDiagram.run(generationId, kind, scopePath, responseJson);
     return response;
   };
 
@@ -3416,7 +3375,7 @@ constructor(dbPath: string) {
       "packages",
       "",
     );
-    this.upsertPackages.run(generationId, JSON.stringify(packages));
+    this.cacheStatements.upsertPackages.run(generationId, JSON.stringify(packages));
     return response;
   });
   this.scopeTransaction = db.transaction((
@@ -3427,7 +3386,7 @@ constructor(dbPath: string) {
     const response = materializeDiagram(generationId, scope.diagram, renderer);
     for (const entry of scope.entries) {
       const viewable = (entry as TreeNode & { viewable?: boolean }).viewable === true ? 1 : 0;
-      this.upsertTreeEntry.run(
+      this.cacheStatements.upsertTreeEntry.run(
         generationId,
         entry.path,
         parentPath(entry.path),
@@ -3438,8 +3397,8 @@ constructor(dbPath: string) {
     }
     if (scope.file) {
       const file = scope.file;
-      this.deleteScopeGotoDefs.run(generationId, file.path);
-      this.upsertFile.run(
+      this.cacheStatements.deleteScopeGotoDefs.run(generationId, file.path);
+      this.cacheStatements.upsertFile.run(
         generationId,
         file.path,
         file.rawContent,
@@ -3449,7 +3408,7 @@ constructor(dbPath: string) {
         file.language,
       );
       for (const definition of scope.definitions) {
-        this.insertGotoDefinition.run(
+        this.cacheStatements.insertGotoDefinition.run(
           generationId,
           definition.key,
           definition.kind,
@@ -3473,9 +3432,9 @@ constructor(dbPath: string) {
     generationId: number,
     definitions: readonly DefinitionIndexWrite[],
   ) => {
-    this.deleteGenerationDefinitionIndex.run(generationId);
+    this.cacheStatements.deleteGenerationDefinitionIndex.run(generationId);
     for (const definition of definitions) {
-      this.insertDefinitionIndex.run(
+      this.cacheStatements.insertDefinitionIndex.run(
         generationId,
         definition.path,
         definition.name,
@@ -3487,9 +3446,9 @@ constructor(dbPath: string) {
     }
   });
   this.promotionTransaction = db.transaction((generationId: number) => {
-    const result = this.markGenerationActive.run(Date.now(), generationId);
+    const result = this.cacheStatements.markGenerationActive.run(Date.now(), generationId);
     if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
-    this.upsertActivePointer.run(String(generationId));
+    this.cacheStatements.upsertActivePointer.run(String(generationId));
   });
 
   } catch (error) {
@@ -3503,7 +3462,7 @@ constructor(dbPath: string) {
 }
 
 recover(sourceFingerprint: string): number | null {
-  const active = this.selectActiveGeneration.get() ?? null;
+  const active = this.cacheStatements.selectActiveGeneration.get() ?? null;
   const activeGenerationId =
     active !== null && active.source_fingerprint === sourceFingerprint ? active.id : null;
   this.recoveryTransaction.immediate(activeGenerationId);
@@ -3511,11 +3470,11 @@ recover(sourceFingerprint: string): number | null {
 }
 
 getActiveGenerationId(): number | null {
-  return this.selectActiveGeneration.get()?.id ?? null;
+  return this.cacheStatements.selectActiveGeneration.get()?.id ?? null;
 }
 
 hasFailedDiagrams(generationId: number): boolean {
-  return this.selectFailedDiagram.get(generationId) !== null;
+  return this.cacheStatements.selectFailedDiagram.get(generationId) !== null;
 }
 
 repairTableForSchemaError(error: unknown): CacheTableName | null {
@@ -3546,7 +3505,7 @@ repairTableForSchemaError(error: unknown): CacheTableName | null {
 }
 
 beginGeneration(cause: "startup" | "watch", sourceFingerprint: string): number {
-  return Number(this.insertGeneration.run(cause, Date.now(), sourceFingerprint).lastInsertRowid);
+  return Number(this.cacheStatements.insertGeneration.run(cause, Date.now(), sourceFingerprint).lastInsertRowid);
 }
 
 writeDiscovery(
@@ -3554,7 +3513,7 @@ writeDiscovery(
   packages: readonly PackageInfo[],
   diagram: CacheDiagramInput,
   render: DiagramRenderer,
-): CacheDiagramResponse {
+): DiagramPayload {
   return this.discoveryTransaction.immediate(generationId, packages, diagram, render);
 }
 
@@ -3562,12 +3521,12 @@ writeScope(
   generationId: number,
   scope: CacheScopeWrite,
   render: DiagramRenderer,
-): CacheDiagramResponse {
+): DiagramPayload {
   return this.scopeTransaction.immediate(generationId, scope, render);
 }
 
 readTreeEntries(generationId: number): TreeNode[] {
-  return this.selectTreeEntries.all(generationId).map((row): TreeNode => {
+  return this.cacheStatements.selectTreeEntries.all(generationId).map((row): TreeNode => {
     if (row.kind === "file") {
       return {
         name: row.name,
@@ -3585,7 +3544,7 @@ readTreeEntries(generationId: number): TreeNode[] {
 }
 
 readPackages(generationId: number): PackageInfo[] {
-  const row = this.selectPackages.get(generationId);
+  const row = this.cacheStatements.selectPackages.get(generationId);
   if (!row) throw new Error(`cache package snapshot not found for generation ${generationId}`);
   return parseJson<PackageInfo[]>(row.packages_json, "package snapshot");
 }
@@ -3607,15 +3566,15 @@ readDiagramGraph(
 
 readDiagram(
   generationId: number,
-  kind: CacheDiagramResponse["kind"],
+  kind: DiagramKind,
   scopePath: string,
-): CacheDiagramResponse | null {
-  const row = this.selectDiagram.get(generationId, kind, scopePath);
-  return row ? parseJson<CacheDiagramResponse>(row.response_json, "diagram") : null;
+): DiagramPayload | null {
+  const row = this.cacheStatements.selectDiagram.get(generationId, kind, scopePath);
+  return row ? parseJson<DiagramPayload>(row.response_json, "diagram") : null;
 }
 
 readFile(generationId: number, path: string): CacheFileWrite | null {
-  const row = this.selectFile.get(generationId, path);
+  const row = this.cacheStatements.selectFile.get(generationId, path);
   if (!row) return null;
   return {
     path: row.path,
@@ -3633,7 +3592,7 @@ readDefinition(
   line: number,
   column: number,
 ): GotoDefinition | null {
-  const row = this.selectDefinition.get(
+  const row = this.cacheStatements.selectDefinition.get(
     generationId,
     normalizeRelativePath(path),
     line,
@@ -3643,7 +3602,7 @@ readDefinition(
 }
 
 readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
-  return this.selectDefinitions
+  return this.cacheStatements.selectDefinitions
     .all(generationId, normalizeRelativePath(path))
     .map((row) => ({
       ...toGotoDefinition(row),
@@ -3664,7 +3623,7 @@ lookupDefinition(
   name: string,
   qualifiedName: string,
 ): UmlSourceLocation | null {
-  const row = this.selectDefinitionIndexEntry.get(
+  const row = this.cacheStatements.selectDefinitionIndexEntry.get(
     normalizeRelativePath(path),
     name,
     qualifiedName,
@@ -3685,11 +3644,11 @@ searchFiles(
     && !query.includes("_");
   const likeQuery = `%${query}%`;
   const fileCandidates = indexed
-    ? this.selectIndexedSearchCandidates.all(generationId, likeQuery)
-    : this.selectScanSearchCandidates.all(generationId);
+    ? this.cacheStatements.selectIndexedSearchCandidates.all(generationId, likeQuery)
+    : this.cacheStatements.selectScanSearchCandidates.all(generationId);
   const definitionCandidates = indexed
-    ? this.selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
-    : this.selectScanDefinitionCandidates.all(generationId);
+    ? this.cacheStatements.selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
+    : this.cacheStatements.selectScanDefinitionCandidates.all(generationId);
   const comparisonQuery = caseInsensitive ? query.toLowerCase() : query;
   const paths = new Set<string>();
   for (const candidate of fileCandidates) {
@@ -3727,20 +3686,20 @@ searchFiles(
 
 promoteGeneration(generationId: number): void {
   this.promotionTransaction.immediate(generationId);
-  this.deleteGenerationsExcept.run(generationId);
-  this.optimizeSearch.run();
-  this.optimizeGotoDefinitionSearch.run();
+  this.cacheStatements.deleteGenerationsExcept.run(generationId);
+  this.cacheStatements.optimizeSearch.run();
+  this.cacheStatements.optimizeGotoDefinitionSearch.run();
 }
 
 discardGeneration(generationId: number): void {
-  if (this.selectActiveGeneration.get()?.id === generationId) {
+  if (this.cacheStatements.selectActiveGeneration.get()?.id === generationId) {
     throw new Error(`cannot discard active generation ${generationId}`);
   }
-  this.deleteInactiveGeneration.run(generationId);
+  this.cacheStatements.deleteInactiveGeneration.run(generationId);
 }
 
 failGeneration(generationId: number): void {
-  this.markGenerationFailed.run(Date.now(), generationId);
+  this.cacheStatements.markGenerationFailed.run(Date.now(), generationId);
 }
 
 close(): void {

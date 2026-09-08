@@ -1,7 +1,8 @@
 import { parseDefinitionSpans, type ParsedDefinitionSpan, type ParsedEntityKind } from "../goto-definition.ts";
 import type { GotoDefinition } from "../types.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
-import { bareUmlName, scopeRelativePath, umlEntityKey, umlFileKey } from "./keys.ts";
+import { scopeRelativePath, umlEntityKey, umlFileKey } from "./keys.ts";
+import { bareUmlName } from "./mermaid.ts";
 import type { FileDeclaration, UmlReference } from "./model.ts";
 
 function parsedDeclarationKey(
@@ -43,7 +44,7 @@ export function collectRenderedModel(
     const renderedMethodOccurrences = new Map<string, number>();
     const scopePath = scopeRelativePath(sourceDir, declaration.fileName);
     for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      for (const entity of descriptor.entities(declaration)) {
+      for (const entity of declaration[descriptor.key]) {
         const bareName = bareUmlName(entity.name);
         entities.set(umlEntityKey(declaration.fileName, bareName), {
           id: entity.id,

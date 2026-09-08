@@ -1,4 +1,4 @@
-import { UML_METHOD_RETURN_MARKER, type DiagramKind } from "../types.ts";
+import { UML_METHOD_RETURN_MARKER } from "../types.ts";
 
 export type ViewportState = {
   scale: number;
@@ -6,10 +6,6 @@ export type ViewportState = {
   y: number;
 };
 
-
-export function shouldStackDiagram(kind: DiagramKind): boolean {
-  return kind === "uml";
-}
 
 const DIAGRAM_STYLING_PREFIXES = [
   "classDef ",

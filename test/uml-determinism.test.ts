@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import type { UmlDiagramGraph } from "../src/diagram-graph.ts";
+import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
 import { renderUmlDiagramGraph, validateUmlDiagramGraph } from "../src/uml/render.ts";
+import { renderUmlView } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
 import {
   expectCachedRendering,
@@ -172,8 +174,8 @@ test("repeated extraction of one tree is identical", async () => {
   const second = await extractNormalizedGraph(root);
 
   expect(second).toEqual(first);
-  const firstRendering = renderUmlDiagramGraph(first);
-  const secondRendering = renderUmlDiagramGraph(second);
+  const firstRendering = renderUmlView(renderUmlDiagramGraph(first).view, FULL_UML_VISIBILITY);
+  const secondRendering = renderUmlView(renderUmlDiagramGraph(second).view, FULL_UML_VISIBILITY);
   expect(secondRendering.dsl).toEqual(firstRendering.dsl);
   expect(secondRendering.dsls).toEqual(firstRendering.dsls);
 }, 60_000);
@@ -222,8 +224,8 @@ test("community assignment and frame rendering are reproducible", async () => {
   expect(second.nodes.map((node) => [node.name, node.community]))
     .toEqual(first.nodes.map((node) => [node.name, node.community]));
 
-  const firstRendering = renderUmlDiagramGraph(first);
-  const secondRendering = renderUmlDiagramGraph(second);
+  const firstRendering = renderUmlView(renderUmlDiagramGraph(first).view, FULL_UML_VISIBILITY);
+  const secondRendering = renderUmlView(renderUmlDiagramGraph(second).view, FULL_UML_VISIBILITY);
   expect(secondRendering.dsls).toEqual(firstRendering.dsls);
   expect(secondRendering.dsls.length).toBe(2);
   // characterizes: every community frame opens with a leading newline before `classDiagram`

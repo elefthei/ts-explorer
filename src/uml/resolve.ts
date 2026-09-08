@@ -9,11 +9,11 @@ import {
 } from "../lang/typescript.ts";
 import { analysisLanguageForPath } from "../lang/registry.ts";
 import {
-  bareUmlName,
   posix,
   umlEntityKey,
   umlFileKey,
 } from "./keys.ts";
+import { bareUmlName } from "./mermaid.ts";
 import type { SourceUnit, UmlReference } from "./model.ts";
 import { collectRustFileScope, rustReferenceNodes } from "./rust-resolve.ts";
 

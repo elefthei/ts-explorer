@@ -1,14 +1,13 @@
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
-  type RenderedDiagram,
+  type RenderedUmlDiagram,
   type UmlDiagramGraph,
   type UmlEntityKind,
 } from "../diagram-graph.ts";
 import { HIGHLIGHT_QUERY_SOURCE } from "../lang/registry.ts";
-import { emitMermaidClassDiagram } from "./emit.ts";
 import { hydrateUmlGraph, type UmlGraph } from "./graph.ts";
 import { UML_ENTITY_COLLECTIONS } from "./entities.ts";
-import { STYLE_DEFS, escapeMermaidLabel, mermaidEntityId } from "./mermaid.ts";
+import { isTestPath } from "./keys.ts";
 import {
   type CategoryMap,
   type ExternalUserNode,
@@ -22,146 +21,13 @@ import {
   type UmlEntityModel,
   type UmlModifier,
 } from "./model.ts";
+import { EMPTY_UML_VIEW_MODEL, type UmlViewModel } from "./view.ts";
 
-
-function cloneWith<T extends object>(value: T, overrides: Partial<T>): T {
-  return { ...value, ...overrides };
-}
-
-type RenderInput = {
-  categories: CategoryMap;
-  methodReturnDependencies: readonly UmlDependency[];
-  usageEdges: readonly UmlDependency[];
-  localUserNodes: readonly LocalUserNode[];
-  externalUserNodes: readonly ExternalUserNode[];
-};
-
-function cloneMermaidEntity(entity: UmlEntityModel): UmlEntityModel {
-  const clone = cloneWith(entity, {});
-  clone.name = mermaidEntityId(entity.name);
-  clone.heritageClauses = entity.heritageClauses.map((clause) => cloneWith(clause, {
-    className: mermaidEntityId(clause.className),
-    clause: mermaidEntityId(clause.clause),
-  }));
-  return clone;
-}
-
-function mermaidDeclarations(declarations: readonly FileDeclaration[]): FileDeclaration[] {
-  return declarations.map((declaration) => {
-    const result = cloneWith(declaration, {
-      classes: [],
-      interfaces: [],
-      enums: [],
-      types: [],
-      heritageClauses: declaration.heritageClauses.map((clauses) =>
-        clauses.map((clause) => cloneWith(clause, {
-          className: mermaidEntityId(clause.className),
-          clause: mermaidEntityId(clause.clause),
-        }))
-      ),
-      memberAssociations: declaration.memberAssociations?.map((association) => cloneWith(association, {
-        a: cloneWith(association.a, { name: mermaidEntityId(association.a.name) }),
-        b: cloneWith(association.b, { name: mermaidEntityId(association.b.name) }),
-      })),
-    });
-    for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      if (descriptor.kind === "enum") {
-        result.enums.push(...descriptor.entities(declaration).map((entity) => cloneWith(entity, {
-          name: mermaidEntityId(entity.name),
-        })));
-      } else if (descriptor.kind === "class") {
-        result.classes.push(...descriptor.entities(declaration).map(
-          (entity) => cloneMermaidEntity(entity)
-        ));
-      } else if (descriptor.kind === "interface") {
-        result.interfaces.push(...descriptor.entities(declaration).map(
-          (entity) => cloneMermaidEntity(entity)
-        ));
-      } else {
-        result.types.push(...descriptor.entities(declaration).map(
-          (entity) => cloneMermaidEntity(entity)
-        ));
-      }
-    }
-    return result;
-  });
-}
-
-function formatUserNodeLabel(label: string, scopePath: string): string {
-  const separator = `: ${scopePath}: `;
-  const separatorIndex = label.indexOf(separator);
-  if (separatorIndex === -1) return escapeMermaidLabel(label);
-  const signatureStart = separatorIndex + separator.length;
-  return `${escapeMermaidLabel(label.slice(0, signatureStart - 2))}<br/>${escapeMermaidLabel(label.slice(signatureStart))}`;
-}
-
-function renderUmlDsl(
-  declarations: FileDeclaration[],
-  model: RenderInput,
-): string {
-  const renderDeclarations = mermaidDeclarations(declarations);
-  const labeledEntityIds = new Set<string>();
-  const presentIds = new Set<string>();
-  const presentNames = new Set<string>();
-  let entityLabels = "";
-  for (const declaration of declarations) {
-    for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      for (const entity of descriptor.entities(declaration)) {
-        presentIds.add(entity.id);
-        presentNames.add(entity.name);
-        const entityId = mermaidEntityId(entity.name);
-        if (entityId === entity.name || labeledEntityIds.has(entityId)) continue;
-        entityLabels += `\nclass ${entityId}["${escapeMermaidLabel(entity.name.replaceAll("<", "⟨").replaceAll(">", "⟩"))}"]`;
-        labeledEntityIds.add(entityId);
-      }
-    }
-  }
-  let dsl = (presentIds.size
-    ? emitMermaidClassDiagram(renderDeclarations).trimEnd()
-    : "classDiagram") + entityLabels;
-
-  for (const dependency of model.methodReturnDependencies) {
-    if (!presentIds.has(dependency.sourceId) || !presentIds.has(dependency.targetId)) continue;
-    dsl += `\n${mermaidEntityId(dependency.sourceName)} --> ${mermaidEntityId(dependency.targetName)}`;
-  }
-  for (const edge of model.usageEdges) {
-    if (!presentIds.has(edge.sourceId) || !presentIds.has(edge.targetId)) continue;
-    dsl += `\n${mermaidEntityId(edge.sourceName)} --> ${mermaidEntityId(edge.targetName)}`;
-  }
-  const emittedLocalIds: string[] = [];
-  for (const local of model.localUserNodes) {
-    const targets = local.targets.filter((target) => presentIds.has(target.id));
-    if (!targets.length) continue;
-    const { nodeId, label, path } = local.navigation;
-    dsl += `\nclass ${nodeId}["${formatUserNodeLabel(label, path)}"]`;
-    for (const target of targets) dsl += `\n${nodeId} --> ${mermaidEntityId(target.name)}`;
-    emittedLocalIds.push(nodeId);
-  }
-  const emittedExternalIds: string[] = [];
-  for (const external of model.externalUserNodes) {
-    const targets = external.targets.filter((target) => presentIds.has(target.id));
-    if (!targets.length) continue;
-    const { nodeId, label, scopePath } = external.navigation;
-    dsl += `\nclass ${nodeId}["${formatUserNodeLabel(label, scopePath)}"]`;
-    for (const target of targets) dsl += `\n${nodeId} --> ${mermaidEntityId(target.name)}`;
-    emittedExternalIds.push(nodeId);
-  }
-  dsl += `\n${STYLE_DEFS.map(([name, style]) => `classDef ${name} ${style}`).join("\n")}`;
-
-  for (const [name, info] of [...model.categories.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-    if (!presentNames.has(name)) continue;
-    const category = info.test ? `test${info.category[0].toUpperCase()}${info.category.slice(1)}` : info.category;
-    dsl += `\ncssClass "${mermaidEntityId(name)}" ${category}`;
-  }
-  for (const nodeId of emittedLocalIds) dsl += `\ncssClass "${nodeId}" local`;
-  for (const nodeId of emittedExternalIds) dsl += `\ncssClass "${nodeId}" external`;
-  return `${dsl}\n`;
-}
 
 function partitionUmlCommunities(
   declarations: FileDeclaration[],
   graph: UmlGraph,
-): FileDeclaration[][] {
+): string[][] {
   const communityIds = new Map<number, Set<string>>();
   const register = (id: string): void => {
     if (!graph.hasNode(id)) throw new Error(`Missing UML graph entity node: ${id}`);
@@ -180,14 +46,13 @@ function partitionUmlCommunities(
 
   for (const declaration of declarations) {
     for (const descriptor of UML_ENTITY_COLLECTIONS) {
-      for (const entity of descriptor.entities(declaration)) register(entity.id);
+      for (const entity of declaration[descriptor.key]) register(entity.id);
     }
   }
 
-  if (!communityIds.size) return [];
-  if (communityIds.size === 1) return [declarations];
+  if (communityIds.size <= 1) return [];
 
-  const communities: FileDeclaration[][] = [];
+  const communities: string[][] = [];
   for (const baseIds of communityIds.values()) {
     const ids = new Set<string>();
     const includeNode = (id: string): void => {
@@ -202,32 +67,7 @@ function partitionUmlCommunities(
       }
     }
 
-    const communityDeclarations: FileDeclaration[] = [];
-    for (const declaration of declarations) {
-      const communityDeclaration: FileDeclaration = {
-        ...declaration,
-        classes: declaration.classes.filter((entity) => ids.has(entity.id)),
-        interfaces: declaration.interfaces.filter((entity) => ids.has(entity.id)),
-        enums: declaration.enums.filter((entity) => ids.has(entity.id)),
-        types: declaration.types.filter((entity) => ids.has(entity.id)),
-        heritageClauses: declaration.heritageClauses
-          .map((clauses) => clauses.filter(
-            (clause) => ids.has(clause.classTypeId) && ids.has(clause.clauseTypeId),
-          ))
-          .filter((clauses) => clauses.length > 0),
-        memberAssociations: declaration.memberAssociations?.filter(
-          (association) => ids.has(association.a.typeId) && ids.has(association.b.typeId),
-        ),
-      };
-      if (
-        !communityDeclaration.classes.length
-        && !communityDeclaration.interfaces.length
-        && !communityDeclaration.enums.length
-        && !communityDeclaration.types.length
-      ) continue;
-      communityDeclarations.push(communityDeclaration);
-    }
-    if (communityDeclarations.length) communities.push(communityDeclarations);
+    communities.push([...ids]);
   }
   return communities;
 }
@@ -1052,7 +892,7 @@ export function validateUmlDiagramGraph(record: UmlDiagramGraph): void {
   hydrateModel(record);
 }
 
-export function renderUmlDiagramGraph(record: UmlDiagramGraph): RenderedDiagram {
+export function renderUmlDiagramGraph(record: UmlDiagramGraph): RenderedUmlDiagram {
   if (record.kind !== "uml") throw new Error("Cannot render a non-UML graph as UML");
   if (record.formatVersion !== DIAGRAM_GRAPH_FORMAT_VERSION) {
     throw new Error(`Unsupported UML graph format version: ${String(record.formatVersion)}`);
@@ -1060,10 +900,9 @@ export function renderUmlDiagramGraph(record: UmlDiagramGraph): RenderedDiagram 
   assertString(record.scopePath, "UML scope path", true);
   if (record.renderMode === "bare") {
     assertBareUmlGraph(record);
-    const dsl = "classDiagram\n  direction LR";
     return {
-      dsl,
-      dsls: [dsl],
+      kind: "uml",
+      view: EMPTY_UML_VIEW_MODEL,
       packageNodes: [],
       definitions: [],
       externalUsers: [],
@@ -1075,13 +914,39 @@ export function renderUmlDiagramGraph(record: UmlDiagramGraph): RenderedDiagram 
   }
 
   const hydrated = hydrateModel(record);
-  const dsl = renderUmlDsl(hydrated.declarations, hydrated);
-  const communities = partitionUmlCommunities(hydrated.declarations, hydrated.topology);
+  const testEntityIds: string[] = [];
+  for (const declaration of hydrated.declarations) {
+    for (const descriptor of UML_ENTITY_COLLECTIONS) {
+      for (const entity of declaration[descriptor.key]) {
+        if (hydrated.categories.get(entity.name)?.test) testEntityIds.push(entity.id);
+      }
+    }
+  }
+  const view: UmlViewModel = {
+    declarations: hydrated.declarations,
+    frames: partitionUmlCommunities(hydrated.declarations, hydrated.topology),
+    testEntityIds,
+    categories: [...hydrated.categories].map(([name, info]) => ({
+      name,
+      category: info.category,
+      test: info.test,
+    })),
+    methodReturnDependencies: hydrated.methodReturnDependencies,
+    usageEdges: hydrated.usageEdges,
+    localUsers: hydrated.localUserNodes.map((node) => ({
+      navigation: node.navigation,
+      targets: node.targets,
+      test: isTestPath(node.navigation.path),
+    })),
+    externalUsers: hydrated.externalUserNodes.map((node) => ({
+      navigation: node.navigation,
+      targets: node.targets,
+      test: isTestPath(node.navigation.scopePath),
+    })),
+  };
   return {
-    dsl,
-    dsls: communities.length
-      ? communities.map((declarations) => renderUmlDsl(declarations, hydrated))
-      : [dsl],
+    kind: "uml",
+    view,
     packageNodes: [],
     definitions: hydrated.definitions,
     externalUsers: hydrated.externalUserNodes.map((node) => node.navigation),

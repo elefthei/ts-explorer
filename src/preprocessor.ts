@@ -15,7 +15,7 @@ import {
 } from "./preprocess-protocol.ts";
 import type {
   DiagramKind,
-  DiagramResponse,
+  DiagramPayload,
   FileResponse,
   GotoDefinition,
   PackageInfo,
@@ -27,11 +27,10 @@ import type {
 } from "./types.ts";
 
 type RequestType = PreprocessRequest["type"];
-type RequestMap = {
-  [Type in RequestType]: Omit<Extract<PreprocessRequest, { type: Type }>, "id">;
-};
-type RequestFor<Type extends RequestType> = RequestMap[Type];
-type QueuedRequest = RequestMap[RequestType];
+type RequestFor<Type extends RequestType> = {
+  [Key in RequestType]: Omit<Extract<PreprocessRequest, { type: Key }>, "id">;
+}[Type];
+type QueuedRequest = RequestFor<RequestType>;
 type QueuePriority = "interactive" | "background";
 type SlotState = "new" | "initializing" | "idle" | "busy" | "dead" | "closing" | "closed";
 
@@ -258,7 +257,7 @@ export class Preprocessor {
   public getDiagram(
     kind: DiagramKind,
     scopePath: string,
-  ): Promise<Omit<DiagramResponse, "version">> {
+  ): Promise<DiagramPayload> {
     let normalizedScopePath: string;
     try {
       normalizedScopePath = normalizeRelativePath(scopePath);
@@ -371,18 +370,14 @@ export class Preprocessor {
     return request.status === "done" || request.error !== undefined;
   }
   
-  private releasePriorityResource(request: PriorityRequest): void {
-    if (this.priorityRequestByResource.get(request.resource) === request) {
-      this.priorityRequestByResource.delete(request.resource);
-    }
-  }
-  
   private settlePriorityRequest(request: PriorityRequest, error?: Error): void {
     if (request.error || request.status === "done") return;
     if (error) request.error = error;
     else request.status = "done";
     request.job = undefined;
-    this.releasePriorityResource(request);
+    if (this.priorityRequestByResource.get(request.resource) === request) {
+      this.priorityRequestByResource.delete(request.resource);
+    }
   }
   
   private resetPriorityBinding(request: PriorityRequest): number {
@@ -1413,7 +1408,7 @@ export class Preprocessor {
     generation: GenerationState,
     kind: DiagramKind,
     scopePath: string,
-  ): Promise<Omit<DiagramResponse, "version">> {
+  ): Promise<DiagramPayload> {
     if (kind === "packages") {
       await generation.discovered.promise;
     } else {

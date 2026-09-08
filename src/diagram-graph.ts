@@ -1,5 +1,4 @@
 import type { LanguageId } from "./lang/registry.ts";
-import type { UmlModifier } from "./uml/model.ts";
 import type {
   GotoDefinition,
   GotoDefinitionKind,
@@ -8,6 +7,8 @@ import type {
   UmlExternalUserKind,
   UmlLocalUser,
 } from "./types.ts";
+import type { UmlModifier } from "./uml/model.ts";
+import type { UmlViewModel } from "./uml/view.ts";
 
 export const DIAGRAM_GRAPH_FORMAT_VERSION = 1 as const;
 
@@ -33,7 +34,7 @@ type DiagramRelationKind =
   | "external-user";
 
 export type UmlEntityKind = "class" | "interface" | "enum" | "type";
-type UmlCategoryKind = "interface" | "type" | "enum" | "abstract" | "concrete";
+export type UmlCategoryKind = "interface" | "type" | "enum" | "abstract" | "concrete";
 
 type UmlEntityOccurrence = {
   declarationOrdinal: number;
@@ -223,11 +224,22 @@ export type UmlDiagramGraph = DiagramGraphBase & {
 
 export type DiagramGraph = PackageDiagramGraph | UmlDiagramGraph;
 
-export type RenderedDiagram = {
-  dsl: string;
-  dsls: string[];
+type RenderedDiagramBase = {
   packageNodes: PackageDiagramNode[];
   definitions: GotoDefinition[];
   externalUsers: UmlExternalUser[];
   localUsers: UmlLocalUser[];
 };
+
+export type RenderedPackageDiagram = RenderedDiagramBase & {
+  kind: "packages";
+  dsl: string;
+  dsls: string[];
+};
+
+export type RenderedUmlDiagram = RenderedDiagramBase & {
+  kind: "uml";
+  view: UmlViewModel;
+};
+
+export type RenderedDiagram = RenderedPackageDiagram | RenderedUmlDiagram;

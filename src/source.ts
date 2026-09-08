@@ -58,13 +58,11 @@ export function isUmlIgnoredPath(path: string): boolean {
   return hasIgnoredSegment(path, UML_IGNORED_SEGMENTS);
 }
 
-export type SourceDecodeFailure = "file is not valid UTF-8 text" | "file contains NUL bytes";
-
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 export function decodeSourceBytes(
   bytes: Uint8Array,
-): { text: string } | { failure: SourceDecodeFailure } {
+): { text: string } | { failure: "file is not valid UTF-8 text" | "file contains NUL bytes" } {
   let text: string;
   try {
     text = UTF8.decode(bytes);

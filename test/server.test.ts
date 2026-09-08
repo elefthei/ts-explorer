@@ -21,6 +21,8 @@ import type {
   TreeNode,
   WatchMessage,
 } from "../src/types.ts";
+import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
+import { renderUmlView } from "../src/uml/view.ts";
 
 type WatchClient = {
   waitFor(predicate: (message: WatchMessage) => boolean): Promise<WatchMessage>;
@@ -88,6 +90,16 @@ function readActiveNormalizedSnapshot(
   });
 }
 
+function umlDsl(response: DiagramResponse): string {
+  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
+  return renderUmlView(response.view, FULL_UML_VISIBILITY).dsl;
+}
+
+function packagesDsl(response: DiagramResponse): string {
+  if (response.kind !== "packages") throw new Error("expected a packages diagram response");
+  return response.dsl;
+}
+
 function expectPromotedFallback(
   before: NormalizedGraphSnapshot,
   after: NormalizedGraphSnapshot,
@@ -107,16 +119,21 @@ function expectPromotedFallback(
   expect(after.records).toEqual(before.records);
   expectSnapshotResponse(before, readyResponse);
   expectSnapshotResponse(after, errorResponse);
+  expect(errorResponse.kind).toBe(readyResponse.kind);
+  const errorPayload = errorResponse.kind === "uml"
+    ? { view: errorResponse.view }
+    : { dsl: errorResponse.dsl, dsls: errorResponse.dsls };
+  const readyPayload = readyResponse.kind === "uml"
+    ? { view: readyResponse.view }
+    : { dsl: readyResponse.dsl, dsls: readyResponse.dsls };
   expect({
-    dsl: errorResponse.dsl,
-    dsls: errorResponse.dsls,
+    ...errorPayload,
     packageNodes: errorResponse.packageNodes,
     definitions: errorResponse.definitions,
     externalUsers: errorResponse.externalUsers,
     localUsers: errorResponse.localUsers,
   }).toEqual({
-    dsl: readyResponse.dsl,
-    dsls: readyResponse.dsls,
+    ...readyPayload,
     packageNodes: readyResponse.packageNodes,
     definitions: readyResponse.definitions,
     externalUsers: readyResponse.externalUsers,
@@ -335,9 +352,6 @@ function assertReadOnlyNavigationAssets(html: string, mainScript: string, styleS
     /new URLSearchParams\(\s*\{[\s\S]*?\bcaseInsensitive\s*:\s*String\([^)]*\)[\s\S]*?\}\s*\)/,
   );
   expect(mainScript).toMatch(/action\s*:\s*["']poll["']/);
-  expect(mainScript).toMatch(
-    /classList\.add\(\s*["']uml-definition-link["']\s*\)[\s\S]{0,240}setAttribute\(\s*["']role["']\s*,\s*["']link["']\s*\)/,
-  );
   expect(mainScript).toMatch(
     /class\s*:\s*["']editor-definition-link["'][\s\S]{0,240}role\s*:\s*["']link["'][\s\S]{0,240}tabindex\s*:\s*["']0["']/,
   );
@@ -701,7 +715,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       await fetch(`${base}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
     expect(packageDiagram.scopePath).toBe("");
-    expect(packageDiagram.dsl).toContain("flowchart LR");
+    expect(packagesDsl(packageDiagram)).toContain("flowchart LR");
     expect(packageDiagram.packageNodes).toEqual([
       { nodeId: "p0", name: "demo", path: "packages/demo" },
     ] satisfies PackageDiagramNode[]);
@@ -710,13 +724,13 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       await fetch(`${base}/api/diagram?kind=uml&path=`)
     ).json() as DiagramResponse;
     expect(rootUml.scopePath).toBe("");
-    expect(rootUml.dsl).toContain("classDiagram");
+    expect(umlDsl(rootUml)).toContain("classDiagram");
 
     const packageUml = await (
       await fetch(`${base}/api/diagram?kind=uml&path=packages%2Fdemo`)
     ).json() as DiagramResponse;
     expect(packageUml.scopePath).toBe("packages/demo");
-    expect(packageUml.dsl).toMatch(
+    expect(umlDsl(packageUml)).toMatch(
       /^[ \t]*DataflowRuntime[ \t]*-->[ \t]*AbstractStateMachine[ \t]*\r?$/m,
     );
     expect(packageUml.definitions).toEqual(expect.arrayContaining([
@@ -777,10 +791,10 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
         kind: "method",
       },
     ]);
-    expect(scopedUml.dsl).toContain(
+    expect(umlDsl(scopedUml)).toContain(
       'class local0["local: packages/demo/src/target/local-user.ts<br/>acceptWidget(Widget)"]',
     );
-    expect(scopedUml.dsl).toContain(
+    expect(umlDsl(scopedUml)).toContain(
       'class extern0["extern: packages/demo/src/consumer.ts<br/>Consumer.build()"]',
     );
 
@@ -1352,8 +1366,8 @@ test("UML extraction errors retain the last promoted normalized graph and respon
     await withTimeout(promotions.first, "initial UML cache promotion");
     const ready = await store.getDiagram("uml", "");
     expect(ready.status).toBe("ready");
-    expect(ready.dsl).toContain("FallbackSource");
-    expect(ready.dsl).toContain("FallbackTarget");
+    expect(umlDsl(ready)).toContain("FallbackSource");
+    expect(umlDsl(ready)).toContain("FallbackTarget");
 
     const graphDbPath = join(root, ".explore", "explore.db");
     const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
@@ -1479,6 +1493,7 @@ test("a malformed root manifest produces the stable empty package error", async 
     await store.ready();
     const response = await store.getDiagram("packages", "");
     expect(response.status).toBe("error");
+    if (response.kind !== "packages") throw new Error("expected a packages diagram response");
     expect(response.dsl).toBe("flowchart LR");
     expect(response.dsls).toEqual(["flowchart LR"]);
     expect(response.packageNodes).toEqual([]);
@@ -1572,7 +1587,7 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
       { nodeId: "p0", name: "a", path: "packages/a" },
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
-    expect(restartedDiagram.dsl).toContain("p0 --> p1");
+    expect(packagesDsl(restartedDiagram)).toContain("p0 --> p1");
     const restartedGenerations = openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string; started_at: number }>(
         db,
@@ -1610,8 +1625,8 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
       { nodeId: "p0", name: "a", path: "packages/a" },
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
-    expect(rebuiltDiagram.dsl).toContain("p0 --> p1");
-    expect(rebuiltDiagram.dsl).not.toBe(firstDiagram.dsl);
+    expect(packagesDsl(rebuiltDiagram)).toContain("p0 --> p1");
+    expect(packagesDsl(rebuiltDiagram)).not.toBe(packagesDsl(firstDiagram));
     const rebuiltId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
     expect(rebuiltId).not.toBe(restartedId);
     expect(openDatabase(dbPath, (db) =>

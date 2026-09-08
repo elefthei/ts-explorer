@@ -20,6 +20,8 @@ import type {
   UmlSourceLocation,
   WatchMessage,
 } from "../types.ts";
+import { FULL_UML_VISIBILITY } from "../uml/model.ts";
+import { renderUmlView } from "../uml/view.ts";
 import {
   adjacentTreeRowIndex,
   RequestSequence,
@@ -31,14 +33,14 @@ import {
   hasPassedDragThreshold,
   matchesSearchQuery,
   panViewport,
-  shouldStackDiagram,
   treeScrollTopForRow,
   zoomViewportAt,
   type ViewportState,
 } from "./diagram-interactions.ts";
 
 function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
-const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>(),packages:[] as readonly PackageInfo[]};
+type UmlDiagramResponse=Extract<DiagramResponse,{kind:"uml"}>;
+const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>(),packages:[] as readonly PackageInfo[],umlVisibility:{...FULL_UML_VISIBILITY},umlRenders:[] as {scope:string;diagram:UmlDiagramResponse}[],umlScopedErrors:false};
 const ZOOM_IN_FACTOR=1.25;
 const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
 const EMPTY_DIAGRAM_MESSAGE="No diagram content for this scope";
@@ -120,7 +122,24 @@ function endScopeSyncLoading(token:number):void{
 function setEditorLoading(loading:boolean):void{$("#editor-loading").hidden=!loading;}
 function parseMethodName(text:string):string{const normalized=text.trim().replace(/^\\?[+\-#~]/,"");const parenthesis=normalized.indexOf("(");return (parenthesis===-1?normalized:normalized.slice(0,parenthesis)).trim();}
 function sourceFromLink(link:Element):UmlSourceLocation|undefined{const data=(link as HTMLElement).dataset;const line=Number(data.sourceLine);const column=Number(data.sourceColumn);if(!data.sourcePath||!Number.isInteger(line)||!Number.isInteger(column))return undefined;return{path:data.sourcePath,line,column};}
-function makeSourceLink(element:Element,location:UmlSourceLocation,label:string):void{element.classList.add("uml-source-link");element.setAttribute("role","link");element.setAttribute("tabindex","0");element.setAttribute("aria-label",`Open ${label} in editor`);const data=(element as HTMLElement).dataset;data.sourcePath=location.path;data.sourceLine=String(location.line);data.sourceColumn=String(location.column);}
+function makeSourceLink(
+  element: Element,
+  location: UmlSourceLocation,
+  label: string,
+  view: "editor" | "uml",
+): void {
+  element.classList.add(view === "editor" ? "uml-source-link" : "uml-definition-link");
+  element.setAttribute("role", "link");
+  element.setAttribute("tabindex", "0");
+  element.setAttribute(
+    "aria-label",
+    view === "editor" ? `Open ${label} in editor` : `Open ${label} UML definition`,
+  );
+  const data = (element as HTMLElement).dataset;
+  data.sourcePath = location.path;
+  data.sourceLine = String(location.line);
+  data.sourceColumn = String(location.column);
+}
 function decoratePackageNodes(root:Element,packageNodes:readonly PackageDiagramNode[]):void{const byId=new Map(packageNodes.map((pkg)=>[pkg.nodeId,pkg]));for(const node of root.querySelectorAll<SVGGElement>("g.node")){const nodeId=packageNodeIdFromNodeId(node.id);if(!nodeId)continue;const pkg=byId.get(nodeId);if(!pkg)continue;node.classList.add("package-link");node.setAttribute("role","link");node.setAttribute("tabindex","0");node.setAttribute("aria-label",`Open ${pkg.name} UML`);node.dataset.packageName=pkg.name;node.dataset.scopePath=pkg.path;}}
 function decorateUmlUsers(root:Element,localUsers:readonly UmlLocalUser[],externalUsers:readonly UmlExternalUser[]):void{
   const localById=new Map(localUsers.map((user)=>[user.nodeId,user]));
@@ -128,7 +147,7 @@ function decorateUmlUsers(root:Element,localUsers:readonly UmlLocalUser[],extern
   for(const node of root.querySelectorAll<SVGGElement>("g.node")){
     const localId=localUserIdFromNodeId(node.id);
     const local=localId?localById.get(localId):undefined;
-    if(local){const title=node.querySelector(".label-group .label, .classTitle");if(title)makeSourceLink(title,local,local.label);continue;}
+    if(local){const title=node.querySelector(".label-group .label, .classTitle");if(title)makeSourceLink(title,local,local.label,"editor");continue;}
     const externalId=externalUserIdFromNodeId(node.id);
     const external=externalId?externalById.get(externalId):undefined;
     if(!external)continue;
@@ -139,7 +158,6 @@ function decorateUmlUsers(root:Element,localUsers:readonly UmlLocalUser[],extern
 }
 function bareDiagramName(name:string):string{const generic=name.search(/[<~]/);return generic===-1?name:name.slice(0,generic);}
 function compareDefinitions(left:GotoDefinition,right:GotoDefinition):number{return left.source.path.localeCompare(right.source.path)||left.source.line-right.source.line||left.source.column-right.source.column||left.key.localeCompare(right.key);}
-function makeDefinitionLink(element:Element,definition:GotoDefinition,label:string):void{element.classList.add("uml-definition-link");element.setAttribute("role","link");element.setAttribute("tabindex","0");element.setAttribute("aria-label",`Open ${label} UML definition`);const data=(element as HTMLElement).dataset;data.sourcePath=definition.source.path;data.sourceLine=String(definition.source.line);data.sourceColumn=String(definition.source.column);}
 function decorateUmlDefinitions(root:Element,definitions:readonly GotoDefinition[]):void{
   const ordered=[...definitions].sort(compareDefinitions);
   for(const node of root.querySelectorAll<SVGGElement>("g.node")){
@@ -151,7 +169,7 @@ function decorateUmlDefinitions(root:Element,definitions:readonly GotoDefinition
     const title=node.querySelector(".label-group .label, .classTitle");
     if(title){
       (title as HTMLElement).dataset.searchText=(title.textContent??"").trim()||entityName;
-      if(entity)makeDefinitionLink(title,entity,entity.qualifiedName);
+      if(entity)makeSourceLink(title,entity.source,entity.qualifiedName,"uml");
     }
     const occurrences=new Map<string,number>();
     for(const label of node.querySelectorAll(".methods-group > .label")){
@@ -171,7 +189,7 @@ function decorateUmlDefinitions(root:Element,definitions:readonly GotoDefinition
         && definition.uml.memberName===methodName
         && definition.uml.memberOccurrence===occurrence
       );
-      if(method)makeDefinitionLink(label,method,method.qualifiedName);
+      if(method)makeSourceLink(label,method.source,method.qualifiedName,"uml");
     }
   }
 }
@@ -286,47 +304,99 @@ function loadTree():Promise<void>{
   })().finally(()=>{treeRefreshPromise=undefined;});
   return treeRefreshPromise;
 }
-type UmlScopeRenderResult={nextFrameIndex:number;complete:boolean};
-async function renderUmlScope(
-  scope:string,
-  diagram:DiagramResponse,
-  holder:HTMLElement,
-  renderToken:number,
-  directoryIndex:number,
-  frameIndexOffset:number,
-  isCurrent:()=>boolean,
-  errors:string[],
-  scopedErrors:boolean,
-):Promise<UmlScopeRenderResult>{
-  let nextFrameIndex=frameIndexOffset;
-  for(const [frameIndex,dsl] of diagram.dsls.entries()){
-    const frame=document.createElement("div");
-    frame.className="uml-frame";
-    frame.setAttribute("role","listitem");
-    frame.setAttribute("aria-label",`UML diagram ${nextFrameIndex+1}`);
-    frame.dataset.index=String(nextFrameIndex);
-    if(!hasDiagramBody(dsl)){
+type UmlPaint = {
+  holder: HTMLElement;
+  token: number;
+  isCurrent: () => boolean;
+  scopedErrors: boolean;
+  errors: string[];
+  dslSections: string[];
+  frameIndex: number;
+};
+
+function beginUmlPaint(
+  token: number,
+  isCurrent: () => boolean,
+  scopedErrors: boolean,
+): UmlPaint {
+  const holder = $("#svg-holder");
+  holder.replaceChildren();
+  holder.classList.add("stacked");
+  holder.setAttribute("role", "list");
+  return { holder, token, isCurrent, scopedErrors, errors: [], dslSections: [], frameIndex: 0 };
+}
+
+async function renderUmlFrames(request: {
+  paint: UmlPaint;
+  scope: string;
+  dsls: readonly string[];
+  diagram: DiagramResponse;
+  directoryIndex: number;
+}): Promise<boolean> {
+  const { paint, scope, dsls, diagram, directoryIndex } = request;
+  for (const [frameIndex, dsl] of dsls.entries()) {
+    const frame = document.createElement("div");
+    frame.className = "uml-frame";
+    frame.setAttribute("role", "listitem");
+    frame.setAttribute("aria-label", `UML diagram ${paint.frameIndex + 1}`);
+    frame.dataset.index = String(paint.frameIndex);
+    if (!hasDiagramBody(dsl)) {
       frame.classList.add("empty");
-      frame.textContent=EMPTY_DIAGRAM_MESSAGE;
-    }else{
-      try{
-        const rendered=await mermaid.render(`diagram-${renderToken}-${directoryIndex}-${frameIndex}`,dsl);
-        if(!isCurrent())return{nextFrameIndex,complete:false};
-        frame.innerHTML=rendered.svg;
-        decorateUmlDefinitions(frame,diagram.definitions);
-        decorateUmlUsers(frame,diagram.localUsers,diagram.externalUsers);
-      }catch(error){
-        if(!isCurrent())return{nextFrameIndex,complete:false};
-        const message=error instanceof Error?error.message:String(error);
+      frame.textContent = EMPTY_DIAGRAM_MESSAGE;
+    } else {
+      try {
+        const rendered = await mermaid.render(
+          `diagram-${paint.token}-${directoryIndex}-${frameIndex}`,
+          dsl,
+        );
+        if (!paint.isCurrent()) return false;
+        frame.innerHTML = rendered.svg;
+        decorateUmlDefinitions(frame, diagram.definitions);
+        decorateUmlUsers(frame, diagram.localUsers, diagram.externalUsers);
+      } catch (error) {
+        if (!paint.isCurrent()) return false;
+        const message = error instanceof Error ? error.message : String(error);
         frame.classList.add("error");
-        frame.textContent=`Diagram ${frameIndex+1}: ${message}`;
-        errors.push(scopedErrors?`[${scope}] diagram ${frameIndex+1}: ${message}`:`Diagram ${frameIndex+1}: ${message}`);
+        frame.textContent = `Diagram ${frameIndex + 1}: ${message}`;
+        paint.errors.push(
+          paint.scopedErrors
+            ? `[${scope}] diagram ${frameIndex + 1}: ${message}`
+            : `Diagram ${frameIndex + 1}: ${message}`,
+        );
       }
     }
-    holder.append(frame);
-    nextFrameIndex++;
+    paint.holder.append(frame);
+    paint.frameIndex++;
   }
-  return{nextFrameIndex,complete:true};
+  return true;
+}
+
+async function paintUmlScope(
+  paint: UmlPaint,
+  scope: string,
+  diagram: UmlDiagramResponse,
+  directoryIndex: number,
+): Promise<boolean> {
+  const view = renderUmlView(diagram.view, state.umlVisibility);
+  paint.dslSections.push(paint.scopedErrors ? `%% Scope: ${scope}\n${view.dsl}` : view.dsl);
+  if (paint.scopedErrors && diagram.status === "error") {
+    paint.errors.push(`[${scope}] ${diagram.error ?? "Diagram parse error"}`);
+  }
+  return renderUmlFrames({ paint, scope, dsls: view.dsls, diagram, directoryIndex });
+}
+
+function finishUmlPaint(paint: UmlPaint, errorStatus: string, readyStatus: string): void {
+  if (!paint.isCurrent()) return;
+  $("#dsl-content").textContent = paint.dslSections.join("\n\n");
+  applySearchHighlights();
+  viewport.apply();
+  if (paint.errors.length) {
+    showError(paint.errors.join("\n"));
+    setStatus(errorStatus, true);
+  } else {
+    showError(undefined);
+    setStatus(readyStatus);
+  }
 }
 async function loadDiagram(
   token=diagramRequests.next(),
@@ -343,10 +413,14 @@ async function loadDiagram(
     const diagram=await api<DiagramResponse>(`/api/diagram?${query}`);
     if(!isCurrent())return;
     state.version=diagram.version;
-    $("#dsl-content").textContent=diagram.dsl;
+    const payload=diagram.kind==="uml"
+      ?{uml:diagram,...renderUmlView(diagram.view,state.umlVisibility)}
+      :{uml:undefined,dsl:diagram.dsl,dsls:diagram.dsls};
+    $("#dsl-content").textContent=payload.dsl;
     showError(diagram.status==="error"?diagram.error:undefined);
     const holder=$("#svg-holder");
     if(diagram.status==="error"){
+      state.umlRenders=[];
       holder.classList.add("stacked");
       holder.setAttribute("role","list");
       const frame=document.createElement("div");
@@ -358,37 +432,32 @@ async function loadDiagram(
       setStatus("Diagram unavailable",true);
       return;
     }
-    if(shouldStackDiagram(state.mode)){
-      holder.innerHTML="";
-      holder.classList.add("stacked");
-      holder.setAttribute("role","list");
-      const errors:string[]=[];
-      const result=await renderUmlScope(
-        state.scope||".",
+    if(state.mode==="uml"){
+      const paint=beginUmlPaint(token,isCurrent,false);
+      state.umlRenders=payload.uml?[{scope:state.scope||".",diagram:payload.uml}]:[];
+      state.umlScopedErrors=false;
+      const complete=await renderUmlFrames({
+        paint,
+        scope:state.scope||".",
+        dsls:payload.dsls,
         diagram,
-        holder,
-        token,
-        0,
-        0,
-        isCurrent,
-        errors,
-        false,
-      );
-      if(!result.complete||!isCurrent())return;
+        directoryIndex:0,
+      });
+      if(!complete||!isCurrent())return;
       applySearchHighlights();
       viewport.apply();
       if(focus&&!focusUmlDefinition(focus)){
         showError("Definition not found");
         setStatus("Definition not found",true);
-      }else if(errors.length){
-        showError(errors.join("\n"));
+      }else if(paint.errors.length){
+        showError(paint.errors.join("\n"));
         setStatus("Mermaid render error",true);
       }else setStatus(`Updated · v${diagram.version}`);
       return;
     }
     holder.classList.remove("stacked");
     holder.removeAttribute("role");
-    if(!hasDiagramBody(diagram.dsl)){
+    if(!hasDiagramBody(payload.dsl)){
       const frame=document.createElement("div");
       frame.className="uml-frame empty";
       frame.textContent=EMPTY_DIAGRAM_MESSAGE;
@@ -398,7 +467,7 @@ async function loadDiagram(
       return;
     }
     try{
-      const rendered=await mermaid.render(`diagram-${token}`,diagram.dsl);
+      const rendered=await mermaid.render(`diagram-${token}`,payload.dsl);
       if(!isCurrent())return;
       holder.innerHTML=rendered.svg;
       decoratePackageNodes(holder,diagram.packageNodes);
@@ -466,55 +535,49 @@ async function renderSearchDiagrams(renderDirs:readonly string[],searchToken:num
   activateView("uml");
   viewport.reset();
   setDiagramLoading(true);
-  const holder=$("#svg-holder");
-  holder.replaceChildren();
-  holder.classList.add("stacked");
-  holder.setAttribute("role","list");
-  const errors:string[]=[];
-  const dslSections:string[]=[];
-  let frameIndex=0;
+  const paint=beginUmlPaint(renderToken,isCurrent,true);
+  state.umlRenders=[];
+  state.umlScopedErrors=true;
   try{
     for(const [directoryIndex,renderDir] of renderDirs.entries()){
       const scope=renderDir||".";
-      let diagram:DiagramResponse;
+      let diagram:UmlDiagramResponse;
       try{
-        diagram=await api<DiagramResponse>(`/api/diagram?kind=uml&path=${encodeURIComponent(renderDir)}`);
+        diagram=await api<UmlDiagramResponse>(`/api/diagram?kind=uml&path=${encodeURIComponent(renderDir)}`);
         if(!isCurrent())return;
       }catch(error){
         if(!isCurrent())return;
         const message=error instanceof Error?error.message:String(error);
-        errors.push(`[${scope}] request: ${message}`);
+        paint.errors.push(`[${scope}] request: ${message}`);
         continue;
       }
-      dslSections.push(`%% Scope: ${scope}\n${diagram.dsl}`);
-      if(diagram.status==="error")errors.push(`[${scope}] ${diagram.error??"Diagram parse error"}`);
-      const result=await renderUmlScope(
-        scope,
-        diagram,
-        holder,
-        renderToken,
-        directoryIndex,
-        frameIndex,
-        isCurrent,
-        errors,
-        true,
-      );
-      if(!result.complete)return;
-      frameIndex=result.nextFrameIndex;
+      state.umlRenders.push({scope,diagram});
+      const complete=await paintUmlScope(paint,scope,diagram,directoryIndex);
+      if(!complete)return;
     }
-    if(!isCurrent())return;
-    $("#dsl-content").textContent=dslSections.join("\n\n");
-    applySearchHighlights();
-    viewport.apply();
-    if(errors.length){
-      showError(errors.join("\n"));
-      setStatus("Search diagram render error",true);
-    }else{
-      showError(undefined);
-      setStatus(`Search · ${state.searchFiles.size} files · v${state.version}`);
-    }
+    finishUmlPaint(
+      paint,
+      "Search diagram render error",
+      `Search · ${state.searchFiles.size} files · v${state.version}`,
+    );
   }finally{
     if(diagramRequests.isCurrent(renderToken))setDiagramLoading(false);
+  }
+}
+async function rerenderUmlDiagrams():Promise<void>{
+  if(state.activeView!=="uml"||!state.umlRenders.length)return;
+  const token=diagramRequests.next();
+  const isCurrent=()=>diagramRequests.isCurrent(token);
+  setDiagramLoading(true);
+  const paint=beginUmlPaint(token,isCurrent,state.umlScopedErrors);
+  try{
+    for(const [directoryIndex,render] of state.umlRenders.entries()){
+      const complete=await paintUmlScope(paint,render.scope,render.diagram,directoryIndex);
+      if(!complete)return;
+    }
+    finishUmlPaint(paint,"Mermaid render error",`Updated · v${state.version}`);
+  }finally{
+    if(isCurrent())setDiagramLoading(false);
   }
 }
 async function commitSearch(query:string,caseInsensitive:boolean):Promise<void>{
@@ -566,7 +629,7 @@ async function commitSearch(query:string,caseInsensitive:boolean):Promise<void>{
     setStatus(error instanceof Error?error.message:String(error),true);
   }
 }
-function activateView(view:"packages"|"uml"|"editor"){state.activeView=view;const activeButtonId=view==="editor"?"editor-mode":`${state.mode}-mode`;document.querySelectorAll(".mode").forEach((button)=>{button.classList.toggle("active",button.id===activeButtonId);});const editorActive=view==="editor";$("#graph-panel").hidden=editorActive;$("#editor-panel").hidden=!editorActive;const hasFile=state.file!==null;$("#editor-empty").hidden=hasFile;$("#editor-content").hidden=!hasFile;applySearchHighlights();}
+function activateView(view:"packages"|"uml"|"editor"){state.activeView=view;const activeButtonId=view==="editor"?"editor-mode":`${state.mode}-mode`;document.querySelectorAll(".mode").forEach((button)=>{button.classList.toggle("active",button.id===activeButtonId);});const editorActive=view==="editor";$("#graph-panel").hidden=editorActive;$("#editor-panel").hidden=!editorActive;$("#uml-visibility").hidden=view!=="uml";const hasFile=state.file!==null;$("#editor-empty").hidden=hasFile;$("#editor-content").hidden=!hasFile;applySearchHighlights();}
 type DefinitionNavigationContext={
   definitionToken:number;
   diagramToken:number;
@@ -679,7 +742,6 @@ function editorDefinitionHandlers(){
     },
   });
 }
-async function openSource(location:UmlSourceLocation):Promise<void>{await openFile(location.path,location);}
 async function openFile(
   path:string,
   position?:UmlSourceLocation,
@@ -849,8 +911,6 @@ const diagramStage=$("#diagram-stage");
 const dragState={pointerId:null as number|null,startX:0,startY:0,lastX:0,lastY:0,moved:false,suppressClick:false};
 function zoomAtStageCenter(factor:number):void{const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(factor,rect.width/2,rect.height/2);}
 function finishDrag(event:PointerEvent,suppressClick:boolean):void{if(dragState.pointerId!==event.pointerId)return;if(diagramStage.hasPointerCapture(event.pointerId))diagramStage.releasePointerCapture(event.pointerId);const moved=dragState.moved;dragState.pointerId=null;dragState.moved=false;diagramStage.classList.remove("dragging");if(moved&&suppressClick){dragState.suppressClick=true;setTimeout(()=>{dragState.suppressClick=false;},0);}}
-function externalScopeFromLink(link:Element):string|undefined{const scopePath=(link as HTMLElement).dataset.scopePath;return scopePath||undefined;}
-function packageFromLink(link:Element):{name:string;path:string}|undefined{const data=(link as HTMLElement).dataset;if(!Object.hasOwn(data,"packageName")||!Object.hasOwn(data,"scopePath"))return undefined;return{name:data.packageName??"",path:data.scopePath??""};}
 function activateDiagramLink(event:MouseEvent|KeyboardEvent):void{
   if(event instanceof KeyboardEvent&&event.key!=="Enter"&&event.key!==" ")return;
   const link=event.target instanceof Element?event.target.closest(".uml-definition-link, .uml-source-link, .uml-external-link, .package-link"):null;
@@ -859,11 +919,17 @@ function activateDiagramLink(event:MouseEvent|KeyboardEvent):void{
   if(link.matches(".uml-definition-link")){
     const source=sourceFromLink(link);if(source)activate=()=>{void navigateToDefinition(source,"uml");};
   }else if(link.matches(".uml-source-link")){
-    const source=sourceFromLink(link);if(source)activate=()=>{void openSource(source);};
+    const source=sourceFromLink(link);if(source)activate=()=>{void openFile(source.path,source);};
   }else if(link.matches(".uml-external-link")){
-    const scopePath=externalScopeFromLink(link);if(scopePath)activate=()=>{void selectScope({name:scopePath.split("/").at(-1)??scopePath,path:scopePath,kind:"file"});};
+    const scopePath=(link as HTMLElement).dataset.scopePath;
+    if(scopePath)activate=()=>{void selectScope({name:scopePath.split("/").at(-1)??scopePath,path:scopePath,kind:"file"});};
   }else{
-    const pkg=packageFromLink(link);if(pkg)activate=()=>{void selectScope({name:pkg.name,path:pkg.path,kind:"directory"},"uml");};
+    const data=(link as HTMLElement).dataset;
+    if(Object.hasOwn(data,"packageName")&&Object.hasOwn(data,"scopePath")){
+      const name=data.packageName??"";
+      const path=data.scopePath??"";
+      activate=()=>{void selectScope({name,path,kind:"directory"},"uml");};
+    }
   }
   if(!activate)return;
   event.preventDefault();
@@ -901,6 +967,11 @@ nodeSearch.oninput=()=>{if(nodeSearch.value!=="")return;clearSearch();};
 $("#packages-mode").onclick=()=>void selectScope({name:"Packages",path:"",kind:"directory"},"packages");
 $("#uml-mode").onclick=()=>void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");
 $("#editor-mode").onclick=()=>{definitionRequests.next();diagramRequests.next();activateView("editor");};$("#tree-filter").oninput=renderTree;$("#zoom-in").onclick=()=>zoomAtStageCenter(ZOOM_IN_FACTOR);$("#zoom-out").onclick=()=>zoomAtStageCenter(ZOOM_OUT_FACTOR);$("#zoom-reset").onclick=()=>viewport.reset();$("#legend-toggle").onclick=()=>{$("#legend").hidden=!$("#legend").hidden;};$("#sidebar-toggle").onclick=toggleSidebar;$("#editor-close").onclick=()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);};$("#editor-print").onclick=printEditor;
+for(const [selector,key] of [["#uml-show-attributes","attributes"],["#uml-show-methods","methods"],["#uml-show-types","types"],["#uml-show-tests","tests"]] as const){
+  const input=$(selector);
+  input.checked=state.umlVisibility[key];
+  input.onchange=()=>{state.umlVisibility[key]=input.checked;void rerenderUmlDiagrams();};
+}
 diagramStage.addEventListener("wheel",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true")return;event.preventDefault();const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(event.deltaY>0?ZOOM_OUT_FACTOR:ZOOM_IN_FACTOR,event.clientX-rect.left,event.clientY-rect.top);},{passive:false});
 diagramStage.addEventListener("pointerdown",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true"||event.button!==0||dragState.pointerId!==null)return;dragState.pointerId=event.pointerId;dragState.startX=dragState.lastX=event.clientX;dragState.startY=dragState.lastY=event.clientY;dragState.moved=false;});
 diagramStage.addEventListener("pointermove",(event)=>{if(dragState.pointerId!==event.pointerId)return;if(!dragState.moved){if(!hasPassedDragThreshold(dragState.startX,dragState.startY,event.clientX,event.clientY))return;dragState.moved=true;diagramStage.setPointerCapture(event.pointerId);diagramStage.classList.add("dragging");}panViewport(viewport,event.clientX-dragState.lastX,event.clientY-dragState.lastY);dragState.lastX=event.clientX;dragState.lastY=event.clientY;viewport.apply();});

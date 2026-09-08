@@ -127,3 +127,18 @@ type UmlCategory = {
 };
 
 export type CategoryMap = Map<string, UmlCategory>;
+
+/** Global UML detail switches; every flag on reproduces the maximal diagram. */
+export type UmlVisibility = {
+  attributes: boolean;
+  methods: boolean;
+  types: boolean;
+  tests: boolean;
+};
+
+export const FULL_UML_VISIBILITY: UmlVisibility = {
+  attributes: true,
+  methods: true,
+  types: true,
+  tests: true,
+};

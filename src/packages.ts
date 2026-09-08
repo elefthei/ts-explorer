@@ -3,7 +3,7 @@ import { join, sep } from "node:path";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type PackageDiagramGraph,
-  type RenderedDiagram,
+  type RenderedPackageDiagram,
 } from "./diagram-graph.ts";
 import { normalizeRelativePath } from "./paths.ts";
 import type { PackageDiagramNode, PackageInfo } from "./types.ts";
@@ -332,11 +332,12 @@ export function validatePackageDiagramGraph(
   return packageRows;
 }
 
-export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedDiagram {
+export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedPackageDiagram {
   const packageRows = validatePackageDiagramGraph(graph);
   if (graph.renderMode === "bare") {
     const dsl = "flowchart LR";
     return {
+      kind: "packages",
       dsl,
       dsls: [dsl],
       packageNodes: [],
@@ -370,6 +371,7 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedD
 
   const dsl = lines.join("\n");
   return {
+    kind: "packages",
     dsl,
     dsls: [dsl],
     packageNodes,

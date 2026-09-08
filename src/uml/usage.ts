@@ -19,12 +19,11 @@ import type {
 } from "../types.ts";
 import { collectRenderedModel } from "./definitions.ts";
 import {
-  bareUmlName,
   scopeRelativePath,
   umlEntityKey,
   umlFileKey,
 } from "./keys.ts";
-import { formatSignatureType } from "./mermaid.ts";
+import { bareUmlName, formatSignatureType } from "./mermaid.ts";
 import type {
   CategoryMap,
   ExternalUserNode,

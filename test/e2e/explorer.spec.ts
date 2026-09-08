@@ -940,8 +940,16 @@ test("a failed diagram shows the server error instead of mermaid output", async 
             version: 0,
             status: "error",
             error: "forced failure",
-            dsl: "classDiagram",
-            dsls: ["classDiagram"],
+            view: {
+              declarations: [],
+              frames: [],
+              testEntityIds: [],
+              categories: [],
+              methodReturnDependencies: [],
+              usageEdges: [],
+              localUsers: [],
+              externalUsers: [],
+            },
             packageNodes: [],
             definitions: [],
             externalUsers: [],
@@ -1055,6 +1063,76 @@ test("renders a live tree independently and observes cache completion", async ({
     await expect(page.locator(".cm-content")).toContainText(
       "export class JuncoAgent<TSkill, TTool, Ctx>",
     );
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("UML visibility toggles re-render every frame without refetching diagrams", async ({ browser }) => {
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+
+    const bulk00 = page.locator('.tree-row[data-tree-path="bulk-00"]');
+    await expect(bulk00).toBeVisible({ timeout: 10_000 });
+    await withBound(watch.cacheReady, 45_000, "cache-ready version 0");
+    await bulk00.click();
+    await expect(
+      page.locator('.tree-row[data-tree-path="bulk-00/generated-00.ts"]'),
+    ).toBeVisible();
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
+    await expect(page.locator("#svg-holder")).toContainText("SessionStorage⟨TMetadata⟩");
+
+    const visibility = page.locator("#uml-visibility");
+    const dsl = page.locator("#dsl-content");
+    const holder = page.locator("#svg-holder");
+    const stage = page.locator("#diagram-stage");
+    await expect(visibility).toBeVisible();
+    for (const id of ["attributes", "methods", "types", "tests"]) {
+      await expect(page.locator(`#uml-show-${id}`)).toBeChecked();
+    }
+    // Two communities -> two frames, so a global toggle must change both.
+    expect(await page.locator(".uml-frame").count()).toBeGreaterThan(1);
+
+    const svg = page.locator("#svg-holder svg").first();
+    const beforeBox = await svg.boundingBox();
+    if (!beforeBox) throw new Error("the UML diagram has no bounding box");
+
+    let diagramRequests = 0;
+    const countDiagramRequests = (request: Request): void => {
+      if (new URL(request.url()).pathname === "/api/diagram") diagramRequests += 1;
+    };
+    page.on("request", countDiagramRequests);
+    try {
+      await page.locator("#uml-show-attributes").uncheck();
+      await expect(dsl).not.toContainText("metadata");
+      await expect(holder).not.toContainText("metadata");
+      await expect(holder).not.toContainText("skill");
+      await expect(stage).toHaveAttribute("aria-busy", "false");
+      const afterBox = await svg.boundingBox();
+      if (!afterBox) throw new Error("the re-rendered UML diagram has no bounding box");
+      expect(afterBox.height).toBeLessThan(beforeBox.height);
+      expect(diagramRequests).toBe(0);
+
+      await page.locator("#uml-show-attributes").check();
+      await expect(dsl).toContainText("metadata");
+      await expect(holder).toContainText("metadata");
+
+      await page.locator("#uml-show-types").uncheck();
+      await expect(dsl).toContainText("metadata");
+      await expect(dsl).not.toContainText(": TMetadata");
+      expect(diagramRequests).toBe(0);
+    } finally {
+      page.off("request", countDiagramRequests);
+    }
+
+    await page.locator("#packages-mode").click();
+    await expect(visibility).toBeHidden();
   } finally {
     await cleanupResource(resource);
   }
@@ -1784,6 +1862,10 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     await expect(definitionResult).toBeVisible();
     await expect(matchedTreeRow).toBeVisible();
     await expect(searchInput).not.toHaveAttribute("aria-invalid");
+    await expect(page.locator("#dsl-content")).toContainText("%% Scope: .");
+    await expect(page.locator("#svg-holder.stacked .uml-frame")).toHaveCount(1);
+    await expect(page.locator("#svg-holder")).toContainText("MixedCaseWidget");
+    await expect(page.locator("#status")).toContainText("Search · 1 files");
 
     const trueDom = await readSearchDom();
     const requestsBeforeUncheckedToggle = observedSearchRequests.length;

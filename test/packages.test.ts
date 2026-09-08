@@ -40,10 +40,12 @@ async function materializePackageDiagram(
     if (reloaded?.kind !== "packages") {
       throw new Error("materialized package diagram graph was not found");
     }
+    const rendered = renderDiagramGraph(reloaded);
+    if (rendered.kind !== "packages") throw new Error("expected a package rendering");
     return {
       extracted,
       reloaded,
-      rendered: renderDiagramGraph(reloaded),
+      rendered,
       cached,
     };
   } finally {
@@ -141,10 +143,9 @@ test("discovers workspace packages and only workspace dependency edges", async (
   });
   expect(rendered).toEqual(renderDiagramGraph(extracted));
   expect(cached).toEqual({
-    kind: "packages",
+    ...rendered,
     scopePath: "",
     status: "ready",
-    ...rendered,
   });
 });
 
@@ -198,6 +199,7 @@ test("materializes a bare package error graph without topology rows", async () =
   expect(reloaded.relations).toEqual([]);
   expect(reloaded.packageNodes).toEqual([]);
   expect(rendered).toEqual({
+    kind: "packages",
     dsl: "flowchart LR",
     dsls: ["flowchart LR"],
     packageNodes: [],
@@ -206,11 +208,10 @@ test("materializes a bare package error graph without topology rows", async () =
     localUsers: [],
   });
   expect(cached).toEqual({
-    kind: "packages",
+    ...rendered,
     scopePath: "",
     status: "error",
     error: "package discovery failed",
-    ...rendered,
   });
 });
 

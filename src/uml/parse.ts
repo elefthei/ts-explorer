@@ -12,7 +12,8 @@ import {
   topLevelDeclarations,
 } from "../lang/typescript.ts";
 import { createDeclarationBuilder, type DeclarationBuilder } from "./declaration.ts";
-import { bareUmlName, posix, syntheticTypeId, umlFileKey } from "./keys.ts";
+import { posix, syntheticTypeId, umlFileKey } from "./keys.ts";
+import { bareUmlName } from "./mermaid.ts";
 import {
   type FileDeclaration,
   type HeritageClause,

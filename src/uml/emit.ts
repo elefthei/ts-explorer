@@ -6,6 +6,7 @@ import type {
   PropertyDetails,
   UmlEntityModel,
   UmlModifier,
+  UmlVisibility,
 } from "./model.ts";
 
 // Ported verbatim from tsuml2's mermaid template: the brace replacements are deliberately
@@ -26,38 +27,42 @@ function applyModifiers(modifiers: readonly UmlModifier[], text: string): string
   return result;
 }
 
-function propertyRow(property: PropertyDetails): string {
+function propertyRow(property: PropertyDetails, types: boolean): string {
   let result = property.name;
-  if (property.type) {
+  if (types && property.type) {
     if (property.optional) result += "?";
     result += `: ${escapeMermaid(property.type)}`;
   }
   return applyModifiers(property.modifiers, result);
 }
 
-function methodRow(method: MethodDetails): string {
+function methodRow(method: MethodDetails, types: boolean): string {
   let result = `${method.name}()`;
-  if (method.returnType) result += ` ${escapeMermaid(method.returnType)}`;
+  if (types && method.returnType) result += ` ${escapeMermaid(method.returnType)}`;
   return applyModifiers(method.modifiers, result);
 }
 
-function members(entity: UmlEntityModel): { props: string; methods: string } {
+function members(entity: UmlEntityModel, visibility: UmlVisibility): { props: string; methods: string } {
   return {
-    props: entity.properties.map(propertyRow).join("\n"),
-    methods: entity.methods.map(methodRow).join("\n"),
+    props: visibility.attributes
+      ? entity.properties.map((property) => propertyRow(property, visibility.types)).join("\n")
+      : "",
+    methods: visibility.methods
+      ? entity.methods.map((method) => methodRow(method, visibility.types)).join("\n")
+      : "",
   };
 }
 
-function classBlock(entity: UmlEntityModel): string {
-  const { props, methods } = members(entity);
+function classBlock(entity: UmlEntityModel, visibility: UmlVisibility): string {
+  const { props, methods } = members(entity, visibility);
   return `class ${escapeMermaid(entity.name)}{
             ${props}
             ${methods}
         }`;
 }
 
-function structuredBlock(entity: UmlEntityModel, stereotype: "interface" | "type"): string {
-  const { props, methods } = members(entity);
+function structuredBlock(entity: UmlEntityModel, stereotype: "interface" | "type", visibility: UmlVisibility): string {
+  const { props, methods } = members(entity, visibility);
   return `class ${escapeMermaid(entity.name)} {
             <<${stereotype}>>
             ${props}
@@ -65,10 +70,10 @@ function structuredBlock(entity: UmlEntityModel, stereotype: "interface" | "type
         }`;
 }
 
-function enumBlock(entity: UmlEntityModel): string {
+function enumBlock(entity: UmlEntityModel, visibility: UmlVisibility): string {
   return `class ${escapeMermaid(entity.name)} {
         <<enumeration>>
-        ${entity.items.join("\n")}
+        ${visibility.attributes ? entity.items.join("\n") : ""}
       }`;
 }
 
@@ -85,12 +90,15 @@ function associationRow(association: MemberAssociation): string {
   }`;
 }
 
-export function emitMermaidClassDiagram(declarations: readonly FileDeclaration[]): string {
+export function emitMermaidClassDiagram(
+  declarations: readonly FileDeclaration[],
+  visibility: UmlVisibility,
+): string {
   const entities = declarations.flatMap((declaration) => [
-    ...declaration.classes.map(classBlock),
-    ...declaration.interfaces.map((entity) => structuredBlock(entity, "interface")),
-    ...declaration.enums.map(enumBlock),
-    ...declaration.types.map((entity) => structuredBlock(entity, "type")),
+    ...declaration.classes.map((entity) => classBlock(entity, visibility)),
+    ...declaration.interfaces.map((entity) => structuredBlock(entity, "interface", visibility)),
+    ...declaration.enums.map((entity) => enumBlock(entity, visibility)),
+    ...declaration.types.map((entity) => structuredBlock(entity, "type", visibility)),
     ...declaration.heritageClauses.flat().map(heritageRow),
     ...(declaration.memberAssociations ?? []).map(associationRow),
   ]);

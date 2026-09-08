@@ -10,16 +10,10 @@ import {
   hasPassedDragThreshold,
   matchesSearchQuery,
   panViewport,
-  shouldStackDiagram,
   treeScrollTopForRow,
   zoomViewportAt,
 } from "../src/web/diagram-interactions.ts";
 import { STYLE_DEFS } from "../src/uml/mermaid.ts";
-
-test("shouldStackDiagram stacks UML diagrams but not package diagrams", () => {
-  expect(shouldStackDiagram("uml")).toBe(true);
-  expect(shouldStackDiagram("packages")).toBe(false);
-});
 
 test("matchesSearchQuery honors the explicit case mode and rejects blank queries", () => {
   const cases = [

@@ -1,3 +1,5 @@
+import type { UmlViewModel } from "./uml/view.ts";
+
 export type TreeNode = {
   name: string;
   path: string;
@@ -138,19 +140,21 @@ export type SearchResponse = {
   renderDirs: string[];
 };
 
-export type DiagramResponse = {
-  kind: DiagramKind;
+type DiagramResponseBase = {
   scopePath: string;
-  version: number;
   status: "ready" | "error";
-  dsl: string;
-  dsls: string[];
   packageNodes: PackageDiagramNode[];
   definitions: GotoDefinition[];
   externalUsers: UmlExternalUser[];
   localUsers: UmlLocalUser[];
   error?: string;
 };
+
+export type DiagramPayload =
+  | (DiagramResponseBase & { kind: "packages"; dsl: string; dsls: string[] })
+  | (DiagramResponseBase & { kind: "uml"; view: UmlViewModel });
+
+export type DiagramResponse = DiagramPayload & { version: number };
 
 export type FileResponse = {
   path: string;
