@@ -5,6 +5,8 @@ import {
   browserOpenCommand,
   browserUrl,
   cliVersion,
+  describeSourceDirError,
+  describeStartupError,
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
@@ -117,5 +119,54 @@ test("formats path-sorted watch invalidation arrays exactly without losing JSON 
     17,
   )).toBe(
     '[sync] invalidate watch version=17 paths=["packages/a file.ts","packages/b\\"quoted\\".ts"] events=["change","unlink"]',
+  );
+});
+
+test("describeSourceDirError reports a missing directory", () => {
+  const error = Object.assign(new Error("boom"), { code: "ENOENT" });
+  expect(describeSourceDirError(error, "/no/such/dir")).toBe(
+    "source directory does not exist: /no/such/dir",
+  );
+});
+
+test.each(["EACCES", "EPERM"])(
+  "describeSourceDirError reports a permission error for %s",
+  (code) => {
+    const error = Object.assign(new Error("boom"), { code });
+    expect(describeSourceDirError(error, "/restricted")).toBe(
+      "cannot access source directory (permission denied): /restricted",
+    );
+  },
+);
+
+test("describeSourceDirError reports a non-directory path", () => {
+  expect(describeSourceDirError(new Error("not a directory"), "/some/file")).toBe(
+    "source path exists but is not a directory: /some/file",
+  );
+});
+
+test("describeSourceDirError falls back to a generic message for unknown errors", () => {
+  expect(describeSourceDirError(new Error("weird"), "/x")).toBe(
+    "source directory does not exist or is not a directory: /x",
+  );
+});
+
+test("describeStartupError explains a port already in use", () => {
+  const error = Object.assign(new Error("boom"), { code: "EADDRINUSE" });
+  expect(describeStartupError(error, 8080)).toBe(
+    "Port 8080 is already in use. Try a different --port, or run with --port 0 to let the OS choose a free port.",
+  );
+});
+
+test("describeStartupError explains a permission error binding a privileged port", () => {
+  const error = Object.assign(new Error("boom"), { code: "EACCES" });
+  expect(describeStartupError(error, 80)).toBe(
+    "Permission denied binding to port 80 (ports below 1024 usually require elevated privileges). Try a port >= 1024.",
+  );
+});
+
+test("describeStartupError falls back to the original error message", () => {
+  expect(describeStartupError(new Error("client bundle failed"), 8080)).toBe(
+    "client bundle failed",
   );
 });

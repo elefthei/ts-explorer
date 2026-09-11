@@ -80,13 +80,36 @@ export function parseCliOptions(args: string[]) {
   };
 }
 
+export function describeSourceDirError(error: unknown, sourceDir: string): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === "ENOENT") return `source directory does not exist: ${sourceDir}`;
+  if (code === "EACCES" || code === "EPERM") {
+    return `cannot access source directory (permission denied): ${sourceDir}`;
+  }
+  if (error instanceof Error && error.message === "not a directory") {
+    return `source path exists but is not a directory: ${sourceDir}`;
+  }
+  return `source directory does not exist or is not a directory: ${sourceDir}`;
+}
+
 async function validateSourceDir(sourceDir: string): Promise<void> {
   try {
     const sourceStat = await stat(sourceDir);
     if (!sourceStat.isDirectory()) throw new Error("not a directory");
-  } catch {
-    throw new Error(`source directory does not exist or is not a directory: ${sourceDir}`);
+  } catch (error) {
+    throw new Error(describeSourceDirError(error, sourceDir), { cause: error });
   }
+}
+
+export function describeStartupError(error: unknown, port: number): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === "EADDRINUSE") {
+    return `Port ${port} is already in use. Try a different --port, or run with --port 0 to let the OS choose a free port.`;
+  }
+  if (code === "EACCES") {
+    return `Permission denied binding to port ${port} (ports below 1024 usually require elevated privileges). Try a port >= 1024.`;
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function browserUrl(host: string, port: number): string {
@@ -121,17 +144,22 @@ if (import.meta.main) {
     const options = parseCliOptions(process.argv.slice(2));
     if (options) {
       await validateSourceDir(options.sourceDir);
-      const server = await ExplorerServer.start({
-        sourceDir: options.sourceDir,
-        host: options.host,
-        port: options.port,
-        onSyncProgress(event) {
-          console.log(formatSyncProgress(event));
-        },
-        onWatchBatch(paths, events, version) {
-          console.log(formatWatchInvalidation(paths, events, version));
-        },
-      });
+      let server: ExplorerServer;
+      try {
+        server = await ExplorerServer.start({
+          sourceDir: options.sourceDir,
+          host: options.host,
+          port: options.port,
+          onSyncProgress(event) {
+            console.log(formatSyncProgress(event));
+          },
+          onWatchBatch(paths, events, version) {
+            console.log(formatWatchInvalidation(paths, events, version));
+          },
+        });
+      } catch (error) {
+        throw new Error(describeStartupError(error, options.port), { cause: error });
+      }
       const url = browserUrl(options.host, server.port);
       console.log(`TS explorer listening at ${url}`);
       if (options.open) openBrowser(url);
