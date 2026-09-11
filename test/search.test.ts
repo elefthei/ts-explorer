@@ -72,6 +72,15 @@ const cases: Array<{
       renderDirs: ["packages/demo/src", "packages/demo/test"],
     },
   },
+  {
+    name: "no files yields no directories or render scopes",
+    files: [],
+    packages: [rootPackage],
+    expected: {
+      directories: [],
+      renderDirs: [],
+    },
+  },
 ];
 
 test("buildSearchScopes derives package-capped highlight chains and minimal render covers", () => {
