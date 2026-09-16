@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promis
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  ensureRegularFile,
   normalizeRelativePath,
   type PathErrorCode,
   resolveInside,
@@ -78,4 +79,47 @@ test("resolves ordinary files but rejects traversal, absolute paths, and symlink
   });
   expect(await resolveInside(root, "src/ok.ts", true)).toBe(canonicalFile);
   expect(await resolveInside(canonicalRoot, "src/ok.ts", true)).toBe(canonicalFile);
+});
+
+test("rejects when the source root itself does not exist", async () => {
+  const missingRoot = join(tmpdir(), "ts-explorer-missing-root-does-not-exist");
+  await expect(resolveInside(missingRoot, "src/ok.ts", true)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+});
+
+test("resolves a not-yet-existing file against its existing parent directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-new-"));
+  roots.push(root);
+  await mkdir(join(root, "src"));
+  const canonicalRoot = await realpath(root);
+
+  const resolved = await resolveInside(root, "src/new-file.ts", false);
+  expect(resolved).toBe(join(canonicalRoot, "src", "new-file.ts"));
+});
+
+test("rejects a not-yet-existing file whose parent directory is also missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-noparent-"));
+  roots.push(root);
+
+  await expect(resolveInside(root, "missing-dir/new-file.ts", false)).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+});
+
+test("ensureRegularFile accepts regular files and rejects missing paths or directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-ensure-file-"));
+  roots.push(root);
+  const file = join(root, "ok.ts");
+  await writeFile(file, "export const ok = 1;\n");
+  const dir = join(root, "subdir");
+  await mkdir(dir);
+
+  await expect(ensureRegularFile(file)).resolves.toBeUndefined();
+  await expect(ensureRegularFile(join(root, "missing.ts"))).rejects.toMatchObject({
+    code: "NOT_FOUND",
+  });
+  await expect(ensureRegularFile(dir)).rejects.toMatchObject({
+    code: "BAD_REQUEST",
+  });
 });
