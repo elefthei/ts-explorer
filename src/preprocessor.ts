@@ -1,8 +1,7 @@
 import { availableParallelism } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LRUCache } from "lru-cache";
-import { normalizeRelativePath } from "./paths.ts";
+import { normalizeRelativePath, resolveCacheDbPath, resolveSourceDir } from "./paths.ts";
 import {
   isPreprocessProgressEvent,
   isPreprocessResponse,
@@ -219,11 +218,11 @@ export class Preprocessor {
     processCount?: number,
     onProgress: (event: PreprocessProgressEvent) => void = () => undefined,
   ) {
-    this.sourceDir = sourceDir;
+    this.sourceDir = resolveSourceDir(sourceDir);
     this.onReady = onReady;
     this.onError = onError;
     this.poolSize = processCountOrDefault(processCount);
-    this.dbPath = join(sourceDir, ".explore", "explore.db");
+    this.dbPath = resolveCacheDbPath(this.sourceDir);
     this.onProgress = onProgress;
     void this.bootstrap();
   }
@@ -524,6 +523,8 @@ export class Preprocessor {
         stdout: "ignore",
         stderr: "inherit",
         windowsHide: true,
+        // Do not detach on Windows: a detached child loses the inherited stderr handle (writes fail
+        // EBADF), and the parent's IPC shutdown already tears workers down after a console Ctrl+C.
         ipc: (message, source) => {
           if (slot.token !== token) return;
           if (isPreprocessProgressEvent(message)) {

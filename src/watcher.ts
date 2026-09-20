@@ -1,6 +1,6 @@
-import { watch, type FSWatcher } from "chokidar";
+import { watch, type ChokidarOptions, type FSWatcher } from "chokidar";
 import { relative, resolve } from "node:path";
-import { normalizeRelativePath } from "./paths.ts";
+import { normalizeRelativePath, resolveSourceDir, WSL_UNC_ROOT } from "./paths.ts";
 import { isTraversalIgnoredPath } from "./source.ts";
 import type { WatchEventName } from "./types.ts";
 
@@ -11,14 +11,20 @@ export async function startSourceWatcher(
   onBatch: (paths: string[], events: WatchEventName[]) => void,
   onError: (error: Error) => void,
 ): Promise<{ close(): Promise<void> }> {
-  const watcherRoot = resolve(sourceDir);
-  const watcher: FSWatcher = watch(watcherRoot, {
+  const watcherRoot = resolveSourceDir(sourceDir);
+  const options: ChokidarOptions = {
     followSymlinks: false,
     ignoreInitial: true,
     awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
     ignored: (path) => isTraversalIgnoredPath(relative(watcherRoot, resolve(path))),
     persistent: true,
-  });
+  };
+  if (process.platform === "win32" && WSL_UNC_ROOT.test(watcherRoot)) {
+    options.usePolling = true;
+    options.interval = 1_000;
+    options.binaryInterval = 1_000;
+  }
+  const watcher: FSWatcher = watch(watcherRoot, options);
   const pending = new Map<string, WatchEventName>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const flush = () => {

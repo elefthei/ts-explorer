@@ -1,11 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   normalizeRelativePath,
   type PathErrorCode,
+  resolveCacheDbPath,
   resolveInside,
+  resolveSourceDir,
 } from "../src/paths.ts";
 
 const roots: string[] = [];
@@ -78,4 +80,46 @@ test("resolves ordinary files but rejects traversal, absolute paths, and symlink
   });
   expect(await resolveInside(root, "src/ok.ts", true)).toBe(canonicalFile);
   expect(await resolveInside(canonicalRoot, "src/ok.ts", true)).toBe(canonicalFile);
+});
+
+const windowsOnly = test.skipIf(process.platform !== "win32");
+
+windowsOnly("canonicalizes every WSL spelling of one root to the same source root and cache", () => {
+  const canonical = String.raw`\\wsl.localhost\archlinux\home\Alice\Project\src`;
+  const spellings = [
+    canonical,
+    String.raw`\\wsl$\archlinux\home\Alice\Project\src`,
+    "//wsl.localhost/archlinux/home/Alice/Project/src",
+    String.raw`\\?\UNC\wsl.localhost\archlinux\home\Alice\Project\src`,
+    String.raw`\\?\UNC\wsl$\archlinux\home\Alice\Project\src`,
+  ];
+
+  for (const spelling of spellings) {
+    expect(resolveSourceDir(spelling)).toBe(canonical);
+    expect(resolveCacheDbPath(spelling)).toBe(resolveCacheDbPath(canonical));
+  }
+  // The cache lives off the redirector because SQLite cannot lock files on it.
+  expect(resolveCacheDbPath(canonical)).not.toStartWith("\\\\");
+});
+
+windowsOnly("keeps Linux path case significant so sibling roots never share a cache", () => {
+  const upper = String.raw`\\wsl.localhost\archlinux\home\Alice\Project\src`;
+  const lower = String.raw`\\wsl.localhost\archlinux\home\Alice\project\src`;
+
+  expect(resolveSourceDir(lower)).toBe(lower);
+  expect(resolveCacheDbPath(upper)).not.toBe(resolveCacheDbPath(lower));
+});
+
+windowsOnly("leaves non-WSL roots at their native resolution", () => {
+  const unrelated = [
+    String.raw`\\server\share\Project\src`,
+    String.raw`\\wsl.localhost.example\share\Project\src`,
+    String.raw`\\?\C:\Project\src`,
+    String.raw`C:\Temp\Project`,
+  ];
+
+  for (const path of unrelated) {
+    expect(resolveSourceDir(path)).toBe(resolve(path));
+    expect(resolveCacheDbPath(path)).toBe(join(resolve(path), ".explore", "explore.db"));
+  }
 });

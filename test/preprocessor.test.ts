@@ -10,6 +10,7 @@ import type {
   RenderedDiagram,
   UmlDiagramGraph,
 } from "../src/diagram-graph.ts";
+import { resolveCacheDbPath } from "../src/paths.ts";
 import { Preprocessor } from "../src/preprocessor.ts";
 import {
   isPreprocessProgressEvent,
@@ -975,7 +976,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     expect((await preprocessor.search(query, false)).files).toEqual(files);
   }
 
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   expect((await stat(dbPath)).isFile()).toBe(true);
   await closePreprocessor(preprocessor);
 
@@ -1829,7 +1830,7 @@ test("labels repeated scope work across startup and watch generations", async ()
   }
 
   await closePreprocessor(preprocessor);
-  openDatabase(join(root, ".explore", "explore.db"), (db) => {
+  openDatabase(resolveCacheDbPath(root), (db) => {
     const activeGeneration = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id
       FROM cache_meta
@@ -1989,7 +1990,7 @@ test("drains superseded subprocess jobs before discarding their generation", asy
   });
   await closePreprocessor(preprocessor);
 
-  openDatabase(join(root, ".explore", "explore.db"), (db) => {
+  openDatabase(resolveCacheDbPath(root), (db) => {
     const generations = db.query<{ id: number; state: string; cause: string }, []>(`
       SELECT id, state, cause FROM generations ORDER BY id
     `).all();
@@ -2015,7 +2016,7 @@ test("drains superseded subprocess jobs before discarding their generation", asy
 
 test("startup recovery removes orphan generations and rebuilds when the active pointer is invalid", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-recovery-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "root-workspace" }));
   await writeFixtureFile(root, "app.js", 'export const state="initial-cache";\n');
 
@@ -2204,7 +2205,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
 
 test("startup retries diagram scopes whose cached outcome is an error", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-failure-retry-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "retry-workspace" }));
   await writeFixtureFile(root, "app.ts", "export class RetryTarget {}\n");
 
@@ -2252,7 +2253,7 @@ test("startup retries diagram scopes whose cached outcome is an error", async ()
 
 test("serves packages from a building generation before the watch rebuild promotes", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-packages-rebuild-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   const blockerSource = Array.from(
     { length: 1_000 },
     (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
@@ -2380,7 +2381,7 @@ test("reserves a subprocess slot so background scope work never saturates the po
 
 test("defers recovered readiness when a watch rebuild is requested before bootstrap completes", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-recovery-race-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "recovery-race" }));
   await writeFixtureFile(root, "app.js", 'export const searchable="recovery-race-token";\n');
 
@@ -2434,7 +2435,7 @@ test("defers recovered readiness when a watch rebuild is requested before bootst
 
 test("recovers named cache tables and retries queued database work for runtime loads and stores", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-schema-retry-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   const expectedPackages = [{
     name: "runtime-recovery",
     path: "",
@@ -2563,7 +2564,7 @@ test("recovers named cache tables and retries queued database work for runtime l
 
 test("indexes every definition before UML extraction and disambiguates lookups by qualified name", async () => {
   const root = await temporaryRoot("ts-explorer-definition-index-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "definition-index" }));
   await writeFixtureFile(
     root,
@@ -2665,7 +2666,7 @@ test("indexes every definition before UML extraction and disambiguates lookups b
 
 test("serves repeated read-only requests from memory and drops them when a rebuild promotes", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-ipc-cache-");
-  const dbPath = join(root, ".explore", "explore.db");
+  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "ipc-cache" }));
   await writeFixtureFile(root, "app.ts", "export const cached = 1;\n");
 

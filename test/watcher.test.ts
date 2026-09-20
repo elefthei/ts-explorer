@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
+import { resolveSourceDir } from "../src/paths.ts";
 import { startSourceWatcher } from "../src/watcher.ts";
 
 const roots: string[] = [];
@@ -11,8 +12,11 @@ afterEach(async () => {
 });
 
 test("batches visible changes while suppressing cache changes under .explore", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-watch-"));
+  // Fixture I/O uses the canonical root because Bun's writes fail on namespaced UNC spellings, while
+  // the watcher receives TEMP/TMP exactly as configured to prove the application canonicalizes it.
+  const root = await mkdtemp(join(resolveSourceDir(tmpdir()), "ts-explorer-watch-"));
   roots.push(root);
+  const watchedArgument = join(tmpdir(), basename(root));
   await Promise.all([
     mkdir(join(root, "src"), { recursive: true }),
     mkdir(join(root, ".explore"), { recursive: true }),
@@ -26,16 +30,29 @@ test("batches visible changes while suppressing cache changes under .explore", a
     writeFile(cacheFile, "generation 1\n"),
   ]);
 
-  let resolveBatch!: (batch: { paths: string[]; events: string[] }) => void;
-  let rejectBatch!: (error: Error) => void;
-  const batch = new Promise<{ paths: string[]; events: string[] }>((resolve, reject) => {
-    resolveBatch = resolve;
-    rejectBatch = reject;
-  });
+  const expectedPaths = ["src/first.ts", "src/second.js"];
+  const batches: { paths: string[]; events: string[] }[] = [];
+  const observed = new Map<string, string>();
+  const errors: Error[] = [];
+  const completion = Promise.withResolvers<void>();
+  // Chokidar restarts write stabilization per path, so the two edits may arrive in separate batches.
   const watcher = await startSourceWatcher(
-    root,
-    (paths, events) => resolveBatch({ paths, events }),
-    rejectBatch,
+    watchedArgument,
+    (paths, events) => {
+      batches.push({ paths: [...paths], events: [...events] });
+      for (const [index, path] of paths.entries()) observed.set(path, events[index] as string);
+      if (expectedPaths.every((path) => observed.has(path))) completion.resolve();
+    },
+    (error) => {
+      errors.push(error);
+      completion.reject(error);
+    },
+  );
+  // Real filesystem delivery has no deterministic clock to advance; this integration deadline fails
+  // the gate below the test timeout so the watcher still closes before fixture removal.
+  const watchdog = setTimeout(
+    () => completion.reject(new Error(`watch batches incomplete: ${JSON.stringify(batches)}`)),
+    4_000,
   );
 
   try {
@@ -45,12 +62,16 @@ test("batches visible changes while suppressing cache changes under .explore", a
       writeFile(cacheFile, "generation 2\n"),
     ]);
 
-    const result = await batch;
-    expect(result).toEqual({
-      paths: ["src/first.ts", "src/second.js"],
-      events: ["change", "change"],
-    });
+    await completion.promise;
+    for (const { paths, events } of batches) {
+      expect(events).toHaveLength(paths.length);
+      expect(paths).toEqual([...new Set(paths)].sort((left, right) => left.localeCompare(right)));
+    }
+    expect(Object.fromEntries([...observed].sort(([left], [right]) => left.localeCompare(right))))
+      .toEqual({ "src/first.ts": "change", "src/second.js": "change" });
+    expect(errors).toEqual([]);
   } finally {
+    clearTimeout(watchdog);
     await watcher.close();
   }
 }, 5_000);

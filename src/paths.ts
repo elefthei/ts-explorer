@@ -1,5 +1,7 @@
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type PathErrorCode = "BAD_REQUEST" | "FORBIDDEN" | "NOT_FOUND";
 
@@ -8,6 +10,32 @@ export class PathError extends Error {
     super(message);
     this.name = "PathError";
   }
+}
+
+// Windows reaches a WSL distribution through a network redirector. `wsl$` and `wsl.localhost` are
+// interchangeable authorities for the same tree, and `\\?\UNC\` is the namespaced spelling of both.
+export const WSL_UNC_ROOT = /^\\\\(?:\?\\UNC\\)?(?:wsl\.localhost|wsl\$)\\/i;
+
+// Windows can spell one WSL root four ways (`wsl$`/`wsl.localhost`, plain or namespaced). Canonicalize
+// the source root itself so I/O, watching and cache identity all agree. Linux path components stay
+// case-sensitive: `Project` and `project` are different roots.
+export function resolveSourceDir(sourceDir: string): string {
+  const root = resolve(sourceDir);
+  return process.platform === "win32" ? root.replace(WSL_UNC_ROOT, "\\\\wsl.localhost\\") : root;
+}
+
+// SQLite cannot acquire a file lock over the WSL redirector: every statement, including `SELECT 1`,
+// fails with SQLITE_BUSY ("database is locked"). The cache therefore lives on local disk for those
+// roots, in a directory keyed by the canonical root so distinct projects never share one database.
+export function resolveCacheDbPath(sourceDir: string): string {
+  const root = resolveSourceDir(sourceDir);
+  if (process.platform !== "win32" || !WSL_UNC_ROOT.test(root)) {
+    return join(root, ".explore", "explore.db");
+  }
+  const digest = createHash("sha256").update(root).digest("hex").slice(0, 16);
+  const label = basename(root).replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 32) || "root";
+  const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  return join(localAppData, "ts-explorer", `${label}-${digest}`, "explore.db");
 }
 
 function isWithin(root: string, candidate: string): boolean {

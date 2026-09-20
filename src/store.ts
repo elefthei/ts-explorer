@@ -1,4 +1,4 @@
-import { PathError } from "./paths.ts";
+import { PathError, resolveSourceDir } from "./paths.ts";
 import { Preprocessor } from "./preprocessor.ts";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import { readTree } from "./tree.ts";
@@ -53,7 +53,7 @@ export class ExplorerStore {
       version: number,
     ) => void = () => undefined,
   ) {
-    this.sourceDir = sourceDir;
+    this.sourceDir = resolveSourceDir(sourceDir);
     this.onError = onError;
     this.onCacheReady = onCacheReady;
     this.onProgress = onProgress;

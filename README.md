@@ -68,6 +68,20 @@ tse ~/git/my-project --host 127.0.0.1 --port 8081
 
 Use `--host 0.0.0.0` only when you intentionally want the server reachable beyond the local machine.
 
+### Preprocessing cache
+
+The explorer keeps its analysis database in `.explore/explore.db` inside the inspected directory.
+
+Windows exploring a WSL directory (`\\wsl.localhost\<distro>\…` or the equivalent `\\wsl$\…`) is the
+one exception. SQLite cannot acquire a file lock over the WSL network redirector — every statement
+fails with `database is locked` — so the cache moves to
+`%LOCALAPPDATA%\ts-explorer\<directory-name>-<hash>\explore.db`, keyed by the canonical source root.
+The four spellings of one WSL path share a single cache directory, while Linux path case stays
+significant — `…/Project` and `…/project` are different roots with different caches. Deleting the
+cache directory discards the cache, and deleting the project does not. Filesystem watching also
+switches to 1 s polling for those roots, because the redirector does not deliver
+`ReadDirectoryChangesW` notifications.
+
 ## Explorer workflow
 
 - **Packages** shows workspace package dependencies as a Mermaid graph.

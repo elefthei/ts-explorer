@@ -4,6 +4,7 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import yargs from "yargs/yargs";
+import { resolveSourceDir } from "./paths.ts";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import type { WatchEventName } from "./types.ts";
 import { ExplorerServer } from "./server.ts";
@@ -73,7 +74,7 @@ export function parseCliOptions(args: string[]) {
     throw new Error("port must be an integer between 1 and 65535");
   }
   return {
-    sourceDir: resolve(expandHome(String(parsed._[0]))),
+    sourceDir: resolveSourceDir(expandHome(String(parsed._[0]))),
     host: parsed.host,
     port: parsed.port,
     open: parsed.open,
@@ -132,15 +133,25 @@ if (import.meta.main) {
           console.log(formatWatchInvalidation(paths, events, version));
         },
       });
+      // Listeners stay registered for the whole teardown: a repeated Ctrl+C must not remove the last
+      // SIGINT listener and let the default handler kill the process while workers still shut down.
+      let stopping = false;
+      const shutdown = () => {
+        if (stopping) return;
+        stopping = true;
+        server.stop().then(
+          () => process.exit(0),
+          (error: unknown) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+          },
+        );
+      };
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
       const url = browserUrl(options.host, server.port);
       console.log(`TS explorer listening at ${url}`);
       if (options.open) openBrowser(url);
-      const shutdown = async () => {
-        await server.stop();
-        process.exit(0);
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
     }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

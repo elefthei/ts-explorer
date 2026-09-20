@@ -1,6 +1,16 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { resolveCacheDbPath } from "../../src/paths.ts";
+
+/**
+ * Removes a fixture root together with the preprocessing cache resolved for it. The cache lives
+ * inside the root for ordinary paths, but off it for Windows-to-WSL roots (see resolveCacheDbPath).
+ */
+export async function removeFixtureRoot(root: string): Promise<void> {
+  await rm(dirname(resolveCacheDbPath(root)), { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true });
+}
 
 export function createFixtureTracker(): {
   temporaryRoot(prefix: string): Promise<string>;
@@ -47,9 +57,7 @@ export function createFixtureTracker(): {
     },
 
     async cleanup(): Promise<void> {
-      await Promise.all(
-        roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-      );
+      await Promise.all(roots.splice(0).map(removeFixtureRoot));
     },
   };
 }

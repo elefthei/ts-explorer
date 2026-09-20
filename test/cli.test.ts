@@ -30,6 +30,20 @@ test("resolves the current directory while retaining host and port defaults", ()
   });
 });
 
+test.skipIf(process.platform !== "win32")(
+  "canonicalizes a namespaced WSL directory before validation, preserving Linux case",
+  () => {
+    const namespaced = String.raw`\\?\UNC\wsl$\archlinux\home\eioannidis\git\Marsh`;
+
+    expect(parseCliOptions([namespaced, "--no-open"])).toEqual({
+      sourceDir: String.raw`\\wsl.localhost\archlinux\home\eioannidis\git\Marsh`,
+      host: "127.0.0.1",
+      port: 8080,
+      open: false,
+    });
+  },
+);
+
 test("requires the directory positional", () => {
   expect(() => parseCliOptions([])).toThrow(
     "Not enough non-option arguments: got 0, need at least 1",
