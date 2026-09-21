@@ -35,6 +35,7 @@ import {
   type UmlTarget,
 } from "./types.ts";
 import { isTestPath } from "./uml/keys.ts";
+import { isNominalKind } from "./uml/usage.ts";
 import type {
   DefinitionBindingKind,
   DefinitionBindingSpace,
@@ -843,16 +844,6 @@ function sqliteBoolean(value: unknown, description: string): number {
   if (typeof value !== "boolean") throw invalidMaterialization(`invalid ${description}`);
   return value ? 1 : 0;
 }
-
-const NOMINAL_DEFINITION_KINDS: Record<string, true> = {
-  class: true,
-  interface: true,
-  trait: true,
-  struct: true,
-  union: true,
-  enum: true,
-  type: true,
-};
 
 type PreparedGraphStore = {
   statements: Array<{ finalize(): void }>;
@@ -2356,7 +2347,7 @@ class UmlSelectionReader {
       if (!this.definition(key)) continue;
       keys.add(key);
       const source = this.definition(key);
-      const nominal = source !== undefined && NOMINAL_DEFINITION_KINDS[source.kind] === true;
+      const nominal = source !== undefined && isNominalKind(source.kind);
       for (const edge of this.effectiveAdjacency(key)) {
         if (this.missing.size || this.error) return { keys, edges };
         // A nominal box absorbs references to its own members instead of drawing them.
