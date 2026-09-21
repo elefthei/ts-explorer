@@ -4,6 +4,7 @@ import { firstAncestor, namedChildren } from "../lang/ast.ts";
 import { highlightLanguageForPath } from "../lang/registry.ts";
 import type { UmlRelationKind } from "../diagram-graph.ts";
 import type { FileDefinitionKind } from "../types.ts";
+import { canonicalScopeKey } from "./keys.ts";
 import { collectRustReferences } from "./rust-usage.ts";
 import type {
   DefinitionBindingSpace,
@@ -163,17 +164,6 @@ export class ReferenceContext {
       || left.targetKey.localeCompare(right.targetKey)
       || left.kind.localeCompare(right.kind)
     );
-  }
-}
-
-/** Repeated same-file namespace blocks share the occurrence-0 key as their export scope. */
-export function canonicalScopeKey(scopeKey: string): string {
-  try {
-    const parts = JSON.parse(scopeKey) as unknown;
-    if (!Array.isArray(parts) || parts.length !== 4) return scopeKey;
-    return JSON.stringify([parts[0], parts[1], parts[2], 0]);
-  } catch {
-    return scopeKey;
   }
 }
 

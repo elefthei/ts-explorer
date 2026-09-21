@@ -4,6 +4,7 @@ import type { ParsedFileDefinition } from "../goto-definition.ts";
 import { children, namedChildren } from "../lang/ast.ts";
 import { highlightLanguageForPath } from "../lang/registry.ts";
 import { rustVisibility } from "../lang/rust.ts";
+import { canonicalScopeKey } from "./keys.ts";
 import type { FileDefinitionKind, TreeNode } from "../types.ts";
 import type {
   DefinitionBinding,
@@ -498,17 +499,6 @@ function pushName(table: NameTable, key: string, definitionKey: string): void {
   const existing = table.get(key);
   if (existing) existing.push(definitionKey);
   else table.set(key, [definitionKey]);
-}
-
-/** `JSON.stringify([path, kind, qualifiedName, 0])` for a repeated namespace/module block. */
-function canonicalScopeKey(scopeKey: string): string {
-  try {
-    const parts = JSON.parse(scopeKey) as unknown;
-    if (!Array.isArray(parts) || parts.length !== 4) return scopeKey;
-    return JSON.stringify([parts[0], parts[1], parts[2], 0]);
-  } catch {
-    return scopeKey;
-  }
 }
 
 type FileScopes = {
