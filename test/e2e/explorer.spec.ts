@@ -956,6 +956,7 @@ test("tree labels select UML targets while chevrons only change expansion", asyn
     await expect(rootRow).toHaveAttribute("data-definition-key", rootKey);
     await rootRow.click();
     await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    await expect(page.locator("#dsl-content")).toContainText("direction TB");
     await expect(rootRow).toHaveAttribute("aria-current", "true");
     await expect(definitionRow(page, "feature/root.ts", "Isolated"))
       .not.toHaveAttribute("aria-current", "true");
