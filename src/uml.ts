@@ -118,12 +118,11 @@ export function extractFileUmlGraph(
     }
     const nominal = buildNominalModel(scopePath, definitions, index);
     const references = collectFileReferences(scopePath, parsed.root, definitions, index);
-    const entityIds = new Set(nominal.entities.map((entity) => entity.id));
     const contributed = new Map<string, { name: string; entity: boolean }>();
     for (const entry of definitions) {
       contributed.set(entry.definition.key, {
         name: entry.definition.qualifiedName,
-        entity: entityIds.has(entry.definition.key),
+        entity: false,
       });
     }
     for (const entity of nominal.entities) {
