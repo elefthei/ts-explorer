@@ -1575,14 +1575,6 @@ export class Preprocessor {
     return waiter.promise;
   }
   
-  private readPriorityDiagram(
-    generation: GenerationState,
-    request: DiagramRequest,
-    onJobs?: (jobs: readonly QueueJob[]) => void,
-  ): Promise<DiagramPayload> {
-    return this.readSelection(generation, request, onJobs);
-  }
-  
   private async readAcrossGenerations<Value>(
     readActive: (generationId: number) => Promise<Value>,
     readBuilding: (generation: GenerationState) => Promise<Value>,
@@ -1715,7 +1707,7 @@ export class Preprocessor {
               await generation.definitionsIndexed.promise;
               this.assertGenerationUsable(generation);
               const diagramRequest = await this.priorityDiagramRequest(generation.id, request.resource);
-              return this.readPriorityDiagram(generation, diagramRequest, (jobs) => {
+              return this.readSelection(generation, diagramRequest, (jobs) => {
                 if (request.bindingToken !== bindingToken) return;
                 request.jobs = new Set(jobs);
                 this.refreshPriorityStatus(request);
