@@ -1,153 +1,271 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
 import { firstAncestor, namedChildren } from "../lang/ast.ts";
-import { rustBodyMethods, rustImplTargetName, rustTypeBaseName } from "../lang/rust.ts";
-import type { UmlExternalUserKind } from "../types.ts";
-import { formatSignatureType } from "./mermaid.ts";
+import type { UmlRelationKind } from "../diagram-graph.ts";
+import type { DefinitionBindingSpace, DefinitionBindingTarget } from "./model.ts";
+import type { ReferenceContext, UmlReferenceEdge } from "./usage.ts";
 
-export type RustReferenceOwner = {
-  signature: string;
-  kind: UmlExternalUserKind;
-  source: Node;
-  ownerName?: string;
+const RUST_SKIPPED_SUBTREES: Record<string, true> = {
+  use_declaration: true,
+  attribute_item: true,
+  inner_attribute_item: true,
+  line_comment: true,
+  block_comment: true,
 };
 
-const RUST_OWNER_TYPES: ReadonlySet<string> = new Set([
-  "field_declaration",
-  "function_item",
-  "function_signature_item",
-  "const_item",
-  "static_item",
-  "type_item",
-  "impl_item",
-  "trait_item",
-  "struct_item",
-  "union_item",
-  "enum_item",
-  "macro_definition",
-]);
+const RUST_DECLARATION_NAME_PARENTS: Record<string, true> = {
+  struct_item: true,
+  union_item: true,
+  enum_item: true,
+  trait_item: true,
+  type_item: true,
+  mod_item: true,
+  function_item: true,
+  function_signature_item: true,
+  const_item: true,
+  static_item: true,
+  field_declaration: true,
+  enum_variant: true,
+  type_parameter: true,
+  associated_type: true,
+  macro_definition: true,
+  let_declaration: true,
+  parameter: true,
+  closure_parameter: true,
+};
 
-function parameterTypes(node: Node): string {
-  const parameters = node.childForFieldName("parameters");
-  if (!parameters) return "";
-  return namedChildren(parameters)
-    .map((parameter) => {
-      if (parameter.type === "self_parameter") return parameter.text;
-      return formatSignatureType(parameter.childForFieldName("type")?.text);
-    })
-    .join(", ");
-}
+type RustScopeFrame = { values: Set<string>; types: Set<string> };
 
-function implLabel(node: Node): string {
-  const target = rustImplTargetName(node) ?? "?";
-  const trait = node.childForFieldName("trait");
-  return trait ? `impl ${rustTypeBaseName(trait).text} for ${target}` : `impl ${target}`;
-}
-
-/**
- * Who "uses" a Rust reference: the nearest enclosing member, or the file-scope item that becomes a
- * local-user node. `ownerName` is the bare name of the entity that owns the member, when there is
- * one; the caller maps it to an entity id exactly as the TypeScript classifier's owner does.
- */
-export function classifyRustReferenceOwner(reference: Node): RustReferenceOwner | undefined {
-  const owner = firstAncestor(reference, (candidate) => RUST_OWNER_TYPES.has(candidate.type));
-  if (!owner) return undefined;
-
-  if (owner.type === "field_declaration") {
-    const parent = firstAncestor(owner, (candidate) =>
-      candidate.type === "struct_item" || candidate.type === "union_item");
-    const ownerName = parent ? parent.childForFieldName("name")?.text : undefined;
-    const nameNode = owner.childForFieldName("name");
-    if (!ownerName || !nameNode) return undefined;
-    return {
-      signature: `${ownerName}.${nameNode.text}: ${
-        formatSignatureType(owner.childForFieldName("type")?.text)
-      }`,
-      kind: "property",
-      source: nameNode,
-      ownerName,
-    };
+function collectRustPatternNames(pattern: Node, out: Set<string>): void {
+  if (pattern.type === "identifier") {
+    out.add(pattern.text);
+    return;
   }
+  for (const child of namedChildren(pattern)) collectRustPatternNames(child, out);
+}
 
-  if (owner.type === "function_item" || owner.type === "function_signature_item") {
-    const nameNode = owner.childForFieldName("name");
-    if (!nameNode) return undefined;
-    const container = firstAncestor(owner, (candidate) =>
-      candidate.type === "trait_item" || candidate.type === "impl_item");
-    if (!container) {
-      return {
-        signature: `${nameNode.text}(${parameterTypes(owner)})`,
-        kind: "function",
-        source: nameNode,
-      };
+function rustScopeFrame(node: Node): RustScopeFrame | undefined {
+  const values = new Set<string>();
+  const types = new Set<string>();
+  const typeParameters = node.childForFieldName("type_parameters");
+  for (const parameter of typeParameters ? namedChildren(typeParameters) : []) {
+    if (parameter.type === "type_identifier") types.add(parameter.text);
+    else {
+      const name = parameter.childForFieldName("name")?.text;
+      if (name) types.add(name);
     }
-    const ownerName = container.type === "trait_item"
-      ? container.childForFieldName("name")?.text
-      : rustImplTargetName(container);
-    if (ownerName === undefined) return undefined;
-    return {
-      signature: `${ownerName}.${nameNode.text}(${parameterTypes(owner)})`,
-      kind: "method",
-      source: nameNode,
-      ownerName,
-    };
   }
-
-  if (owner.type === "impl_item") {
-    // When the target is an entity in the same file the caller resolves `ownerName` and the
-    // reference becomes an entity-to-entity edge; otherwise the impl block itself is a local user.
-    const ownerName = rustImplTargetName(owner);
-    return {
-      signature: implLabel(owner),
-      kind: "type",
-      source: owner.child(0) ?? owner,
-      ...(ownerName === undefined ? {} : { ownerName }),
-    };
+  if (node.type === "function_item" || node.type === "function_signature_item") {
+    const parameters = node.childForFieldName("parameters");
+    for (const parameter of parameters ? namedChildren(parameters) : []) {
+      const pattern = parameter.childForFieldName("pattern");
+      if (pattern) collectRustPatternNames(pattern, values);
+    }
+  } else if (node.type === "closure_expression") {
+    const parameters = node.childForFieldName("parameters");
+    for (const parameter of parameters ? namedChildren(parameters) : []) {
+      collectRustPatternNames(parameter, values);
+    }
+  } else if (node.type === "block") {
+    for (const statement of namedChildren(node)) {
+      if (statement.type !== "let_declaration") continue;
+      const pattern = statement.childForFieldName("pattern");
+      if (pattern) collectRustPatternNames(pattern, values);
+    }
+  } else if (node.type === "for_expression") {
+    const pattern = node.childForFieldName("pattern");
+    if (pattern) collectRustPatternNames(pattern, values);
   }
-
-  const nameNode = owner.childForFieldName("name");
-  if (!nameNode) return undefined;
-  if (owner.type === "const_item" || owner.type === "static_item") {
-    return {
-      signature: `${nameNode.text}: ${
-        formatSignatureType(owner.childForFieldName("type")?.text)
-      }`,
-      kind: "variable",
-      source: nameNode,
-    };
-  }
-  if (owner.type === "type_item" || owner.type === "macro_definition") {
-    return { signature: nameNode.text, kind: "type", source: nameNode };
-  }
-  // A reference in a `struct`/`trait`/`enum` header (generic bounds, supertraits) belongs to the
-  // entity itself, which `analyzeUmlTypes` turns into an entity-to-entity usage edge.
-  return {
-    signature: nameNode.text,
-    kind: "class",
-    source: nameNode,
-    ownerName: nameNode.text,
-  };
+  return values.size || types.size ? { values, types } : undefined;
 }
 
-/** Return-type annotations of every method a Rust entity owns, keyed by the entity's bare name. */
-export function rustMethodReturnAnnotations(
-  items: readonly Node[],
-): { ownerName: string; annotation: Node }[] {
-  const result: { ownerName: string; annotation: Node }[] = [];
-  const collect = (ownerName: string, body: Node | null | undefined): void => {
-    for (const member of rustBodyMethods(body)) {
-      const annotation = member.childForFieldName("return_type");
-      if (annotation) result.push({ ownerName, annotation });
-    }
-  };
-  for (const item of items) {
-    if (item.type === "trait_item") {
-      const name = item.childForFieldName("name")?.text;
-      if (name !== undefined) collect(name, item.childForFieldName("body"));
+function rustShadowed(
+  frames: readonly RustScopeFrame[],
+  name: string,
+  space: DefinitionBindingSpace,
+): boolean {
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    if (!frame) continue;
+    if (space === "value" ? frame.values.has(name) : frame.types.has(name)) return true;
+  }
+  return false;
+}
+
+function rustIsUsage(node: Node): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (parent.type === "field_expression") return parent.childForFieldName("field")?.id !== node.id;
+  if (parent.type === "scoped_type_identifier" || parent.type === "scoped_identifier") return false;
+  if (parent.type === "attribute" || parent.type === "lifetime") return false;
+  if (RUST_DECLARATION_NAME_PARENTS[parent.type] === true) {
+    if (parent.childForFieldName("name")?.id === node.id) return false;
+    if (parent.childForFieldName("pattern")?.id === node.id) return false;
+  }
+  return true;
+}
+
+/** Bare name of a possibly generic/reference/scoped type node. */
+function rustBareTypeName(node: Node): string | undefined {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current.type === "generic_type" || current.type === "reference_type") {
+      current = current.childForFieldName("type") ?? undefined;
       continue;
     }
-    if (item.type !== "impl_item") continue;
-    const name = rustImplTargetName(item);
-    if (name !== undefined) collect(name, item.childForFieldName("body"));
+    if (current.type === "scoped_type_identifier" || current.type === "scoped_identifier") {
+      current = current.childForFieldName("name") ?? undefined;
+      continue;
+    }
+    return current.text || undefined;
   }
-  return result;
+  return undefined;
+}
+
+function rustRelationKind(node: Node): UmlRelationKind {
+  const bounds = firstAncestor(node, (candidate) => candidate.type === "trait_bounds");
+  return bounds?.parent?.type === "trait_item" ? "extends" : "references";
+}
+
+type RustVisitState = {
+  context: ReferenceContext;
+  frames: RustScopeFrame[];
+  implOwner: string | undefined;
+  /** `impl` header nodes already consumed as heritage; they are not generic references too. */
+  skipped: Set<number>;
+};
+
+function ownersAt(state: RustVisitState, node: Node): readonly string[] {
+  const owners = state.context.ownersOf(node);
+  if (owners.length) return owners;
+  return state.implOwner === undefined ? [] : [state.implOwner];
+}
+
+function rustReceiverTargets(
+  state: RustVisitState,
+  node: Node,
+  chain: readonly string[],
+): DefinitionBindingTarget[] {
+  if (node.type === "self" || node.text === "Self") {
+    const owner = state.implOwner ?? state.context.enclosingNominal(node);
+    return owner === undefined ? [] : [{ kind: "definition", key: owner }];
+  }
+  if (node.type === "identifier" || node.type === "type_identifier") {
+    if (rustShadowed(state.frames, node.text, "value") && rustShadowed(state.frames, node.text, "type")) {
+      return [];
+    }
+    const types = state.context.resolveName(node.text, "type", chain);
+    if (types.length) return types;
+    return state.context.resolveName(node.text, "value", chain);
+  }
+  if (node.type === "scoped_identifier" || node.type === "scoped_type_identifier") {
+    const path = node.childForFieldName("path");
+    const name = node.childForFieldName("name");
+    if (!path || !name) return [];
+    const receivers = rustReceiverTargets(state, path, chain);
+    const keys = new Set<string>();
+    for (const receiver of receivers) {
+      for (const space of ["type", "value"] as const) {
+        for (const key of state.context.resolveMember(receiver, name.text, space)) keys.add(key);
+      }
+    }
+    return [...keys].map((key) => ({ kind: "definition", key } as const));
+  }
+  if (node.type === "field_expression") {
+    const value = node.childForFieldName("value");
+    const field = node.childForFieldName("field");
+    if (!value || !field) return [];
+    const receivers = rustReceiverTargets(state, value, chain);
+    const keys = new Set<string>();
+    for (const receiver of receivers) {
+      for (const key of state.context.resolveMember(receiver, field.text, "value")) keys.add(key);
+    }
+    return [...keys].map((key) => ({ kind: "definition", key } as const));
+  }
+  return [];
+}
+
+function visitRust(state: RustVisitState, node: Node): void {
+  if (RUST_SKIPPED_SUBTREES[node.type] === true || state.skipped.has(node.id)) return;
+  const frame = rustScopeFrame(node);
+  if (frame) state.frames.push(frame);
+  const previousImplOwner = state.implOwner;
+  try {
+    if (node.type === "impl_item") {
+      const targetNode = node.childForFieldName("type");
+      const targetName = targetNode ? rustBareTypeName(targetNode) : undefined;
+      const resolved = targetName === undefined
+        ? []
+        : state.context.resolveName(targetName, "type", [""]);
+      const owner = resolved.find((entry) => entry.kind === "definition");
+      state.implOwner = owner?.kind === "definition" ? owner.key : undefined;
+      if (targetNode) state.skipped.add(targetNode.id);
+      const traitNode = node.childForFieldName("trait");
+      if (traitNode) state.skipped.add(traitNode.id);
+      if (traitNode && state.implOwner !== undefined) {
+        const traitName = rustBareTypeName(traitNode);
+        const traitTargets = traitName === undefined
+          ? []
+          : state.context.resolveName(traitName, "type", [""]);
+        for (const target of traitTargets) {
+          if (target.kind === "definition") state.context.add([state.implOwner], target.key, "implements");
+        }
+      }
+    }
+    const owners = ownersAt(state, node);
+    const chain = state.context.scopeChain(owners[0]);
+    if (node.type === "scoped_type_identifier" || node.type === "scoped_identifier") {
+      const path = node.childForFieldName("path");
+      const name = node.childForFieldName("name");
+      if (path && name && owners.length) {
+        const receivers = rustReceiverTargets(state, path, chain);
+        const keys = new Set<string>();
+        for (const receiver of receivers) {
+          for (const space of ["type", "value"] as const) {
+            for (const key of state.context.resolveMember(receiver, name.text, space)) keys.add(key);
+          }
+        }
+        if (keys.size) {
+          const kind = rustRelationKind(node);
+          for (const key of keys) state.context.add(owners, key, kind);
+          return;
+        }
+        // An unresolved qualifier still lets its leading name resolve on its own.
+      }
+    }
+    if (node.type === "field_expression") {
+      const value = node.childForFieldName("value");
+      const field = node.childForFieldName("field");
+      if (value && field && owners.length) {
+        const receivers = rustReceiverTargets(state, value, chain);
+        const keys = new Set<string>();
+        for (const receiver of receivers) {
+          for (const key of state.context.resolveMember(receiver, field.text, "value")) keys.add(key);
+        }
+        for (const key of keys) state.context.add(owners, key, "references");
+        if (value.type !== "identifier" && value.type !== "self") visitRust(state, value);
+        return;
+      }
+    }
+    if (node.type === "type_identifier" || node.type === "identifier") {
+      if (rustIsUsage(node) && owners.length) {
+        const kind = rustRelationKind(node);
+        for (const space of ["type", "value"] as const) {
+          if (rustShadowed(state.frames, node.text, space)) continue;
+          for (const target of state.context.resolveName(node.text, space, chain)) {
+            if (target.kind === "definition") state.context.add(owners, target.key, kind);
+          }
+        }
+      }
+      return;
+    }
+    for (const child of namedChildren(node)) visitRust(state, child);
+  } finally {
+    state.implOwner = previousImplOwner;
+    if (frame) state.frames.pop();
+  }
+}
+
+export function collectRustReferences(context: ReferenceContext, root: Node): UmlReferenceEdge[] {
+  visitRust({ context, frames: [], implOwner: undefined, skipped: new Set() }, root);
+  return context.result();
 }

@@ -12,9 +12,11 @@ import {
   type PreprocessResultMap,
   type PreprocessScope,
 } from "./preprocess-protocol.ts";
+import type { DiagramReadResult } from "./preprocess-protocol.ts";
 import type {
-  DiagramKind,
   DiagramPayload,
+  DiagramRequest,
+  FileDefinition,
   FileResponse,
   GotoDefinition,
   PackageInfo,
@@ -39,9 +41,9 @@ type SlotState = "new" | "initializing" | "idle" | "busy" | "dead" | "closing" |
 const CACHEABLE_REQUEST_TYPES: Partial<Record<RequestType, true>> = {
   "read-tree": true,
   "read-packages": true,
-  "read-diagram": true,
   "read-file": true,
   "read-definition": true,
+  "read-file-definitions": true,
   "lookup-definition": true,
 };
 
@@ -90,7 +92,16 @@ interface GenerationState {
   readonly id: number;
   readonly cause: PreprocessCause;
   readonly promoted: Deferred<void>;
+  /**
+   * Resolves once this generation's definition index is written. The file outline waits only on
+   * this, never on whole-project UML promotion.
+   */
+  readonly definitionsIndexed: Deferred<void>;
   readonly discovered: Deferred<readonly PackageInfo[]>;
+  /** Set before `definitionsIndexed` resolves; a rejected deferred must not look complete. */
+  definitionsIndexComplete: boolean;
+  /** Background traversal is seeded exactly once, after discovery and index both succeed. */
+  traversalSeeded: boolean;
   readonly scopes: Map<string, ScopeRecord>;
   readonly scopeWaiters: Map<string, Deferred<ScopeRecord>[]>;
   packages: PackageInfo[];
@@ -108,7 +119,8 @@ interface PriorityRequest {
   status: PreprocessPriorityStatus;
   bindingToken: number;
   generationId?: number;
-  job?: QueueJob;
+  /** Every job the selection currently needs; reprioritizing moves all of them. */
+  jobs: Set<QueueJob>;
   error?: Error;
 }
 
@@ -171,6 +183,21 @@ function findTreeKind(tree: TreeNode, path: string): "directory" | "file" | unde
     if (node.children) stack.push(...node.children);
   }
   return undefined;
+}
+
+/** Canonical request identity; a definition root is part of the dedupe key, never the path alone. */
+function normalizeDiagramRequest(request: DiagramRequest): DiagramRequest {
+  if (request.kind === "packages") return { kind: "packages", scopePath: "" };
+  const target = request.target;
+  const path = normalizeRelativePath(target.path);
+  if (target.kind === "directory") return { kind: "uml", target: { kind: "directory", path } };
+  if (!path) throw new PreprocessorError("INVALID_INPUT", "path is required");
+  if (target.kind === "file") return { kind: "uml", target: { kind: "file", path } };
+  if (!target.definitionKey) throw new PreprocessorError("INVALID_INPUT", "definition is required");
+  return {
+    kind: "uml",
+    target: { kind: "definition", path, definitionKey: target.definitionKey },
+  };
 }
 
 function processCountOrDefault(value: number | undefined): number {
@@ -253,26 +280,100 @@ export class Preprocessor {
     );
   }
   
-  public getDiagram(
-    kind: DiagramKind,
-    scopePath: string,
-  ): Promise<DiagramPayload> {
-    let normalizedScopePath: string;
+  public getDiagram(request: DiagramRequest): Promise<DiagramPayload> {
+    let normalized: DiagramRequest;
     try {
-      normalizedScopePath = normalizeRelativePath(scopePath);
+      normalized = normalizeDiagramRequest(request);
     } catch (error) {
       return Promise.reject(error);
     }
+    // One repair rebuild per diagram request, never per retry of the same read.
+    const repair = { used: false };
     return this.dedupe(
-      `read-diagram:${kind}:${normalizedScopePath}`,
+      `read-diagram:${JSON.stringify(normalized)}`,
       () => this.readAcrossGenerations(
-        (generationId) => this.enqueueCachedRequest<"read-diagram">(
-          { type: "read-diagram", generationId, kind, scopePath: normalizedScopePath },
-          "interactive",
-        ),
-        (generation) => this.readPriorityDiagram(generation, kind, normalizedScopePath),
+        (generationId) => this.readActiveDiagram(generationId, normalized, repair),
+        (generation) => this.readSelection(generation, normalized),
       ),
     );
+  }
+
+  /** A SQL-only probe; only a complete response is worth caching. */
+  private async readDiagramOnce(
+    generationId: number,
+    request: DiagramRequest,
+    generation?: GenerationState,
+  ): Promise<DiagramReadResult> {
+    const key = JSON.stringify(["read-diagram", generationId, request]);
+    const cached = this.ipcCache.get(key);
+    if (cached !== undefined) return cached as DiagramReadResult;
+    const value = await this.enqueueRequest<"read-diagram">(
+      { type: "read-diagram", generationId, request },
+      "interactive",
+      generation?.id,
+    ).promise;
+    if (value.state === "complete") this.ipcCache.set(key, value);
+    return value;
+  }
+
+  private async readActiveDiagram(
+    generationId: number,
+    request: DiagramRequest,
+    repair: { used: boolean },
+  ): Promise<DiagramPayload> {
+    const result = await this.readDiagramOnce(generationId, request);
+    if (result.state === "complete") return result.diagram;
+    if (repair.used) {
+      throw new PreprocessorError("INTERNAL", "UML cache remains incomplete after rebuild");
+    }
+    repair.used = true;
+    this.rebuild("watch");
+    await this.awaitBuildingGeneration();
+    throw new PreprocessorError("NOT_FOUND", "diagram is not cached in the active generation");
+  }
+
+  private assertGenerationUsable(generation: GenerationState): void {
+    if (generation.superseded) throw new SupersededGenerationError();
+    if (generation.failed) {
+      throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
+    }
+  }
+
+  /**
+   * Reads the selection from SQL, schedules exactly the missing owner/dependency files, and
+   * re-reads until the closure is complete. Unrelated scopes and promotion are never awaited.
+   */
+  private async readSelection(
+    generation: GenerationState,
+    request: DiagramRequest,
+    onJobs?: (jobs: readonly QueueJob[]) => void,
+  ): Promise<DiagramPayload> {
+    await generation.discovered.promise;
+    if (request.kind === "packages") {
+      const result = await this.readDiagramOnce(generation.id, request, generation);
+      if (result.state === "complete") return result.diagram;
+      throw new PreprocessorError("INTERNAL", "package diagram is not cached");
+    }
+    await generation.definitionsIndexed.promise;
+    this.assertGenerationUsable(generation);
+    const requested = new Set<string>();
+    for (;;) {
+      const result = await this.readDiagramOnce(generation.id, request, generation);
+      if (result.state === "complete") return result.diagram;
+      if (result.files.every((file) => requested.has(file))) {
+        throw new PreprocessorError(
+          "INTERNAL",
+          `preprocessed scope is still missing its diagram: ${result.files.join(", ")}`,
+        );
+      }
+      for (const file of result.files) requested.add(file);
+      const records = result.files.map((file) =>
+        this.enqueueScope(generation, { path: file, kind: "file" }, "interactive", false)
+      );
+      onJobs?.(records.map((record) => record.job));
+      await Promise.all(records.map((record) => record.promise));
+      this.assertGenerationUsable(generation);
+    }
   }
   
   public readFile(
@@ -321,6 +422,44 @@ export class Preprocessor {
     return this.dedupe(
       `read-definition:${normalizedPath}:${location.line}:${location.column}`,
       () => this.readDefinitionAcrossGenerations(normalizedPath, location),
+    );
+  }
+
+  public getFileDefinitions(relativePath: string): Promise<FileDefinition[]> {
+    let path: string;
+    try {
+      path = normalizeRelativePath(relativePath);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!path) {
+      return Promise.reject(new PreprocessorError("INVALID_INPUT", "path is required"));
+    }
+    return this.dedupe(
+      `read-file-definitions:${path}`,
+      () => this.readAcrossGenerations(
+        (generationId) => this.enqueueCachedRequest<"read-file-definitions">(
+          { type: "read-file-definitions", generationId, path },
+          "interactive",
+        ),
+        (generation) => this.readBuildingFileDefinitions(generation, path),
+      ),
+    );
+  }
+
+  /**
+   * The definition index is immutable once written, so the outline of a building generation is
+   * readable as soon as that one job lands — long before its UML scopes are preprocessed.
+   */
+  private async readBuildingFileDefinitions(
+    generation: GenerationState,
+    path: string,
+  ): Promise<FileDefinition[]> {
+    await generation.definitionsIndexed.promise;
+    return this.enqueueCachedRequest<"read-file-definitions">(
+      { type: "read-file-definitions", generationId: generation.id, path },
+      "interactive",
+      generation.id,
     );
   }
   
@@ -373,7 +512,7 @@ export class Preprocessor {
     if (request.error || request.status === "done") return;
     if (error) request.error = error;
     else request.status = "done";
-    request.job = undefined;
+    request.jobs.clear();
     if (this.priorityRequestByResource.get(request.resource) === request) {
       this.priorityRequestByResource.delete(request.resource);
     }
@@ -382,29 +521,28 @@ export class Preprocessor {
   private resetPriorityBinding(request: PriorityRequest): number {
     request.bindingToken += 1;
     request.generationId = undefined;
-    request.job = undefined;
+    request.jobs.clear();
     request.status = "queued";
     return request.bindingToken;
   }
-  
-  private bindPriorityJob(
-    request: PriorityRequest,
-    bindingToken: number,
-    generationId: number,
-    job: QueueJob,
-  ): boolean {
-    if (request.bindingToken !== bindingToken || this.isTerminalPriorityRequest(request)) return false;
-    request.generationId = generationId;
-    request.job = job;
-    if (!job.cancelled && (job.state === "queued" || job.state === "processing")) {
-      request.status = job.state;
+
+  /** Processing while any required job runs, queued otherwise; done only once the read lands. */
+  private refreshPriorityStatus(request: PriorityRequest): void {
+    if (this.isTerminalPriorityRequest(request)) return;
+    let status: PreprocessPriorityStatus = "queued";
+    for (const job of request.jobs) {
+      if (job.cancelled) continue;
+      if (job.state === "processing") {
+        status = "processing";
+        break;
+      }
     }
-    return true;
+    request.status = status;
   }
-  
+
   private resetPriorityRequestsForJob(job: QueueJob): void {
     for (const request of this.priorityRequests.values()) {
-      if (request.job === job && !this.isTerminalPriorityRequest(request)) {
+      if (request.jobs.has(job) && !this.isTerminalPriorityRequest(request)) {
         request.status = "queued";
       }
     }
@@ -973,6 +1111,7 @@ export class Preprocessor {
     this.rejectScopeWaiters(generation, cause);
     generation.discovered.reject(cause);
     generation.promoted.reject(cause);
+    generation.definitionsIndexed.reject(cause);
     if (this.building === generation) {
       this.building = undefined;
       this.buildingSignal = createDeferred<void>();
@@ -1028,7 +1167,6 @@ export class Preprocessor {
         generationId: generation.id,
         cause: generation.cause,
         scope,
-        packages: generation.packages,
       },
       priority,
       generation.id,
@@ -1046,8 +1184,21 @@ export class Preprocessor {
     return record;
   }
   
-  private seedTraversal(generation: GenerationState, packages: readonly PackageInfo[]): void {
-    for (const pkg of packages) {
+  /**
+   * Background traversal needs both the published catalogue and package discovery. Both success
+   * callbacks call this synchronously, inside their tracked mutation, so promotion can never
+   * overtake the traversal it depends on.
+   */
+  private seedTraversalIfReady(generation: GenerationState): void {
+    if (
+      generation.traversalSeeded
+      || generation.superseded
+      || generation.failed
+      || !generation.discoveryComplete
+      || !generation.definitionsIndexComplete
+    ) return;
+    generation.traversalSeeded = true;
+    for (const pkg of generation.packages) {
       this.enqueueScope(generation, { path: pkg.path, kind: "package" }, "background", true);
     }
     this.enqueueScope(generation, { path: "", kind: "directory" }, "background", true);
@@ -1074,6 +1225,7 @@ export class Preprocessor {
       generation.failed ||
       generation.promotionScheduled ||
       !generation.discoveryComplete ||
+      !generation.traversalSeeded ||
       generation.pendingMutations !== 0
     ) return;
   
@@ -1110,11 +1262,14 @@ export class Preprocessor {
       id: result.generationId,
       cause,
       promoted: createDeferred<void>(),
+      definitionsIndexed: createDeferred<void>(),
       discovered: createDeferred<readonly PackageInfo[]>(),
       scopes: new Map(),
       scopeWaiters: new Map(),
       packages: [],
       pendingMutations: 0,
+      definitionsIndexComplete: false,
+      traversalSeeded: false,
       discoveryComplete: false,
       promotionScheduled: false,
       superseded: false,
@@ -1129,7 +1284,15 @@ export class Preprocessor {
       "background",
       generation.id,
     ).promise;
-    this.trackGenerationMutation(generation, definitionIndex);
+    this.trackGenerationMutation(
+      generation,
+      definitionIndex,
+      () => {
+        generation.definitionsIndexComplete = true;
+        generation.definitionsIndexed.resolve(undefined);
+        this.seedTraversalIfReady(generation);
+      },
+    );
     const discovery = this.enqueueRequest<"discover-packages">(
       { type: "discover-packages", generationId: generation.id },
       "background",
@@ -1143,7 +1306,7 @@ export class Preprocessor {
       generation.packages = packages;
       generation.discoveryComplete = true;
       generation.discovered.resolve(packages);
-      this.seedTraversal(generation, packages);
+      this.seedTraversalIfReady(generation);
     });
     return generation;
   }
@@ -1159,6 +1322,7 @@ export class Preprocessor {
     this.rejectScopeWaiters(generation, error);
     generation.discovered.reject(error);
     generation.promoted.reject(error);
+    generation.definitionsIndexed.reject(error);
     if (this.building === generation) {
       this.building = undefined;
       this.buildingSignal = createDeferred<void>();
@@ -1343,13 +1507,17 @@ export class Preprocessor {
     throw this.closedError();
   }
   
-  private async inferBuildingScopeKind(path: string): Promise<"directory" | "file" | undefined> {
+  /** Infers a path's kind from the same generation's indexed tree, never from an older one. */
+  private async inferScopeKind(
+    generationId: number,
+    path: string,
+  ): Promise<"directory" | "file" | undefined> {
     if (path === "") return "directory";
-    if (this.activeGenerationId === null) return undefined;
     try {
       const tree = await this.enqueueCachedRequest<"read-tree">(
-        { type: "read-tree", generationId: this.activeGenerationId },
+        { type: "read-tree", generationId },
         "interactive",
+        generationId,
       );
       return findTreeKind(tree, path);
     } catch {
@@ -1363,6 +1531,8 @@ export class Preprocessor {
     knownKind?: "directory" | "file",
   ): Promise<ScopeRecord | undefined> {
     await generation.discovered.promise;
+    // Every interactive scope needs the catalogue, not just background traversal.
+    await generation.definitionsIndexed.promise;
     if (generation.superseded) throw new SupersededGenerationError();
     if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
   
@@ -1377,7 +1547,7 @@ export class Preprocessor {
       return undefined;
     }
   
-    const inferred = knownKind ?? await this.inferBuildingScopeKind(path);
+    const inferred = knownKind ?? await this.inferScopeKind(generation.id, path);
     if (generation.superseded) throw new SupersededGenerationError();
     if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
     const discoveredWhileInferring = generation.scopes.get(path);
@@ -1405,22 +1575,12 @@ export class Preprocessor {
     return waiter.promise;
   }
   
-  private async readPriorityDiagram(
+  private readPriorityDiagram(
     generation: GenerationState,
-    kind: DiagramKind,
-    scopePath: string,
+    request: DiagramRequest,
+    onJobs?: (jobs: readonly QueueJob[]) => void,
   ): Promise<DiagramPayload> {
-    if (kind === "packages") {
-      await generation.discovered.promise;
-    } else {
-      const record = await this.prioritizeScope(generation, scopePath);
-      if (record) await record.promise;
-    }
-    return this.enqueueCachedRequest<"read-diagram">(
-      { type: "read-diagram", generationId: generation.id, kind, scopePath },
-      "interactive",
-      generation.id,
-    );
+    return this.readSelection(generation, request, onJobs);
   }
   
   private async readAcrossGenerations<Value>(
@@ -1518,163 +1678,52 @@ export class Preprocessor {
     throw this.closedError();
   }
   
-  private activePrioritySelectionIsCurrent(
-    request: PriorityRequest,
-    bindingToken: number,
+  /** Maps a path resource to its typed selection using the same generation's indexed tree. */
+  private async priorityDiagramRequest(
     generationId: number,
-  ): boolean {
-    if (
-      request.bindingToken !== bindingToken ||
-      this.watchRebuilding ||
-      this.activeGenerationId !== generationId
-    ) return false;
-    const generation = this.generations.get(generationId);
-    return !generation || (!generation.superseded && !generation.failed);
+    resource: string,
+  ): Promise<DiagramRequest> {
+    const kind = await this.inferScopeKind(generationId, resource);
+    if (kind === undefined) {
+      throw new PreprocessorError("NOT_FOUND", `path not found: ${resource}`);
+    }
+    return kind === "directory"
+      ? { kind: "uml", target: { kind: "directory", path: resource } }
+      : { kind: "uml", target: { kind: "file", path: resource } };
   }
-  
-  private buildingPrioritySelectionIsCurrent(
-    request: PriorityRequest,
-    bindingToken: number,
-    generation: GenerationState,
-    fallbackActiveGenerationId: number | null,
-  ): boolean {
-    if (
-      request.bindingToken !== bindingToken ||
-      generation.superseded ||
-      generation.failed
-    ) return false;
-    if (this.watchRebuilding) return this.building === generation;
-    if (this.activeGenerationId === generation.id) return true;
-    return this.activeGenerationId === fallbackActiveGenerationId && this.building === generation;
-  }
-  
-  private async processPriorityGeneration(
-    request: PriorityRequest,
-    bindingToken: number,
-    generation: GenerationState,
-    fallbackActiveGenerationId: number | null,
-  ): Promise<boolean> {
-    request.generationId = generation.id;
-    request.job = undefined;
-    request.status = "queued";
-    const scope = await this.prioritizeScope(generation, request.resource);
-    if (
-      !this.buildingPrioritySelectionIsCurrent(
-        request,
-        bindingToken,
-        generation,
-        fallbackActiveGenerationId,
-      )
-    ) return false;
-    if (!scope) return false;
-    if (!this.bindPriorityJob(request, bindingToken, generation.id, scope.job)) return false;
-    await scope.promise;
-    if (
-      !this.buildingPrioritySelectionIsCurrent(
-        request,
-        bindingToken,
-        generation,
-        fallbackActiveGenerationId,
-      )
-    ) return false;
-  
-    const read = this.enqueueRequest<"read-diagram">(
-      {
-        type: "read-diagram",
-        generationId: generation.id,
-        kind: "uml",
-        scopePath: request.resource,
-      },
-      "interactive",
-      generation.id,
-    );
-    if (!this.bindPriorityJob(request, bindingToken, generation.id, read.job)) return false;
-    await read.promise;
-    if (
-      !this.buildingPrioritySelectionIsCurrent(
-        request,
-        bindingToken,
-        generation,
-        fallbackActiveGenerationId,
-      )
-    ) return false;
-    this.settlePriorityRequest(request);
-    return true;
-  }
-  
+
   private async controlPriorityRequest(request: PriorityRequest): Promise<void> {
     try {
       await this.readyDeferred.promise;
       while (!this.closed && !this.isTerminalPriorityRequest(request)) {
-        let bindingToken = this.resetPriorityBinding(request);
-  
-        if (this.watchRebuilding) {
-          const generation = await this.awaitBuildingGeneration();
-          if (
-            !this.watchRebuilding ||
-            this.building !== generation ||
-            generation.superseded ||
-            generation.failed ||
-            request.bindingToken !== bindingToken
-          ) continue;
-          try {
-            if (await this.processPriorityGeneration(request, bindingToken, generation, this.activeGenerationId)) return;
-          } catch (error) {
-            if (error instanceof SupersededGenerationError) continue;
-            throw error;
-          }
-          continue;
-        }
-  
-        const selectedGenerationId = this.activeGenerationId;
-        if (selectedGenerationId !== null) {
-          request.generationId = selectedGenerationId;
-          const read = this.enqueueRequest<"read-diagram">(
-            {
-              type: "read-diagram",
-              generationId: selectedGenerationId,
-              kind: "uml",
-              scopePath: request.resource,
-            },
-            "interactive",
-          );
-          if (!this.bindPriorityJob(request, bindingToken, selectedGenerationId, read.job)) continue;
-          try {
-            await read.promise;
-            if (!this.activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
-            this.settlePriorityRequest(request);
-            return;
-          } catch (error) {
-            if (!(error instanceof PreprocessorError) || error.code !== "NOT_FOUND") throw error;
-            if (!this.activePrioritySelectionIsCurrent(request, bindingToken, selectedGenerationId)) continue;
-            const fallback = this.building;
-            if (!fallback) throw error;
-            bindingToken = this.resetPriorityBinding(request);
-            try {
-              if (
-                await this.processPriorityGeneration(
-                  request,
-                  bindingToken,
-                  fallback,
-                  selectedGenerationId,
-                )
-              ) return;
-            } catch (fallbackError) {
-              if (fallbackError instanceof SupersededGenerationError) continue;
-              throw fallbackError;
-            }
-            continue;
-          }
-        }
-  
-        const generation = await this.awaitBuildingGeneration();
-        if (
-          !this.watchRebuilding &&
-          this.activeGenerationId !== null &&
-          this.activeGenerationId !== generation.id
-        ) continue;
+        const bindingToken = this.resetPriorityBinding(request);
         try {
-          if (await this.processPriorityGeneration(request, bindingToken, generation, null)) return;
+          await this.readAcrossGenerations(
+            async (generationId) => {
+              request.generationId = generationId;
+              const diagramRequest = await this.priorityDiagramRequest(generationId, request.resource);
+              const result = await this.readDiagramOnce(generationId, diagramRequest);
+              if (result.state === "complete") return result.diagram;
+              throw new PreprocessorError(
+                "NOT_FOUND",
+                "diagram is not cached in the active generation",
+              );
+            },
+            async (generation) => {
+              request.generationId = generation.id;
+              await generation.discovered.promise;
+              await generation.definitionsIndexed.promise;
+              this.assertGenerationUsable(generation);
+              const diagramRequest = await this.priorityDiagramRequest(generation.id, request.resource);
+              return this.readPriorityDiagram(generation, diagramRequest, (jobs) => {
+                if (request.bindingToken !== bindingToken) return;
+                request.jobs = new Set(jobs);
+                this.refreshPriorityStatus(request);
+              });
+            },
+          );
+          this.settlePriorityRequest(request);
+          return;
         } catch (error) {
           if (error instanceof SupersededGenerationError) continue;
           throw error;
@@ -1686,6 +1735,7 @@ export class Preprocessor {
     }
   }
   
+
   public prioritize(resource: string): Promise<PreprocessPriorityResponse> {
     let normalizedResource: string;
     try {
@@ -1696,15 +1746,8 @@ export class Preprocessor {
   
     const existing = this.priorityRequestByResource.get(normalizedResource);
     if (existing) {
-      if (existing.job) {
-        this.repositionQueuedJob(existing.job);
-        if (
-          !existing.job.cancelled &&
-          (existing.job.state === "queued" || existing.job.state === "processing")
-        ) {
-          existing.status = existing.job.state;
-        }
-      }
+      for (const job of existing.jobs) this.repositionQueuedJob(job);
+      this.refreshPriorityStatus(existing);
       return Promise.resolve(this.prioritySnapshot(existing));
     }
   
@@ -1719,6 +1762,7 @@ export class Preprocessor {
       resource: normalizedResource,
       status: "queued",
       bindingToken: 0,
+      jobs: new Set(),
     };
     this.priorityRequests.set(request.requestId, request);
     this.priorityRequestByResource.set(normalizedResource, request);
@@ -1741,13 +1785,7 @@ export class Preprocessor {
       );
     }
     if (request.error) return Promise.reject(request.error);
-    if (
-      request.job &&
-      !request.job.cancelled &&
-      (request.job.state === "queued" || request.job.state === "processing")
-    ) {
-      request.status = request.job.state;
-    }
+    this.refreshPriorityStatus(request);
     return Promise.resolve(this.prioritySnapshot(request));
   }
   
@@ -1774,6 +1812,7 @@ export class Preprocessor {
     if (this.building) {
       this.building.discovered.reject(error);
       this.building.promoted.reject(error);
+      this.building.definitionsIndexed.reject(error);
       this.rejectScopeWaiters(this.building, error);
     }
     for (const promise of this.queryDedupe.values()) {

@@ -1,986 +1,428 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import type { UmlDiagramGraph } from "../src/diagram-graph.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { extractContract, extractNormalizedGraph } from "./support/uml-contract.ts";
+import { expectFileGraphRoundTrips } from "./support/normalized-graph.ts";
+import {
+  expectCatalogueRows,
+  expectNormalizedGraphRows,
+  readNormalizedGraphSnapshot,
+} from "./support/normalized-sql.ts";
+import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
+
+/**
+ * One source file's persisted UML graph is the unit the whole rooted design is built on: every
+ * node is a catalogue definition key, every edge is directed, and the `diagrams` row carries only
+ * a completion marker. These tests pin that per-file contract, not any assembled selection.
+ */
+
+const SCRIPT_FILES: Record<string, string> = {
+  "base.ts": `export abstract class Base {
+  id = 0;
+}
+export interface Marker {
+  tag: string;
+}
+`,
+  "root.ts": `import { Base, Marker } from "./base.ts";
+export class Root extends Base implements Marker {
+  tag = "root";
+  peer?: Base;
+  run(value: Marker): Base {
+    return this;
+  }
+}
+export function helper(value: Root): number {
+  return value.id;
+}
+export const answer: number = 42;
+export enum Mode {
+  Idle,
+  Busy,
+}
+export type Alias = Root;
+`,
+  // The generic bound and the heritage clause are two references from one owner to one target.
+  "derived.ts": `import { Base } from "./base.ts";
+export class Derived<T extends Base> extends Base {
+  items: T[] = [];
+}
+`,
+  // A second, unrelated `Base`: same name, different file, different category.
+  "other.ts": `export interface Base {
+  extra: string;
+}
+`,
+  "empty.ts": "",
+};
+
+const RUST_FILES: Record<string, string> = {
+  "lib.rs": `mod root;
+mod contracts;
+mod marker_impl;
+mod methods;
+mod leaf;
+`,
+  "root.rs": `pub struct Root;
+`,
+  "contracts.rs": `pub trait LocalTrait {}
+`,
+  "marker_impl.rs": `use crate::root::Root;
+use crate::contracts::LocalTrait;
+impl LocalTrait for Root {}
+`,
+  "methods.rs": `use crate::root::Root;
+use crate::leaf::Leaf;
+impl Root {
+    pub fn make(&self) -> Leaf {
+        Leaf
+    }
+}
+`,
+  "leaf.rs": `pub struct Leaf;
+`,
+};
 
 afterEach(async () => {
   await fixtures.cleanup();
 });
 
-test("extracts every entity kind with its members", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-kinds-", {
-    "src/model.ts": `export class Widget {
-  label = "widget";
-  size?: number;
-  render(): string {
-    return this.label;
+function nodeKinds(project: UmlProject, path: string): Record<string, string> {
+  return Object.fromEntries(
+    project.fileGraph(path).nodes.map((node) => [node.nodeId, node.nodeKind]),
+  );
+}
+
+function ordinals(rows: readonly { [key: string]: unknown }[], field: string): unknown[] {
+  return rows.map((row) => row[field]);
+}
+
+function contiguous(length: number): number[] {
+  return Array.from({ length }, (_, index) => index);
+}
+
+test("node kind records what the selected file contributes", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-nodes-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    expect(nodeKinds(project, "root.ts")).toEqual({
+      // Nominal definitions declared here.
+      [project.key("root.ts", "Root")]: "entity",
+      [project.key("root.ts", "Mode")]: "entity",
+      // Every other declaration of the file.
+      [project.key("root.ts", "Root.tag")]: "definition",
+      [project.key("root.ts", "Root.peer")]: "definition",
+      [project.key("root.ts", "Root.run")]: "definition",
+      [project.key("root.ts", "helper")]: "definition",
+      [project.key("root.ts", "answer")]: "definition",
+      [project.key("root.ts", "Mode.Idle")]: "definition",
+      [project.key("root.ts", "Mode.Busy")]: "definition",
+      [project.key("root.ts", "Alias")]: "definition",
+      // Referenced targets this file contributes nothing to.
+      [project.key("base.ts", "Base")]: "boundary",
+      [project.key("base.ts", "Marker")]: "boundary",
+    });
+
+    const graph = project.fileGraph("root.ts");
+    expect(ordinals(graph.nodes, "nodeOrdinal")).toEqual(contiguous(graph.nodes.length));
+    // The same definition is an entity in its declaring file and a boundary in a referencing one.
+    expect(nodeKinds(project, "base.ts")[project.key("base.ts", "Base")]).toBe("entity");
+    expect(nodeKinds(project, "empty.ts")).toEqual({});
+  } finally {
+    project.close();
   }
-}
-export interface Shape {
-  area: number;
-  scale(factor: number): void;
-}
-export enum Mode {
-  Idle,
-  Busy,
-}
-export type Options = { retries: number; onDone(): void };
-export type Id = string;
-export type Fn = (a: number) => void;
-export class Box<T> {
-  value!: T;
-  read(): T {
-    return this.value;
+}, 60_000);
+
+test("edges are directed and deduplicate their relation kinds per pair", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-edges-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    const derived = project.fileGraph("derived.ts");
+    const source = project.key("derived.ts", "Derived");
+    const target = project.key("base.ts", "Base");
+
+    expect(derived.edges).toEqual([{
+      edgeOrdinal: 0,
+      sourceNodeId: source,
+      targetNodeId: target,
+      edgeKind: "uml-relation",
+      directed: true,
+      weight: 2,
+    }]);
+    // `extends Base` and `<T extends Base>` are one directed pair carrying two relation kinds.
+    expect(derived.relations).toEqual([
+      {
+        edgeOrdinal: 0,
+        relationOrdinal: 0,
+        relationKind: "extends",
+        sourceNodeId: source,
+        targetNodeId: target,
+      },
+      {
+        edgeOrdinal: 0,
+        relationOrdinal: 1,
+        relationKind: "references",
+        sourceNodeId: source,
+        targetNodeId: target,
+      },
+    ]);
+    // Direction is not symmetric: the referenced file records nothing about its users.
+    expect(project.fileGraph("base.ts").edges).toEqual([]);
+    expect(project.fileGraph("base.ts").relations).toEqual([]);
+  } finally {
+    project.close();
   }
-}
-export interface Container<T> {
-  items: T[];
-}
-`,
-  });
+}, 60_000);
 
-  const { contract } = await extractContract(root);
+test("every persisted ordinal sequence is contiguous and matches its edge weight", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-ordinals-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    for (const path of project.sourcePaths) {
+      const graph = project.fileGraph(path);
+      expect(ordinals(graph.nodes, "nodeOrdinal"), `${path}: nodes`)
+        .toEqual(contiguous(graph.nodes.length));
+      expect(ordinals(graph.edges, "edgeOrdinal"), `${path}: edges`)
+        .toEqual(contiguous(graph.edges.length));
+      expect(ordinals(graph.entities, "entityOrdinal"), `${path}: entities`)
+        .toEqual(contiguous(graph.entities.length));
+      expect(ordinals(graph.categories, "categoryOrdinal"), `${path}: categories`)
+        .toEqual(contiguous(graph.categories.length));
 
-  expect(contract).toEqual({
-    entities: [
-      {
-        file: "src/model.ts",
-        kind: "class",
-        name: "Widget",
-        properties: [
-          { name: "label", type: null, optional: false, modifiers: [] },
-          { name: "size", type: "number", optional: true, modifiers: [] },
-        ],
-        // characterizes: rendered return types carry the "\n§() " method-return marker
-        methods: [{ name: "render", type: "\n§() string", modifiers: [] }],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        file: "src/model.ts",
-        kind: "class",
-        name: "Box<T>",
-        properties: [{ name: "value", type: "T", optional: false, modifiers: [] }],
-        methods: [{ name: "read", type: "\n§() T", modifiers: [] }],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        file: "src/model.ts",
-        kind: "interface",
-        name: "Shape",
-        properties: [{ name: "area", type: "number", optional: false, modifiers: [] }],
-        methods: [{ name: "scale", type: "\n§() void", modifiers: [] }],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        file: "src/model.ts",
-        kind: "interface",
-        name: "Container<T>",
-        properties: [{ name: "items", type: "T[]", optional: false, modifiers: [] }],
-        methods: [],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        file: "src/model.ts",
-        kind: "enum",
-        name: "Mode",
-        properties: [],
-        methods: [],
-        enumItems: ["Idle", "Busy"],
-        heritage: [],
-      },
-      {
-        // characterizes: an object type alias contributes properties and methods like an interface
-        file: "src/model.ts",
-        kind: "type",
-        name: "Options",
-        properties: [{ name: "retries", type: "number", optional: false, modifiers: [] }],
-        methods: [{ name: "onDone", type: "\n§() void", modifiers: [] }],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        // characterizes: scalar and callable aliases contribute an entity with no members
-        file: "src/model.ts",
-        kind: "type",
-        name: "Id",
-        properties: [],
-        methods: [],
-        enumItems: [],
-        heritage: [],
-      },
-      {
-        file: "src/model.ts",
-        kind: "type",
-        name: "Fn",
-        properties: [],
-        methods: [],
-        enumItems: [],
-        heritage: [],
-      },
-    ],
-    // characterizes: categories are ordered interface, type, enum, class - not declaration order
-    categories: [
-      { entityName: "Shape", category: "interface", isTest: false },
-      { entityName: "Container<T>", category: "interface", isTest: false },
-      { entityName: "Options", category: "type", isTest: false },
-      { entityName: "Id", category: "type", isTest: false },
-      { entityName: "Fn", category: "type", isTest: false },
-      { entityName: "Mode", category: "enum", isTest: false },
-      { entityName: "Widget", category: "concrete", isTest: false },
-      { entityName: "Box<T>", category: "concrete", isTest: false },
-    ],
-    associations: [],
-    methodReturns: [],
-    usage: [],
-    localUsers: [],
-    externalUsers: [],
-    definitions: [
-      {
-        definitionOrdinal: 0,
-        definitionKey: '["class","Widget",0,null,null]',
-        definitionKind: "class",
-        name: "Widget",
-        qualifiedName: "Widget",
-        sourcePath: "src/model.ts",
-        sourceLine: 1,
-        sourceColumn: 14,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Widget",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 1,
-        definitionKey: '["class","Widget",0,"render",0]',
-        definitionKind: "method",
-        name: "render",
-        qualifiedName: "Widget.render",
-        sourcePath: "src/model.ts",
-        sourceLine: 4,
-        sourceColumn: 3,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Widget",
-        umlMemberName: "render",
-        umlMemberOccurrence: 0,
-      },
-      {
-        definitionOrdinal: 2,
-        definitionKey: '["interface","Shape",0,null,null]',
-        definitionKind: "interface",
-        name: "Shape",
-        qualifiedName: "Shape",
-        sourcePath: "src/model.ts",
-        sourceLine: 8,
-        sourceColumn: 18,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Shape",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 3,
-        definitionKey: '["interface","Shape",0,"scale",0]',
-        definitionKind: "method",
-        name: "scale",
-        qualifiedName: "Shape.scale",
-        sourcePath: "src/model.ts",
-        sourceLine: 10,
-        sourceColumn: 3,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Shape",
-        umlMemberName: "scale",
-        umlMemberOccurrence: 0,
-      },
-      {
-        definitionOrdinal: 4,
-        definitionKey: '["enum","Mode",0,null,null]',
-        definitionKind: "enum",
-        name: "Mode",
-        qualifiedName: "Mode",
-        sourcePath: "src/model.ts",
-        sourceLine: 12,
-        sourceColumn: 13,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Mode",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 5,
-        definitionKey: '["type","Options",0,null,null]',
-        definitionKind: "type",
-        name: "Options",
-        qualifiedName: "Options",
-        sourcePath: "src/model.ts",
-        sourceLine: 16,
-        sourceColumn: 13,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Options",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 6,
-        definitionKey: '["type","Options",0,"onDone",0]',
-        definitionKind: "method",
-        name: "onDone",
-        qualifiedName: "Options.onDone",
-        sourcePath: "src/model.ts",
-        sourceLine: 16,
-        sourceColumn: 42,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Options",
-        umlMemberName: "onDone",
-        umlMemberOccurrence: 0,
-      },
-      {
-        definitionOrdinal: 7,
-        definitionKey: '["type","Id",0,null,null]',
-        definitionKind: "type",
-        name: "Id",
-        qualifiedName: "Id",
-        sourcePath: "src/model.ts",
-        sourceLine: 17,
-        sourceColumn: 13,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Id",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 8,
-        definitionKey: '["type","Fn",0,null,null]',
-        definitionKind: "type",
-        name: "Fn",
-        qualifiedName: "Fn",
-        sourcePath: "src/model.ts",
-        sourceLine: 18,
-        sourceColumn: 13,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Fn",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        // characterizes: definition names stay bare while the UML entity name keeps its parameters
-        definitionOrdinal: 9,
-        definitionKey: '["class","Box",0,null,null]',
-        definitionKind: "class",
-        name: "Box",
-        qualifiedName: "Box",
-        sourcePath: "src/model.ts",
-        sourceLine: 19,
-        sourceColumn: 14,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Box<T>",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-      {
-        definitionOrdinal: 10,
-        definitionKey: '["class","Box",0,"read",0]',
-        definitionKind: "method",
-        name: "read",
-        qualifiedName: "Box.read",
-        sourcePath: "src/model.ts",
-        sourceLine: 21,
-        sourceColumn: 3,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Box<T>",
-        umlMemberName: "read",
-        umlMemberOccurrence: 0,
-      },
-      {
-        definitionOrdinal: 11,
-        definitionKey: '["interface","Container",0,null,null]',
-        definitionKind: "interface",
-        name: "Container",
-        qualifiedName: "Container",
-        sourcePath: "src/model.ts",
-        sourceLine: 25,
-        sourceColumn: 18,
-        umlScopePath: "src/model.ts",
-        umlEntityName: "Container<T>",
-        umlMemberName: null,
-        umlMemberOccurrence: null,
-      },
-    ],
-    // characterizes: unconnected entities each land in their own community
-    nodes: [
-      { name: "Widget", kind: "entity", community: 0 },
-      { name: "Box<T>", kind: "entity", community: 1 },
-      { name: "Shape", kind: "entity", community: 2 },
-      { name: "Container<T>", kind: "entity", community: 3 },
-      { name: "Mode", kind: "entity", community: 4 },
-      { name: "Options", kind: "entity", community: 5 },
-      { name: "Id", kind: "entity", community: 6 },
-      { name: "Fn", kind: "entity", community: 7 },
-    ],
-    edges: [],
-    relations: [],
-  });
-}, 30_000);
+      for (const edge of graph.edges) {
+        const rows = graph.relations.filter((row) => row.edgeOrdinal === edge.edgeOrdinal);
+        expect(ordinals(rows, "relationOrdinal"), `${path}: edge ${edge.edgeOrdinal}`)
+          .toEqual(contiguous(rows.length));
+        expect(rows.length, `${path}: edge ${edge.edgeOrdinal} weight`).toBe(edge.weight);
+      }
+      // Relations may only mention nodes this graph declares.
+      const nodeIds = new Set(graph.nodes.map((node) => node.nodeId));
+      const dangling = graph.relations.filter((relation) =>
+        !nodeIds.has(relation.sourceNodeId) || !nodeIds.has(relation.targetNodeId)
+      );
+      expect(dangling, `${path}: relation endpoints`).toEqual([]);
 
-test("records decoded modifiers for every member form", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-modifiers-", {
-    "src/members.ts": `export abstract class Members {
-  public plain = 1;
-  private secret = 2;
-  protected shared = 3;
-  static counter = 4;
-  readonly frozen = 5;
-  static readonly both = 6;
-  optional?: string;
-  definite!: string;
-  accessor tracked = 7;
-  declare ambient: number;
-  #hard = 8;
-  arrow = (value: number): number => value;
-  abstract run(): void;
-  async load(): Promise<void> {}
-  protected static make(): Members | undefined { return undefined; }
-  get value(): number { return 1; }
-  set value(next: number) {}
-  constructor(public injected: string, private hidden: number) { super(); }
-}
-export interface Signatures {
-  (call: string): void;
-  new (construct: string): Signatures;
-  [index: number]: string;
-  readonly ro: string;
-  method?(): void;
-}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  expect(contract.entities).toEqual([
-    {
-      file: "src/members.ts",
-      kind: "class",
-      name: "Members",
-      properties: [
-        { name: "plain", type: null, optional: false, modifiers: ["public"] },
-        { name: "secret", type: null, optional: false, modifiers: ["private"] },
-        { name: "shared", type: null, optional: false, modifiers: ["protected"] },
-        { name: "counter", type: null, optional: false, modifiers: ["static"] },
-        // characterizes: an unannotated member carries no type - nothing is inferred
-        { name: "frozen", type: null, optional: false, modifiers: ["readonly"] },
-        { name: "both", type: null, optional: false, modifiers: ["static", "readonly"] },
-        // characterizes: `?` sets optional and strips the trailing "| undefined"
-        { name: "optional", type: "string", optional: true, modifiers: [] },
-        { name: "definite", type: "string", optional: false, modifiers: [] },
-        { name: "tracked", type: null, optional: false, modifiers: ["accessor"] },
-        { name: "ambient", type: "number", optional: false, modifiers: ["ambient"] },
-        // characterizes: `#private` fields are kept, name included
-        { name: "#hard", type: null, optional: false, modifiers: [] },
-        // characterizes: an arrow-function field stays a property, never a method, and its
-        // unannotated declaration leaves the property untyped
-        { name: "arrow", type: null, optional: false, modifiers: [] },
-        // characterizes: constructor parameter properties are appended after the class fields
-        { name: "injected", type: "string", optional: false, modifiers: ["public"] },
-        { name: "hidden", type: "number", optional: false, modifiers: ["private"] },
-      ],
-      // characterizes: get/set accessors and the constructor contribute no method rows
-      methods: [
-        { name: "run", type: "\n§() void", modifiers: ["abstract"] },
-        { name: "load", type: "\n§() Promise⟨void⟩", modifiers: ["async"] },
-        // characterizes: an explicit `| undefined` return annotation is preserved verbatim
-        { name: "make", type: "\n§() Members | undefined", modifiers: ["protected", "static"] },
-      ],
-      enumItems: [],
-      heritage: [],
-    },
-    {
-      // characterizes: call, construct and index signatures contribute nothing
-      file: "src/members.ts",
-      kind: "interface",
-      name: "Signatures",
-      properties: [{ name: "ro", type: "string", optional: false, modifiers: ["readonly"] }],
-      // characterizes: an optional method keeps no optional marker of its own
-      methods: [{ name: "method", type: "\n§() void", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-  ]);
-}, 30_000);
-
-test("merged declarations and overloads share one entity", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-merged-", {
-    "src/merged.ts": `export interface Merged {
-  first(): void;
-}
-export interface Merged {
-  second(): void;
-}
-export class Merged2 {
-  run(): void {}
-}
-export namespace Merged2 {
-  export const flag = 1;
-}
-export class Overloads {
-  run(value: string): string;
-  run(value: number): number;
-  run(value: string | number): string | number {
-    return value;
+      for (const entity of graph.entities) {
+        const owned = <Row extends { entityOrdinal: number }>(rows: readonly Row[]): Row[] =>
+          rows.filter((row) => row.entityOrdinal === entity.entityOrdinal);
+        for (
+          const [rows, field] of [
+            [owned(graph.properties), "propertyOrdinal"],
+            [owned(graph.methods), "methodOrdinal"],
+            [owned(graph.enumItems), "itemOrdinal"],
+          ] as const
+        ) {
+          expect(ordinals(rows, field), `${path}: ${entity.name} ${field}`)
+            .toEqual(contiguous(rows.length));
+        }
+      }
+      // Every member row belongs to an entity this graph declares.
+      const entityOrdinals = new Set(graph.entities.map((entity) => entity.entityOrdinal));
+      const orphanMembers = [
+        ...graph.properties,
+        ...graph.methods,
+        ...graph.enumItems,
+        ...graph.memberModifiers,
+      ].filter((row) => !entityOrdinals.has(row.entityOrdinal));
+      expect(orphanMembers, `${path}: member owners`).toEqual([]);
+    }
+  } finally {
+    project.close();
   }
-}
-`,
-  });
+}, 60_000);
 
-  const { contract } = await extractContract(root);
+test("member rows carry the definition key of the declaration they render", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-members-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    const graph = project.fileGraph("root.ts");
+    const rootEntity = graph.entities.find((entity) =>
+      entity.definitionKey === project.key("root.ts", "Root")
+    );
+    const modeEntity = graph.entities.find((entity) =>
+      entity.definitionKey === project.key("root.ts", "Mode")
+    );
+    if (!rootEntity || !modeEntity) throw new Error("expected Root and Mode entities");
 
-  // characterizes: each merged block is its own entity row, all sharing one graph node
-  expect(contract.entities).toEqual([
-    {
-      file: "src/merged.ts",
-      kind: "class",
-      name: "Merged2",
-      properties: [],
-      methods: [{ name: "run", type: "\n§() void", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-    {
-      // characterizes: overloads collapse into the implementation signature only
-      file: "src/merged.ts",
-      kind: "class",
-      name: "Overloads",
-      properties: [],
-      methods: [{ name: "run", type: "\n§() string | number", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-    {
-      file: "src/merged.ts",
-      kind: "interface",
-      name: "Merged",
-      properties: [],
-      methods: [{ name: "first", type: "\n§() void", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-    {
-      file: "src/merged.ts",
-      kind: "interface",
-      name: "Merged",
-      properties: [],
-      methods: [{ name: "second", type: "\n§() void", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-  ]);
-  expect(contract.nodes).toEqual([
-    { name: "Merged2", kind: "entity", community: 0 },
-    { name: "Overloads", kind: "entity", community: 1 },
-    { name: "Merged", kind: "entity", community: 2 },
-  ]);
-  expect(contract.definitions).toEqual([
-    {
-      definitionOrdinal: 0,
-      definitionKey: '["interface","Merged",0,null,null]',
-      definitionKind: "interface",
-      name: "Merged",
-      qualifiedName: "Merged",
-      sourcePath: "src/merged.ts",
-      sourceLine: 1,
-      sourceColumn: 18,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 1,
-      definitionKey: '["interface","Merged",0,"first",0]',
-      definitionKind: "method",
-      name: "first",
-      qualifiedName: "Merged.first",
-      sourcePath: "src/merged.ts",
-      sourceLine: 2,
-      sourceColumn: 3,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged",
-      umlMemberName: "first",
-      umlMemberOccurrence: 0,
-    },
-    {
-      definitionOrdinal: 2,
-      definitionKey: '["interface","Merged",1,null,null]',
-      definitionKind: "interface",
-      name: "Merged",
-      qualifiedName: "Merged",
-      sourcePath: "src/merged.ts",
-      sourceLine: 4,
-      sourceColumn: 18,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 3,
-      definitionKey: '["interface","Merged",1,"second",0]',
-      definitionKind: "method",
-      name: "second",
-      qualifiedName: "Merged.second",
-      sourcePath: "src/merged.ts",
-      sourceLine: 5,
-      sourceColumn: 3,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged",
-      umlMemberName: "second",
-      umlMemberOccurrence: 0,
-    },
-    {
-      definitionOrdinal: 4,
-      definitionKey: '["class","Merged2",0,null,null]',
-      definitionKind: "class",
-      name: "Merged2",
-      qualifiedName: "Merged2",
-      sourcePath: "src/merged.ts",
-      sourceLine: 7,
-      sourceColumn: 14,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged2",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 5,
-      definitionKey: '["class","Merged2",0,"run",0]',
-      definitionKind: "method",
-      name: "run",
-      qualifiedName: "Merged2.run",
-      sourcePath: "src/merged.ts",
-      sourceLine: 8,
-      sourceColumn: 3,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Merged2",
-      umlMemberName: "run",
-      umlMemberOccurrence: 0,
-    },
-    {
-      definitionOrdinal: 6,
-      definitionKey: '["class","Overloads",0,null,null]',
-      definitionKind: "class",
-      name: "Overloads",
-      qualifiedName: "Overloads",
-      sourcePath: "src/merged.ts",
-      sourceLine: 13,
-      sourceColumn: 14,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Overloads",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      // characterizes: only the first overload span is recorded, at the first signature
-      definitionOrdinal: 7,
-      definitionKey: '["class","Overloads",0,"run",0]',
-      definitionKind: "method",
-      name: "run",
-      qualifiedName: "Overloads.run",
-      sourcePath: "src/merged.ts",
-      sourceLine: 14,
-      sourceColumn: 3,
-      umlScopePath: "src/merged.ts",
-      umlEntityName: "Overloads",
-      umlMemberName: "run",
-      umlMemberOccurrence: 0,
-    },
-  ]);
-}, 30_000);
+    expect(graph.properties.map((row) => [row.entityOrdinal, row.definitionKey, row.name]))
+      .toEqual([
+        [rootEntity.entityOrdinal, project.key("root.ts", "Root.tag"), "tag"],
+        [rootEntity.entityOrdinal, project.key("root.ts", "Root.peer"), "peer"],
+      ]);
+    expect(graph.methods.map((row) => [row.entityOrdinal, row.definitionKey, row.name]))
+      .toEqual([
+        [rootEntity.entityOrdinal, project.key("root.ts", "Root.run"), "run"],
+      ]);
+    expect(graph.enumItems.map((row) => [row.entityOrdinal, row.definitionKey, row.value]))
+      .toEqual([
+        [modeEntity.entityOrdinal, project.key("root.ts", "Mode.Idle"), "Idle"],
+        [modeEntity.entityOrdinal, project.key("root.ts", "Mode.Busy"), "Busy"],
+      ]);
 
-test("export form does not change entity extraction, and duplicate names stay distinct", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-exports-", {
-    "src/a.ts": `export class Dup {}
-class Hidden {}
-export default class Named {}
-`,
-    "src/anon.ts": `export default class {}
-`,
-    "src/b.ts": `export * from "./a.ts";
-export class Dup {}
-export { Dup as Aliased };
-`,
-  });
-
-  const graph = await extractNormalizedGraph(root);
-
-  // characterizes: non-exported and default-exported classes are extracted like exported ones
-  expect(graph.entities.map((entity) => entity.nodeId)).toEqual([
-    '"<root>/src/a".Dup',
-    '"<root>/src/a".Hidden',
-    '"<root>/src/a".Named',
-    // characterizes: an anonymous default export becomes the entity named "default"
-    '"<root>/src/anon".default',
-    '"<root>/src/b".Dup',
-  ]);
-  // characterizes: same-named classes in different files stay separate nodes;
-  // `export { Dup as Aliased }` adds an export local-user node instead of an entity
-  expect(graph.nodes.map((node) => node.name).sort()).toEqual([
-    "Dup",
-    "Dup",
-    "Hidden",
-    "Named",
-    "default",
-    "export: src/b.ts: Aliased",
-  ]);
-  // characterizes: the anonymous default export produces no definition row
-  expect(graph.definitions).toEqual([
-    {
-      definitionOrdinal: 0,
-      definitionKey: '["class","Dup",0,null,null]',
-      definitionKind: "class",
-      name: "Dup",
-      qualifiedName: "Dup",
-      sourcePath: "src/a.ts",
-      sourceLine: 1,
-      sourceColumn: 14,
-      umlScopePath: "src/a.ts",
-      umlEntityName: "Dup",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 1,
-      definitionKey: '["class","Hidden",0,null,null]',
-      definitionKind: "class",
-      name: "Hidden",
-      qualifiedName: "Hidden",
-      sourcePath: "src/a.ts",
-      sourceLine: 2,
-      sourceColumn: 7,
-      umlScopePath: "src/a.ts",
-      umlEntityName: "Hidden",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 2,
-      definitionKey: '["class","Named",0,null,null]',
-      definitionKind: "class",
-      name: "Named",
-      qualifiedName: "Named",
-      sourcePath: "src/a.ts",
-      sourceLine: 3,
-      sourceColumn: 22,
-      umlScopePath: "src/a.ts",
-      umlEntityName: "Named",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-    {
-      definitionOrdinal: 3,
-      definitionKey: '["class","Dup",0,null,null]',
-      definitionKind: "class",
-      name: "Dup",
-      qualifiedName: "Dup",
-      sourcePath: "src/b.ts",
-      sourceLine: 2,
-      sourceColumn: 14,
-      umlScopePath: "src/b.ts",
-      umlEntityName: "Dup",
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    },
-  ]);
-}, 30_000);
-
-test("heritage records extends and implements, and unresolved bases become boundary nodes", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-heritage-", {
-    "src/vendor.d.ts": `export declare class Missing {}
-`,
-    "src/model.ts": `import { Missing } from "./vendor";
-export class Base {}
-export interface First {}
-export interface Second {}
-export class Box<T> {
-  value!: T;
-}
-export class Sub extends Base {}
-export class Impl implements First, Second {}
-export interface Wide extends First, Second {}
-export class Narrow extends Box<string> {}
-export class Foreign extends Missing {}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  expect(
-    contract.entities.map(({ name, heritage }) => ({ name, heritage })),
-  ).toEqual([
-    { name: "Base", heritage: [] },
-    { name: "Box<T>", heritage: [] },
-    { name: "Sub", heritage: [{ kind: "extends", clause: "Base", className: "Sub" }] },
-    {
-      name: "Impl",
-      heritage: [
-        { kind: "implements", clause: "First", className: "Impl" },
-        { kind: "implements", clause: "Second", className: "Impl" },
-      ],
-    },
-    {
-      // characterizes: a generic base is recorded by its declared name, not the instantiation
-      name: "Narrow",
-      heritage: [{ kind: "extends", clause: "Box<T>", className: "Narrow" }],
-    },
-    { name: "Foreign", heritage: [{ kind: "extends", clause: "Missing", className: "Foreign" }] },
-    { name: "First", heritage: [] },
-    { name: "Second", heritage: [] },
-    {
-      // characterizes: `interface extends` is recorded as an implements clause
-      name: "Wide",
-      heritage: [
-        { kind: "implements", clause: "First", className: "Wide" },
-        { kind: "implements", clause: "Second", className: "Wide" },
-      ],
-    },
-  ]);
-  // characterizes: `Missing` lives only in the excluded .d.ts, so it surfaces as a boundary node
-  expect(contract.nodes.map(({ name, kind }) => ({ name, kind }))).toEqual([
-    { name: "Base", kind: "entity" },
-    { name: "Box<T>", kind: "entity" },
-    { name: "Sub", kind: "entity" },
-    { name: "Impl", kind: "entity" },
-    { name: "Narrow", kind: "entity" },
-    { name: "Foreign", kind: "entity" },
-    { name: "First", kind: "entity" },
-    { name: "Second", kind: "entity" },
-    { name: "Wide", kind: "entity" },
-    { name: "Missing", kind: "boundary" },
-  ]);
-}, 30_000);
-
-test("member associations link entities through property types", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-associations-", {
-    "src/model.ts": `export class Other {}
-export type Handle = { id: string };
-export class Owner {
-  other!: Other;
-  many!: Other[];
-  maybe?: Other;
-  self!: Owner;
-  handle!: Handle;
-}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  // characterizes: one association per property, arrays carry 0..*, self-references are removed
-  expect(contract.associations).toEqual([
-    { a: "Owner", aMultiplicity: null, b: "Other", bMultiplicity: null, inherited: false },
-    { a: "Owner", aMultiplicity: null, b: "Other", bMultiplicity: "0..*", inherited: false },
-    { a: "Owner", aMultiplicity: null, b: "Other", bMultiplicity: null, inherited: false },
-    { a: "Owner", aMultiplicity: null, b: "Handle", bMultiplicity: null, inherited: false },
-  ]);
-  // characterizes: duplicate associations aggregate onto one edge that also carries a usage relation
-  expect(contract.relations).toEqual([
-    { kind: "member-association", source: "Owner", target: "Other" },
-    { kind: "member-association", source: "Owner", target: "Other" },
-    { kind: "member-association", source: "Owner", target: "Other" },
-    { kind: "usage", source: "Owner", target: "Other" },
-    { kind: "member-association", source: "Owner", target: "Handle" },
-    { kind: "usage", source: "Owner", target: "Handle" },
-  ]);
-  expect(contract.edges).toEqual([
-    { a: "Other", b: "Owner", weight: 4 },
-    { a: "Handle", b: "Owner", weight: 2 },
-  ]);
-}, 30_000);
-
-test("enum items keep their rendered values", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-enums-", {
-    "src/enums.ts": `export enum Numbers {
-  First,
-  Second = 5,
-}
-export enum Strings {
-  Ready = "ready",
-}
-export enum Computed {
-  Shifted = 1 << 2,
-}
-export const enum Constant {
-  Only,
-}
-declare enum Ambient {
-  Value,
-}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  // characterizes: enum items record member names only - initializers never reach the model
-  expect(contract.entities).toEqual([
-    {
-      file: "src/enums.ts",
-      kind: "enum",
-      name: "Numbers",
-      properties: [],
-      methods: [],
-      enumItems: ["First", "Second"],
-      heritage: [],
-    },
-    {
-      file: "src/enums.ts",
-      kind: "enum",
-      name: "Strings",
-      properties: [],
-      methods: [],
-      enumItems: ["Ready"],
-      heritage: [],
-    },
-    {
-      file: "src/enums.ts",
-      kind: "enum",
-      name: "Computed",
-      properties: [],
-      methods: [],
-      enumItems: ["Shifted"],
-      heritage: [],
-    },
-    {
-      file: "src/enums.ts",
-      kind: "enum",
-      name: "Constant",
-      properties: [],
-      methods: [],
-      enumItems: ["Only"],
-      heritage: [],
-    },
-    {
-      // characterizes: `declare enum` inside a .ts file is extracted like a plain enum
-      file: "src/enums.ts",
-      kind: "enum",
-      name: "Ambient",
-      properties: [],
-      methods: [],
-      enumItems: ["Value"],
-      heritage: [],
-    },
-  ]);
-}, 30_000);
-
-test("file forms decide what is extracted", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-files-", {
-    "a.ts": `export class InTs {}
-`,
-    "b.tsx": `export class InTsx {
-  render() {
-    return <div className="tsx" />;
+    // A compartment row addresses the exact outline declaration owned by that entity.
+    const byKey = new Map(project.definitions("root.ts").map((row) => [row.key, row]));
+    for (const row of [...graph.properties, ...graph.methods, ...graph.enumItems]) {
+      const owner = graph.entities.find((entity) => entity.entityOrdinal === row.entityOrdinal);
+      expect(byKey.get(row.definitionKey)?.parentKey, row.definitionKey)
+        .toBe(owner?.definitionKey);
+    }
+  } finally {
+    project.close();
   }
-}
-`,
-    "c.mts": `export class InMts {}
-`,
-    "d.cts": `export class InCts {}
-`,
-    "e.d.ts": `export declare class InDts {}
-`,
-    "node_modules/pkg/f.ts": `export class InNodeModules {}
-`,
-    ".explore/g.ts": `export class InExplore {}
-`,
-    "dist/h.ts": `export class InDist {}
-`,
-  });
+}, 60_000);
 
-  const { contract } = await extractContract(root);
-
-  // characterizes: .ts/.tsx/.mts/.cts are extracted; .d.ts, node_modules and .explore are not.
-  // `dist` is ignored for traversal but not for UML extraction (src/source.ts:11).
-  expect(contract.entities.map(({ file, name }) => ({ file, name }))).toEqual([
-    { file: "a.ts", name: "InTs" },
-    { file: "b.tsx", name: "InTsx" },
-    { file: "c.mts", name: "InMts" },
-    { file: "d.cts", name: "InCts" },
-    { file: "dist/h.ts", name: "InDist" },
-  ]);
-}, 30_000);
-
-test("entity ids embed the declaring file path", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-ids-", {
-    "src/model.ts": `export class Widget {}
-export class Box<T> {
-  value!: T;
-}
-`,
-    "src/nested/deep.ts": `export interface Deep {
-  id: string;
-}
-`,
-  });
-
-  const graph = await extractNormalizedGraph(root);
-
-  // The only test that pins raw tsuml2 ids. Two consumers depend on this exact shape:
-  // the generic alias derivation at src/uml/graph.ts:66-71 slices the rendered name off the id,
-  // and umlEntityKey at src/uml/keys.ts:11-14 rebuilds the same `<file>\0<name>` pairing.
-  expect(graph.entities.map((entity) => entity.nodeId)).toEqual([
-    '"<root>/src/model".Widget',
-    '"<root>/src/model".Box<T>',
-    '"<root>/src/nested/deep".Deep',
-  ]);
-  // characterizes: the `Box` alias is only materialized when an endpoint references it
-  expect(graph.aliases).toEqual([]);
-}, 30_000);
-
-test("a malformed source file does not lose the rest of the scope", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-contract-malformed-", {
-    "src/broken.ts": `export class Broken {
-  run(): void {}
-`,
-    "src/valid.ts": `export class Valid {
-  ok(): boolean {
-    return true;
+test("categories are keyed by definition key, not by entity name", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-categories-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    expect(project.fileGraph("base.ts").categories).toEqual([
+      {
+        categoryOrdinal: 0,
+        definitionKey: project.key("base.ts", "Base"),
+        category: "abstract",
+        isTest: false,
+      },
+      {
+        categoryOrdinal: 1,
+        definitionKey: project.key("base.ts", "Marker"),
+        category: "interface",
+        isTest: false,
+      },
+    ]);
+    // A different file's `Base` is a separate key and keeps its own category.
+    expect(project.fileGraph("other.ts").categories).toEqual([{
+      categoryOrdinal: 0,
+      definitionKey: project.key("other.ts", "Base"),
+      category: "interface",
+      isTest: false,
+    }]);
+    expect(project.key("other.ts", "Base")).not.toBe(project.key("base.ts", "Base"));
+  } finally {
+    project.close();
   }
-}
-`,
-  });
+}, 60_000);
 
-  const { contract } = await extractContract(root);
+test("a completed file persists its projected rows and only a readiness marker", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-rows-", SCRIPT_FILES);
+  const project = await buildUmlProject(root);
+  const db = new Database(project.dbPath, { readonly: true, strict: true });
+  try {
+    expectFileGraphRoundTrips(project);
+    expectCatalogueRows(db, project.generationId, project.snapshot);
 
-  // characterizes: the recovered parse of a file with an unclosed class still contributes its
-  // entity and members, and the valid file is unaffected.
-  expect(contract.entities).toEqual([
-    {
-      file: "src/broken.ts",
-      kind: "class",
-      name: "Broken",
-      properties: [],
-      methods: [{ name: "run", type: "\n§() void", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-    {
-      file: "src/valid.ts",
-      kind: "class",
-      name: "Valid",
-      properties: [],
-      methods: [{ name: "ok", type: "\n§() boolean", modifiers: [] }],
-      enumItems: [],
-      heritage: [],
-    },
-  ]);
-  expect(contract.definitions.map(({ definitionKey, sourcePath }) => ({
-    definitionKey,
-    sourcePath,
-  }))).toEqual([
-    { definitionKey: '["class","Broken",0,null,null]', sourcePath: "src/broken.ts" },
-    { definitionKey: '["class","Broken",0,"run",0]', sourcePath: "src/broken.ts" },
-    { definitionKey: '["class","Valid",0,null,null]', sourcePath: "src/valid.ts" },
-    { definitionKey: '["class","Valid",0,"ok",0]', sourcePath: "src/valid.ts" },
-  ]);
-}, 30_000);
+    for (const path of project.sourcePaths) {
+      expectNormalizedGraphRows(db, project.generationId, project.fileGraph(path));
+      const snapshot = readNormalizedGraphSnapshot(db, project.generationId, "uml", path);
+      expect(snapshot.response, path).toEqual({ status: "ready" });
+      expect(snapshot.header, path).toEqual({ format_version: 2, render_mode: "normal" });
+    }
+
+    // A syntactically valid file with no declarations still completes, with no rows at all.
+    const empty = project.fileGraph("empty.ts");
+    expect({ nodes: empty.nodes, edges: empty.edges, entities: empty.entities }).toEqual({
+      nodes: [],
+      edges: [],
+      entities: [],
+    });
+    expect(readCompleteUml(project, { kind: "file", path: "empty.ts" })).toEqual({
+      kind: "uml",
+      scopePath: "empty.ts",
+      target: { kind: "file", path: "empty.ts" },
+      status: "ready",
+      view: { kind: "definitions", nodes: [], edges: [], frames: [] },
+    });
+  } finally {
+    db.close();
+    project.close();
+  }
+}, 60_000);
+
+test("a cross-file Rust impl contributes a fragment owned by the declaring type", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-rust-impl-", RUST_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    const rootKey = project.key("root.rs", "Root");
+    const methods = project.fileGraph("methods.rs");
+
+    // The fragment carries the implemented type's canonical identity, not a synthetic impl node.
+    expect(methods.entities).toEqual([{
+      entityOrdinal: 0,
+      definitionKey: rootKey,
+      entityKind: "struct",
+      name: "Root",
+    }]);
+    expect(methods.methods).toEqual([{
+      entityOrdinal: 0,
+      methodOrdinal: 0,
+      definitionKey: project.key("methods.rs", "Root.make"),
+      name: "make",
+      returnType: "Leaf",
+    }]);
+    expect(methods.memberModifiers).toEqual([{
+      entityOrdinal: 0,
+      memberKind: "method",
+      memberOrdinal: 0,
+      modifierOrdinal: 0,
+      modifier: "public",
+    }]);
+    // The header/category stays with the declaring file; a fragment must not restyle the type.
+    expect(methods.categories).toEqual([]);
+    expect(project.fileGraph("root.rs").categories).toEqual([{
+      categoryOrdinal: 0,
+      definitionKey: rootKey,
+      category: "concrete",
+      isTest: false,
+    }]);
+
+    expect(nodeKinds(project, "methods.rs")).toEqual({
+      [rootKey]: "entity",
+      [project.key("methods.rs", "Root.make")]: "definition",
+      [project.key("leaf.rs", "Leaf")]: "boundary",
+    });
+    // The method owns its own outgoing reference; the type does not duplicate it.
+    expect(methods.relations).toEqual([{
+      edgeOrdinal: 0,
+      relationOrdinal: 0,
+      relationKind: "references",
+      sourceNodeId: project.key("methods.rs", "Root.make"),
+      targetNodeId: project.key("leaf.rs", "Leaf"),
+    }]);
+  } finally {
+    project.close();
+  }
+}, 60_000);
+
+test("a file that declares nothing records only boundary nodes", async () => {
+  const root = await fixtures.fixtureRoot("ts-explorer-contract-rust-marker-", RUST_FILES);
+  const project = await buildUmlProject(root);
+  try {
+    const rootKey = project.key("root.rs", "Root");
+    const traitKey = project.key("contracts.rs", "LocalTrait");
+    const marker = project.fileGraph("marker_impl.rs");
+
+    expect(project.definitions("marker_impl.rs")).toEqual([]);
+    expect(nodeKinds(project, "marker_impl.rs")).toEqual({
+      [rootKey]: "boundary",
+      [traitKey]: "boundary",
+    });
+    // An empty `impl Trait for Type {}` still has to publish its trait relation.
+    expect(marker.relations).toEqual([{
+      edgeOrdinal: 0,
+      relationOrdinal: 0,
+      relationKind: "implements",
+      sourceNodeId: rootKey,
+      targetNodeId: traitKey,
+    }]);
+    const detail: Pick<UmlDiagramGraph, "entities" | "properties" | "methods" | "categories"> = {
+      entities: marker.entities,
+      properties: marker.properties,
+      methods: marker.methods,
+      categories: marker.categories,
+    };
+    expect(detail).toEqual({ entities: [], properties: [], methods: [], categories: [] });
+  } finally {
+    project.close();
+  }
+}, 60_000);

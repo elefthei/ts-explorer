@@ -11,8 +11,6 @@ const TRAVERSAL_IGNORED_SEGMENTS = new Set([
   "out",
   ".explore",
 ]);
-const UML_IGNORED_SEGMENTS = new Set([".git", "node_modules", ".explore"]);
-
 function hasIgnoredSegment(path: string, ignored: ReadonlySet<string>): boolean {
   return path.split(/[\\/]+/).some((segment) => ignored.has(segment));
 }
@@ -52,10 +50,6 @@ export function isDeclarationPath(path: string): boolean {
 
 export function isTraversalIgnoredPath(path: string): boolean {
   return hasIgnoredSegment(path, TRAVERSAL_IGNORED_SEGMENTS);
-}
-
-export function isUmlIgnoredPath(path: string): boolean {
-  return hasIgnoredSegment(path, UML_IGNORED_SEGMENTS);
 }
 
 const UTF8 = new TextDecoder("utf-8", { fatal: true });

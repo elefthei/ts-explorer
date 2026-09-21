@@ -3,15 +3,16 @@ import { basename, join } from "node:path";
 import { format, formatWithCursor } from "prettier";
 import {
   Cache,
-  type CacheDiagramInput,
   type CacheFileWrite,
-  type DefinitionIndexWrite,
+  type CachePackageDiagramInput,
   DiagramMaterializationError,
 } from "./cache.ts";
-import type { DiagramGraph, RenderedDiagram } from "./diagram-graph.ts";
-import { parseDefinitionSpans } from "./goto-definition.ts";
+import type { PackageDiagramGraph, UmlDiagramGraph, UmlFileOutcome } from "./diagram-graph.ts";
+import { collectFileDefinitionNodes, parseDefinitionSpans } from "./goto-definition.ts";
 import { computeHighlightSpans } from "./highlight.ts";
-import { analysisLanguageForPath, highlightLanguageForPath } from "./lang/registry.ts";
+import { highlightLanguageForPath } from "./lang/registry.ts";
+import { parseRustSource } from "./lang/rust.ts";
+import { parseTypeScriptSource } from "./lang/typescript.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
@@ -20,28 +21,34 @@ import {
 import { ensureRegularFile, normalizeRelativePath, PathError, resolveInside } from "./paths.ts";
 import type {
   PreprocessCause,
+  PreprocessErrorCode,
   PreprocessFailure,
+  PreprocessProgressEvent,
   PreprocessRequest,
   PreprocessResponse,
-  PreprocessProgressEvent,
   PreprocessResultMap,
   PreprocessScope,
   PreprocessSuccess,
   SourceLocation,
-  PreprocessErrorCode,
 } from "./preprocess-protocol.ts";
 import { isRecord } from "./preprocess-protocol.ts";
 import {
   decodeSourceBytes,
-  isDeclarationPath,
   isPrettierFormattablePath,
   isSourcePath,
 } from "./source.ts";
-import { buildTree, collectTreeEntries, computeSourceFingerprint, readDirectoryEntries } from "./tree.ts";
-import type { EditorGotoDefinition, GotoDefinition, PackageInfo, TreeNode } from "./types.ts";
-import { bareUmlDiagramGraph, extractUmlDiagramGraph } from "./uml.ts";
-import { renderUmlDiagramGraph } from "./uml/render.ts";
-
+import { buildTree, collectTreeEntries, computeSourceFingerprint } from "./tree.ts";
+import type {
+  DiagramRequest,
+  EditorGotoDefinition,
+  GotoDefinition,
+  PackageInfo,
+  TreeNode,
+  UmlTarget,
+} from "./types.ts";
+import { bareUmlDiagramGraph, extractFileUmlGraph } from "./uml.ts";
+import { buildCatalogue, collectFileFacts, type FileFacts } from "./uml/catalogue.ts";
+import { collectEditorDefinitions } from "./uml/definitions.ts";
 
 class PreprocessRequestError extends Error {
   constructor(
@@ -63,13 +70,6 @@ let state: PreprocessState | undefined;
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram {
-  return graph.kind === "packages"
-    ? renderPackageDiagramGraph(graph)
-    : renderUmlDiagramGraph(graph);
-}
-
 
 function readRequestId(value: unknown): number {
   if (!isRecord(value)) return -1;
@@ -104,23 +104,6 @@ function parseCause(value: unknown): PreprocessCause {
   return value;
 }
 
-function parsePackages(value: unknown): PackageInfo[] {
-  if (!Array.isArray(value)) {
-    throw new PreprocessRequestError("BAD_REQUEST", "packages must be an array");
-  }
-  return value.map((item, index) => {
-    if (!isRecord(item)) {
-      throw new PreprocessRequestError("BAD_REQUEST", `packages[${index}] must be an object`);
-    }
-    const name = requireString(item.name, `packages[${index}].name`);
-    const path = normalizeRelativePath(requireString(item.path, `packages[${index}].path`));
-    if (!Array.isArray(item.dependencies) || !item.dependencies.every((dependency) => typeof dependency === "string")) {
-      throw new PreprocessRequestError("BAD_REQUEST", `packages[${index}].dependencies must be a string array`);
-    }
-    return { name, path, dependencies: [...item.dependencies] };
-  });
-}
-
 function parseLocation(value: unknown): SourceLocation | undefined {
   if (value === undefined) return undefined;
   if (!isRecord(value)) {
@@ -141,6 +124,41 @@ function parseScope(value: unknown): PreprocessScope {
     throw new PreprocessRequestError("BAD_REQUEST", "scope.kind is invalid");
   }
   return { path, kind: value.kind };
+}
+
+function parseUmlTarget(value: unknown): UmlTarget {
+  if (!isRecord(value)) {
+    throw new PreprocessRequestError("BAD_REQUEST", "target must be an object");
+  }
+  const path = normalizeRelativePath(requireString(value.path, "target.path"));
+  if (value.kind === "directory") return { kind: "directory", path };
+  if (value.kind === "file") {
+    if (!path) throw new PreprocessRequestError("BAD_REQUEST", "path is required");
+    return { kind: "file", path };
+  }
+  if (value.kind !== "definition") {
+    throw new PreprocessRequestError("BAD_REQUEST", "target.kind is invalid");
+  }
+  const definitionKey = requireString(value.definitionKey, "target.definitionKey");
+  if (!path) throw new PreprocessRequestError("BAD_REQUEST", "path is required");
+  if (!definitionKey) throw new PreprocessRequestError("BAD_REQUEST", "definition is required");
+  return { kind: "definition", path, definitionKey };
+}
+
+function parseDiagramRequest(value: unknown): DiagramRequest {
+  if (!isRecord(value)) {
+    throw new PreprocessRequestError("BAD_REQUEST", "request must be an object");
+  }
+  if (value.kind === "packages") {
+    if (value.scopePath !== "") {
+      throw new PreprocessRequestError("BAD_REQUEST", "packages diagram scope must be the source root");
+    }
+    return { kind: "packages", scopePath: "" };
+  }
+  if (value.kind !== "uml") {
+    throw new PreprocessRequestError("BAD_REQUEST", "kind must be packages or uml");
+  }
+  return { kind: "uml", target: parseUmlTarget(value.target) };
 }
 
 function parseRequest(value: unknown): PreprocessRequest {
@@ -177,20 +195,14 @@ function parseRequest(value: unknown): PreprocessRequest {
         generationId: requireSafeInteger(value.generationId, "generationId"),
         cause: parseCause(value.cause),
         scope: parseScope(value.scope),
-        packages: parsePackages(value.packages),
       };
-    case "read-diagram": {
-      if (value.kind !== "packages" && value.kind !== "uml") {
-        throw new PreprocessRequestError("BAD_REQUEST", "kind must be packages or uml");
-      }
+    case "read-diagram":
       return {
         id,
         type,
         generationId: requireSafeInteger(value.generationId, "generationId"),
-        kind: value.kind,
-        scopePath: normalizeRelativePath(requireString(value.scopePath, "scopePath")),
+        request: parseDiagramRequest(value.request),
       };
-    }
     case "read-file":
       return {
         id,
@@ -207,6 +219,13 @@ function parseRequest(value: unknown): PreprocessRequest {
         path: normalizeRelativePath(requireString(value.path, "path")),
         line: requireSafeInteger(value.line, "line"),
         column: requireSafeInteger(value.column, "column"),
+      };
+    case "read-file-definitions":
+      return {
+        id,
+        type,
+        generationId: requireSafeInteger(value.generationId, "generationId"),
+        path: normalizeRelativePath(requireString(value.path, "path")),
       };
     case "lookup-definition":
       return {
@@ -247,7 +266,10 @@ function requireState(): PreprocessState {
   return state;
 }
 
-async function resolveValidatedPath(preprocessState: PreprocessState, relativePath: string): Promise<string> {
+async function resolveValidatedPath(
+  preprocessState: PreprocessState,
+  relativePath: string,
+): Promise<string> {
   const normalized = normalizeRelativePath(relativePath);
   let candidate = preprocessState.sourceDir;
   for (const segment of normalized.split("/")) {
@@ -260,26 +282,16 @@ async function resolveValidatedPath(preprocessState: PreprocessState, relativePa
   return resolveInside(preprocessState.sourceDir, normalized, true);
 }
 
-function failedDiagramInput(
+function failedPackageDiagram(
   preprocessState: PreprocessState,
   generationId: number,
-  graph: DiagramGraph,
+  graph: PackageDiagramGraph,
   error: string,
-): CacheDiagramInput {
+): CachePackageDiagramInput {
   const activeGenerationId = preprocessState.cache.getActiveGenerationId();
   return activeGenerationId === null || activeGenerationId === generationId
-    ? {
-      graph,
-      outcome: { status: "error", error },
-    }
-    : {
-      fallbackSource: {
-        sourceGenerationId: activeGenerationId,
-        kind: graph.kind,
-        scopePath: graph.scopePath,
-      },
-      outcome: { status: "error", error },
-    };
+    ? { graph, outcome: { status: "error", error } }
+    : { fallbackSource: { sourceGenerationId: activeGenerationId }, outcome: { status: "error", error } };
 }
 
 async function discoverAndPersist(
@@ -287,7 +299,7 @@ async function discoverAndPersist(
   generationId: number,
 ): Promise<{ packages: PackageInfo[] }> {
   let packages: PackageInfo[];
-  let diagram: CacheDiagramInput;
+  let diagram: CachePackageDiagramInput;
   try {
     packages = [...await discoverPackages(preprocessState.sourceDir)].map((pkg) => ({
       name: pkg.name,
@@ -300,7 +312,7 @@ async function discoverAndPersist(
     };
   } catch (error) {
     packages = [];
-    diagram = failedDiagramInput(
+    diagram = failedPackageDiagram(
       preprocessState,
       generationId,
       extractPackageDiagramGraph([], "bare"),
@@ -311,80 +323,85 @@ async function discoverAndPersist(
     generationId,
     packages,
     diagram,
-    renderDiagramGraph,
+    renderPackageDiagramGraph,
   );
   return { packages };
 }
 
 const DEFINITION_INDEX_READ_BATCH = 64;
 
+/**
+ * One pass over every visible source file: raw snapshots are written batch by batch, and the
+ * declaration/binding catalogue is published atomically once every file has been parsed. No tree
+ * or AST is retained past its batch.
+ */
 async function indexDefinitions(
   preprocessState: PreprocessState,
   generationId: number,
 ): Promise<{ definitionCount: number }> {
-  const files = (await collectTreeEntries(preprocessState.sourceDir, "")).filter((entry) =>
-    entry.kind === "file"
-    && analysisLanguageForPath(entry.path) !== undefined
-    && !isDeclarationPath(entry.path)
-  );
-  const definitions: DefinitionIndexWrite[] = [];
+  const entries = await collectTreeEntries(preprocessState.sourceDir, "");
+  const rootEntry: TreeNode = {
+    name: basename(preprocessState.sourceDir),
+    path: "",
+    kind: "directory",
+  };
+  const files = entries.filter((entry) => entry.kind === "file" && isSourcePath(entry.path));
+  const facts: FileFacts[] = [];
   for (let start = 0; start < files.length; start += DEFINITION_INDEX_READ_BATCH) {
     const batch = files.slice(start, start + DEFINITION_INDEX_READ_BATCH);
-    const contents = await Promise.all(batch.map(async (entry) => {
+    const decoded = await Promise.all(batch.map(async (entry) => {
       try {
-        const decoded = decodeSourceBytes(
-          await readFileBytes(join(preprocessState.sourceDir, entry.path)),
-        );
-        return "failure" in decoded ? null : decoded.text;
-      } catch {
-        return null;
+        const bytes = await readFileBytes(join(preprocessState.sourceDir, entry.path));
+        return decodeSourceBytes(bytes);
+      } catch (error) {
+        return { failure: errorMessage(error) } as const;
       }
     }));
+    const snapshots: CacheFileWrite[] = [];
     for (const [index, entry] of batch.entries()) {
-      const content = contents[index];
-      if (!content) continue;
-      for (const span of parseDefinitionSpans(entry.path, content)) {
-        definitions.push({
-          path: entry.path,
-          name: span.name,
-          qualifiedName: span.qualifiedName,
-          kind: span.kind,
-          line: span.line,
-          column: span.column,
-        });
+      const result = decoded[index];
+      if (!result) continue;
+      const language = highlightLanguageForPath(entry.path) ?? null;
+      snapshots.push(
+        "failure" in result
+          ? {
+            path: entry.path,
+            rawContent: null,
+            displayContent: null,
+            sourceError: result.failure,
+            formatError: null,
+            language,
+          }
+          : {
+            path: entry.path,
+            rawContent: result.text,
+            displayContent: null,
+            sourceError: null,
+            formatError: null,
+            language,
+          },
+      );
+    }
+    preprocessState.cache.writeSourceSnapshots(generationId, snapshots);
+    for (const [index, entry] of batch.entries()) {
+      const result = decoded[index];
+      if (!result || "failure" in result) continue;
+      const parsed = highlightLanguageForPath(entry.path) === "rust"
+        ? parseRustSource(result.text)
+        : parseTypeScriptSource(entry.path, result.text);
+      if (!parsed) continue;
+      try {
+        facts.push(
+          collectFileFacts(entry.path, parsed.root, collectFileDefinitionNodes(entry.path, parsed.root)),
+        );
+      } finally {
+        parsed.dispose();
       }
     }
   }
-  preprocessState.cache.writeDefinitionIndex(generationId, definitions);
-  return { definitionCount: definitions.length };
-}
-
-async function extractScopeDiagram(
-  preprocessState: PreprocessState,
-  generationId: number,
-  scopePath: string,
-  shouldBuild: boolean,
-  packages: readonly PackageInfo[],
-): Promise<CacheDiagramInput> {
-  if (!shouldBuild) {
-    return {
-      graph: bareUmlDiagramGraph(scopePath),
-      outcome: { status: "ready" },
-    };
-  }
-  try {
-    return {
-      graph: await extractUmlDiagramGraph(preprocessState.sourceDir, scopePath, packages),
-      outcome: { status: "ready" },
-    };
-  } catch (error) {
-    return failedDiagramInput(
-      preprocessState,
-      generationId,
-      bareUmlDiagramGraph(scopePath),
-      errorMessage(error),
-    );
-  }
+  const snapshot = buildCatalogue(facts, [rootEntry, ...entries]);
+  preprocessState.cache.writeDefinitionIndex(generationId, snapshot);
+  return { definitionCount: snapshot.definitions.length };
 }
 
 type PreprocessedFile = {
@@ -405,11 +422,7 @@ function indexDisplayDefinitions(
     if (definition.source.path !== path) return [];
     const display = displaySpans.get(definition.key);
     return display
-      ? [{
-        ...definition,
-        displayFrom: display.from,
-        displayTo: display.to,
-      }]
+      ? [{ ...definition, displayFrom: display.from, displayTo: display.to }]
       : [];
   });
 }
@@ -417,65 +430,28 @@ function indexDisplayDefinitions(
 async function preprocessFile(
   absolutePath: string,
   path: string,
+  source: CacheFileWrite,
   rawDefinitions: readonly GotoDefinition[],
 ): Promise<PreprocessedFile> {
-  const decoded = await readFileBytes(absolutePath).then(decodeSourceBytes, () => ({
-    failure: "file is not valid UTF-8 text" as const,
-  }));
-  if ("failure" in decoded) {
-    return {
-      file: {
-        path,
-        rawContent: null,
-        displayContent: null,
-        sourceError: decoded.failure,
-        formatError: null,
-        language: highlightLanguageForPath(path) ?? null,
-      },
-      definitions: [],
-    };
+  if (source.sourceError !== null || source.rawContent === null) {
+    return { file: { ...source, displayContent: null }, definitions: [] };
   }
-  const rawContent = decoded.text;
-  const language = highlightLanguageForPath(path) ?? null;
+  const rawContent = source.rawContent;
   let file: CacheFileWrite;
   if (!isSourcePath(path)) {
-    file = {
-      path,
-      rawContent,
-      displayContent: null,
-      sourceError: null,
-      formatError: null,
-      language,
-    };
+    file = { ...source, displayContent: null, formatError: null };
   } else if (!isPrettierFormattablePath(path)) {
     // Rust is served exactly as written: there is no formatter in this pipeline.
-    file = {
-      path,
-      rawContent,
-      displayContent: rawContent,
-      sourceError: null,
-      formatError: null,
-      language,
-    };
+    file = { ...source, displayContent: rawContent, formatError: null };
   } else {
     try {
       file = {
-        path,
-        rawContent,
+        ...source,
         displayContent: await format(rawContent, { filepath: absolutePath }),
-        sourceError: null,
         formatError: null,
-        language,
       };
     } catch (error) {
-      file = {
-        path,
-        rawContent,
-        displayContent: rawContent,
-        sourceError: null,
-        formatError: errorMessage(error),
-        language,
-      };
+      file = { ...source, displayContent: rawContent, formatError: errorMessage(error) };
     }
   }
   return {
@@ -497,129 +473,116 @@ async function runPhase<Value>(
   return value;
 }
 
+type FileDiagram = { graph: UmlDiagramGraph; outcome: UmlFileOutcome };
+
+function extractFileDiagram(
+  preprocessState: PreprocessState,
+  generationId: number,
+  path: string,
+  content: string,
+): FileDiagram {
+  try {
+    const index = preprocessState.cache.createDefinitionResolutionIndex(generationId);
+    return { graph: extractFileUmlGraph(path, content, index), outcome: { status: "ready" } };
+  } catch (error) {
+    return { graph: bareUmlDiagramGraph(path), outcome: { status: "error", error: errorMessage(error) } };
+  }
+}
+
 async function preprocessScope(
   preprocessState: PreprocessState,
   generationId: number,
   cause: PreprocessCause,
   requestedScope: PreprocessScope,
-  packages: readonly PackageInfo[],
 ): Promise<{ children: PreprocessScope[] }> {
   const scope = { ...requestedScope, path: normalizeRelativePath(requestedScope.path) };
-  const absolutePath = await resolveValidatedPath(preprocessState, scope.path);
-  const info = await lstat(absolutePath);
-  const isDirectoryScope = scope.kind === "package" || scope.kind === "directory";
-  if (isDirectoryScope && !info.isDirectory()) {
-    throw new PreprocessRequestError("BAD_REQUEST", "directory scope path is not a directory");
-  }
-  if (!isDirectoryScope) await ensureRegularFile(absolutePath);
-
-  let children: TreeNode[] = [];
-  const ownEntry: TreeNode = isDirectoryScope
-    ? {
-      name: scope.path ? basename(scope.path) : basename(preprocessState.sourceDir),
-      path: scope.path,
-      kind: "directory",
-    }
-    : {
-      name: basename(scope.path),
-      path: scope.path,
-      kind: "file",
-      viewable: isSourcePath(scope.path),
+  if (scope.kind === "package" || scope.kind === "directory") {
+    // The indexed tree already holds every entry; a directory scope only fans its cascade out.
+    return {
+      children: preprocessState.cache
+        .readTreeChildren(generationId, scope.path)
+        .map((child) => ({ path: child.path, kind: child.kind })),
     };
-  if (isDirectoryScope) {
-    children = await readDirectoryEntries(preprocessState.sourceDir, scope.path);
   }
 
-  const shouldBuildUml = isDirectoryScope
-    || (analysisLanguageForPath(scope.path) !== undefined && !isDeclarationPath(scope.path));
+  const absolutePath = await resolveValidatedPath(preprocessState, scope.path);
+  await ensureRegularFile(absolutePath);
   const resource = scope.path ? `./${scope.path}` : ".";
-  const extractDiagram = () => extractScopeDiagram(
-    preprocessState,
-    generationId,
-    scope.path,
-    shouldBuildUml,
-    packages,
-  );
-  const diagram = shouldBuildUml
-    ? await runPhase(generationId, cause, "uml", resource, extractDiagram)
-    : await extractDiagram();
-  const rawDefinitions = "graph" in diagram
-    && diagram.outcome.status === "ready"
-    && diagram.graph.kind === "uml"
-    ? diagram.graph.definitions.map((definition) => ({
-      key: definition.definitionKey,
-      kind: definition.definitionKind,
-      name: definition.name,
-      qualifiedName: definition.qualifiedName,
-      source: {
-        path: definition.sourcePath,
-        line: definition.sourceLine,
-        column: definition.sourceColumn,
-      },
-      uml: {
-        scopePath: definition.umlScopePath,
-        entityName: definition.umlEntityName,
-        ...(definition.umlMemberName === null
-          ? {}
-          : { memberName: definition.umlMemberName }),
-        ...(definition.umlMemberOccurrence === null
-          ? {}
-          : { memberOccurrence: definition.umlMemberOccurrence }),
-      },
-    }))
-    : [];
-  const processedFile = isDirectoryScope
-    ? undefined
-    : isSourcePath(scope.path)
-      ? await runPhase(
-        generationId,
-        cause,
-        "code",
-        resource,
-        () => preprocessFile(
-          absolutePath,
-          scope.path,
-          rawDefinitions,
-        ),
-      )
-      : await preprocessFile(
-        absolutePath,
-        scope.path,
-        rawDefinitions,
-      );
-  const entries = [ownEntry, ...children];
-  const persistScope = (
-    nextDiagram: CacheDiagramInput,
-    definitions: readonly EditorGotoDefinition[],
-  ) => preprocessState.cache.writeScope(generationId, {
-    entries,
-    diagram: nextDiagram,
-    file: processedFile?.file,
-    definitions,
-  }, renderDiagramGraph);
-  try {
-    persistScope(diagram, processedFile?.definitions ?? []);
-  } catch (error) {
-    if (
-      !(error instanceof DiagramMaterializationError)
-      || !("graph" in diagram)
-      || diagram.outcome.status !== "ready"
-      || diagram.graph.kind !== "uml"
-      || diagram.graph.renderMode !== "normal"
-    ) throw error;
-    persistScope(failedDiagramInput(
-      preprocessState,
-      generationId,
-      bareUmlDiagramGraph(scope.path),
-      errorMessage(error),
-    ), []);
+  let source = preprocessState.cache.readFile(generationId, scope.path);
+  if (!source) {
+    const decoded = await readFileBytes(absolutePath).then(decodeSourceBytes, () => ({
+      failure: "file is not valid UTF-8 text" as const,
+    }));
+    source = "failure" in decoded
+      ? {
+        path: scope.path,
+        rawContent: null,
+        displayContent: null,
+        sourceError: decoded.failure,
+        formatError: null,
+        language: highlightLanguageForPath(scope.path) ?? null,
+      }
+      : {
+        path: scope.path,
+        rawContent: decoded.text,
+        displayContent: null,
+        sourceError: null,
+        formatError: null,
+        language: highlightLanguageForPath(scope.path) ?? null,
+      };
   }
-  return {
-    children: children.map((child) => ({
-      path: child.path,
-      kind: child.kind,
-    })),
-  };
+
+  const buildsUml = isSourcePath(scope.path);
+  const content = source.rawContent;
+  let diagram: FileDiagram | undefined;
+  let rawDefinitions: GotoDefinition[] = [];
+  if (buildsUml && content !== null) {
+    diagram = await runPhase(
+      generationId,
+      cause,
+      "uml",
+      resource,
+      async () => extractFileDiagram(preprocessState, generationId, scope.path, content),
+    );
+    rawDefinitions = collectEditorDefinitions(scope.path, content);
+  } else if (buildsUml) {
+    diagram = {
+      graph: bareUmlDiagramGraph(scope.path),
+      outcome: { status: "error", error: source.sourceError ?? "source file could not be read" },
+    };
+  }
+
+  const processedFile = buildsUml
+    ? await runPhase(
+      generationId,
+      cause,
+      "code",
+      resource,
+      () => preprocessFile(absolutePath, scope.path, source, rawDefinitions),
+    )
+    : await preprocessFile(absolutePath, scope.path, source, rawDefinitions);
+
+  const persist = (nextDiagram: typeof diagram, definitions: readonly EditorGotoDefinition[]) =>
+    preprocessState.cache.writeScope(generationId, {
+      ...(nextDiagram ? { diagram: nextDiagram } : {}),
+      file: processedFile.file,
+      definitions,
+    });
+  try {
+    persist(diagram, processedFile.definitions);
+  } catch (error) {
+    if (!(error instanceof DiagramMaterializationError) || !diagram || diagram.outcome.status !== "ready") {
+      throw error;
+    }
+    persist(
+      {
+        graph: bareUmlDiagramGraph(scope.path),
+        outcome: { status: "error", error: errorMessage(error) },
+      },
+      [],
+    );
+  }
+  return { children: [] };
 }
 
 function rawOffsetForLocation(content: string, location: SourceLocation): number {
@@ -668,7 +631,7 @@ async function readCachedFile(
   if (!record) throw new PreprocessRequestError("NOT_FOUND", `cached file not found: ${path}`);
   if (record.sourceError) throw new PreprocessRequestError("INVALID_INPUT", record.sourceError);
   if (record.rawContent === null || record.displayContent === null) {
-    throw new PreprocessRequestError("INVALID_INPUT", "source file has no display content");
+    throw new PreprocessRequestError("NOT_FOUND", `cached file not found: ${path}`);
   }
   const definitions = preprocessState.cache.readDefinitions(generationId, path);
   if (!location) {
@@ -768,7 +731,6 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
           request.generationId,
           request.cause,
           request.scope,
-          request.packages,
         ),
       );
     case "read-tree": {
@@ -789,21 +751,23 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
         throw error;
       }
     case "read-diagram": {
-      if (request.kind === "packages" && request.scopePath !== "") {
-        throw new PreprocessRequestError("BAD_REQUEST", "packages diagram scope must be the source root");
+      if (request.request.kind === "packages") {
+        const diagram = preprocessState.cache.readPackageDiagram(request.generationId);
+        if (!diagram) {
+          throw new PreprocessRequestError("NOT_FOUND", "cached packages diagram not found");
+        }
+        return success(request, { state: "complete", diagram });
       }
-      const diagram = preprocessState.cache.readDiagram(
-        request.generationId,
-        request.kind,
-        request.scopePath,
+      const target = request.request.target;
+      if (target.kind !== "directory") {
+        await resolveValidatedPath(preprocessState, target.path);
+      } else if (target.path) {
+        await resolveValidatedPath(preprocessState, target.path);
+      }
+      return success(
+        request,
+        preprocessState.cache.readUmlDiagram(request.generationId, target),
       );
-      if (!diagram) {
-        throw new PreprocessRequestError(
-          "NOT_FOUND",
-          `cached ${request.kind} diagram not found: ${request.scopePath}`,
-        );
-      }
-      return success(request, diagram);
     }
     case "read-file":
       return success(
@@ -824,6 +788,12 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
           request.line,
           request.column,
         ),
+      );
+    case "read-file-definitions":
+      // A pure index read: no cached file, highlighting or UML work is involved.
+      return success(
+        request,
+        preprocessState.cache.readFileDefinitions(request.generationId, request.path),
       );
     case "lookup-definition":
       return success(

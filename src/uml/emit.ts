@@ -1,25 +1,32 @@
-import type {
-  FileDeclaration,
-  HeritageClause,
-  MemberAssociation,
-  MethodDetails,
-  PropertyDetails,
-  UmlEntityModel,
-  UmlModifier,
-  UmlVisibility,
-} from "./model.ts";
+import type { FileDefinition } from "../types.ts";
+import type { UmlEntityModel, UmlModifier, UmlVisibility } from "./model.ts";
+import { escapeMermaidLabel, escapeMethodReturnType, escapeStructuredType } from "./mermaid.ts";
 
-// Ported verbatim from tsuml2's mermaid template: the brace replacements are deliberately
-// non-global, and every space in the class/interface/type/enum templates is load-bearing.
-function escapeMermaid(value: string): string {
-  return value.replace(/[<>]/g, "~").replace("{", "#123;").replace("}", "#125;");
-}
+/** One emitted compartment line. `definitionKey` is null for a synthetic method-return row. */
+export type EmittedRow = { text: string; definitionKey: string | null };
+
+export type EmittedBlock = {
+  dsl: string;
+  /** Emitted as its own `class id["label"]` statement, exactly like the previous renderer. */
+  label: string;
+  /** `.members-group` order: properties, or an enum's values. */
+  attributes: EmittedRow[];
+  /** `.methods-group` order, including synthetic return rows. */
+  methods: EmittedRow[];
+};
+
+/** Kinds Mermaid renders with their own stereotype; a plain class carries none. */
+const STEREOTYPE_BY_KIND: Record<string, string | undefined> = {
+  interface: "interface",
+  trait: "trait",
+  struct: "struct",
+  union: "union",
+  enum: "enumeration",
+  type: "type",
+};
 
 function applyModifiers(modifiers: readonly UmlModifier[], text: string): string {
-  let result = "";
-  if (modifiers.includes("private")) result = "-";
-  else if (modifiers.includes("protected")) result = "#";
-  else result = "+";
+  let result = modifiers.includes("private") ? "-" : modifiers.includes("protected") ? "#" : "+";
   result += text;
   // UML2: a static member is underlined, an abstract member is italic.
   if (modifiers.includes("static")) result += "$";
@@ -27,83 +34,69 @@ function applyModifiers(modifiers: readonly UmlModifier[], text: string): string
   return result;
 }
 
-function propertyRow(property: PropertyDetails, types: boolean): string {
-  let result = property.name;
-  if (types && property.type) {
-    if (property.optional) result += "?";
-    result += `: ${escapeMermaid(property.type)}`;
+function escapeMermaidRow(value: string): string {
+  return value.replace(/[<>]/g, "~").replace("{", "#123;").replace("}", "#125;");
+}
+
+/**
+ * One box. Nominal entities render their compartments; every other definition renders its native
+ * kind plus, when Types is on, its declared type or signature.
+ */
+export function emitMermaidClassBlock(input: {
+  nodeId: string;
+  definition: FileDefinition;
+  detail: UmlEntityModel | null;
+  visibility: UmlVisibility;
+}): EmittedBlock {
+  const { nodeId, definition, detail, visibility } = input;
+  const attributes: EmittedRow[] = [];
+  const methods: EmittedRow[] = [];
+  if (detail) {
+    if (visibility.attributes) {
+      for (const item of detail.items) {
+        attributes.push({ text: escapeMermaidRow(item.value), definitionKey: item.definitionKey });
+      }
+      for (const property of detail.properties) {
+        let text = property.name;
+        const type = visibility.types ? escapeStructuredType(property.type) : undefined;
+        if (type) text += `${property.optional ? "?" : ""}: ${escapeMermaidRow(type)}`;
+        attributes.push({
+          text: applyModifiers(property.modifiers, text),
+          definitionKey: property.definitionKey,
+        });
+      }
+    }
+    if (visibility.methods) {
+      for (const method of detail.methods) {
+        methods.push({
+          text: applyModifiers(method.modifiers, `${method.name}()`),
+          definitionKey: method.definitionKey,
+        });
+        const returnRow = visibility.types ? escapeMethodReturnType(method.returnType) : undefined;
+        if (returnRow) methods.push({ text: escapeMermaidRow(returnRow), definitionKey: null });
+      }
+    }
+  } else if (visibility.types) {
+    attributes.push({
+      text: escapeMermaidRow(escapeStructuredType(definition.type ?? undefined) ?? "—"),
+      definitionKey: null,
+    });
   }
-  return applyModifiers(property.modifiers, result);
-}
 
-function methodRow(method: MethodDetails, types: boolean): string {
-  let result = `${method.name}()`;
-  if (types && method.returnType) result += ` ${escapeMermaid(method.returnType)}`;
-  return applyModifiers(method.modifiers, result);
-}
-
-function members(entity: UmlEntityModel, visibility: UmlVisibility): { props: string; methods: string } {
-  return {
-    props: visibility.attributes
-      ? entity.properties.map((property) => propertyRow(property, visibility.types)).join("\n")
-      : "",
-    methods: visibility.methods
-      ? entity.methods.map((method) => methodRow(method, visibility.types)).join("\n")
-      : "",
-  };
-}
-
-function classBlock(entity: UmlEntityModel, visibility: UmlVisibility): string {
-  const { props, methods } = members(entity, visibility);
-  return `class ${escapeMermaid(entity.name)}{
-            ${props}
-            ${methods}
-        }`;
-}
-
-function structuredBlock(entity: UmlEntityModel, stereotype: "interface" | "type", visibility: UmlVisibility): string {
-  const { props, methods } = members(entity, visibility);
-  return `class ${escapeMermaid(entity.name)} {
-            <<${stereotype}>>
-            ${props}
-            ${methods}
-        }`;
-}
-
-function enumBlock(entity: UmlEntityModel, visibility: UmlVisibility): string {
-  return `class ${escapeMermaid(entity.name)} {
-        <<enumeration>>
-        ${visibility.attributes ? entity.items.join("\n") : ""}
-      }`;
-}
-
-function heritageRow(clause: HeritageClause): string {
-  const separator = clause.relation === "extends" ? "<|--" : "<|..";
-  return `${escapeMermaid(clause.clause)}${separator}${escapeMermaid(clause.className)}`;
-}
-
-function associationRow(association: MemberAssociation): string {
-  const multiplicityA = association.a.multiplicity ? `"${association.a.multiplicity}"` : "";
-  const multiplicityB = association.b.multiplicity ? `"${association.b.multiplicity}"` : "";
-  return `${escapeMermaid(association.a.name)} ${multiplicityA} -- ${multiplicityB} ${
-    escapeMermaid(association.b.name)
-  }`;
-}
-
-export function emitMermaidClassDiagram(
-  declarations: readonly FileDeclaration[],
-  visibility: UmlVisibility,
-): string {
-  const entities = declarations.flatMap((declaration) => [
-    ...declaration.classes.map((entity) => classBlock(entity, visibility)),
-    ...declaration.interfaces.map((entity) => structuredBlock(entity, "interface", visibility)),
-    ...declaration.enums.map((entity) => enumBlock(entity, visibility)),
-    ...declaration.types.map((entity) => structuredBlock(entity, "type", visibility)),
-    ...declaration.heritageClauses.flat().map(heritageRow),
-    ...(declaration.memberAssociations ?? []).map(associationRow),
-  ]);
-  if (entities.length === 0) entities.push("[Could not process any class / interface / enum / type]");
-  // tsuml2's header is `'\nclassDiagram\n' + settings.mermaid.join("\n") + '\n'`, joined to the
-  // body with one more newline; `settings.mermaid` was always empty.
-  return `\nclassDiagram\n\n\n${entities.join("\n")}`;
+  const kind = detail?.kind ?? definition.kind;
+  const stereotype = STEREOTYPE_BY_KIND[kind] ?? (detail ? undefined : kind);
+  const body = [
+    ...(stereotype ? [`<<${stereotype}>>`] : []),
+    ...attributes.map((row) => row.text),
+    ...methods.map((row) => row.text),
+  ];
+  const label = escapeMermaidLabel(
+    (detail?.name ?? definition.name).replaceAll("<", "⟨").replaceAll(">", "⟩"),
+  );
+  const dsl = [
+    `class ${nodeId} {`,
+    ...body.map((line) => `  ${line}`),
+    "}",
+  ].join("\n");
+  return { dsl, label, attributes, methods };
 }

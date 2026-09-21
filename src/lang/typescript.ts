@@ -1,6 +1,6 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
 import { namedChildren } from "./ast.ts";
-import { definitionLanguageForPath } from "./registry.ts";
+import { highlightLanguageForPath } from "./registry.ts";
 import { loadLanguage, parseTree } from "./runtime.ts";
 
 export const ENTITY_KIND_BY_NODE: Record<string, "class" | "interface" | "enum" | "type"> = {
@@ -17,26 +17,22 @@ export const METHOD_NODE_TYPES: ReadonlySet<string> = new Set([
   "abstract_method_signature",
 ]);
 
-export const TYPE_REFERENCE_NODE_TYPES: ReadonlySet<string> = new Set([
-  "type_identifier",
-  "identifier",
-]);
-
 // Declared after the tables above and awaited last on purpose: the top-level `await` suspends this
 // module mid-evaluation, and `src/uml/resolve.ts` / `src/uml/usage.ts` read the tables at *their*
 // module scope. Anything declared below this point is still in TDZ for them.
 const GRAMMARS = {
   typescript: await loadLanguage("typescript"),
   tsx: await loadLanguage("tsx"),
+  javascript: await loadLanguage("javascript"),
 };
 
-/** `undefined` when `path` is not TypeScript/TSX. Caller MUST `dispose()`. */
+/** `undefined` when `path` is not TypeScript/TSX/JavaScript. Caller MUST `dispose()`. */
 export function parseTypeScriptSource(
   path: string,
   source: string,
 ): { root: Node; dispose(): void } | undefined {
-  const language = definitionLanguageForPath(path);
-  if (!language) return undefined;
+  const language = highlightLanguageForPath(path);
+  if (language === undefined || language === "rust") return undefined;
   const parsed = parseTree(GRAMMARS[language], source);
   return { root: parsed.tree.rootNode, dispose: parsed.dispose };
 }
@@ -74,14 +70,13 @@ export function topLevelDeclarations(root: Node): Node[] {
   return result;
 }
 
-/** Bare declared name of any named declaration node. */
-export function declarationName(node: Node): string | undefined {
-  return node.childForFieldName("name")?.text;
-}
-
-/** Canonical member name and the node carrying it, or `undefined` for computed names. */
+/**
+ * Canonical member name and the node carrying it, or `undefined` for computed names. The
+ * JavaScript grammar keeps a `field_definition`'s name under `property`, so both fields are read;
+ * the accepted name-node types are unchanged.
+ */
 export function memberName(node: Node): { name: string; node: Node } | undefined {
-  const nameNode = node.childForFieldName("name");
+  const nameNode = node.childForFieldName("name") ?? node.childForFieldName("property");
   if (!nameNode) return undefined;
   if (
     nameNode.type === "property_identifier"
@@ -105,15 +100,4 @@ export function isAccessor(node: Node): boolean {
 /** The annotated type node behind a `type` / `return_type` field, without the leading `:`. */
 export function annotationType(node: Node, field: "type" | "return_type"): Node | undefined {
   return node.childForFieldName(field)?.namedChild(0) ?? undefined;
-}
-
-/** Every type reference inside an annotation, in source order. */
-export function typeReferenceNodes(node: Node): Node[] {
-  const result: Node[] = [];
-  const visit = (current: Node): void => {
-    if (TYPE_REFERENCE_NODE_TYPES.has(current.type)) result.push(current);
-    for (const child of namedChildren(current)) visit(child);
-  };
-  visit(node);
-  return result;
 }

@@ -6,13 +6,14 @@ import {
   type Request,
   type Response,
   type Route,
+  type TestInfo,
   type WebSocket as PlaywrightWebSocket,
 } from "@playwright/test";
 import {
   spawn,
   type ChildProcessByStdio,
 } from "node:child_process";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -21,12 +22,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type {
   DiagramResponse,
-  FileResponse,
-  GotoDefinitionLookupResponse,
-  PreprocessControlRequest,
-  PreprocessPriorityResponse,
-  WatchMessage,
   SearchResponse,
+  WatchMessage,
 } from "../../src/types.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -334,6 +331,64 @@ async function cleanupAll(): Promise<void> {
   if (failures.length > 0) throw new AggregateError(failures, "E2E cleanup failed");
 }
 
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const ROOT_SOURCE = [
+  'import { B } from "./b";',
+  "export class Root {",
+  "  value: B;",
+  "  run(): B { return new B(); }",
+  "}",
+  "export class Isolated {}",
+  "",
+].join("\n");
+
+/**
+ * The rooted-UML fixture: one outgoing chain with a cycle (`Root -> B <-> C`), an isolated root,
+ * files that are only importers, a test file, a JavaScript pair and a class whose name and member
+ * type are full of Mermaid-special characters.
+ */
+async function createUmlFixture(resource: TestResource): Promise<string> {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-uml-e2e-"));
+  resource.fixtureRoot = fixtureRoot;
+  await Promise.all([
+    mkdir(join(fixtureRoot, "feature")),
+    mkdir(join(fixtureRoot, "shared")),
+  ]);
+  const files: Record<string, string> = {
+    "package.json": `${JSON.stringify({ name: "uml-e2e", private: true })}\n`,
+    "feature/root.ts": ROOT_SOURCE,
+    "feature/b.ts": ['import { C } from "../shared/c";', "export class B { value: C; }", ""].join("\n"),
+    "feature/boxed.ts": [
+      "export class Box<TValue> {",
+      "  entries: Record<string, { value: TValue }>;",
+      "}",
+      "",
+    ].join("\n"),
+    "feature/side-effect.ts": ['import "../shared/extra";', "export const sideEffect = true;", ""].join("\n"),
+    "feature/root.test.ts": ['import { Root } from "./root";', "export const spec = new Root();", ""].join("\n"),
+    "shared/c.ts": [
+      'import { B } from "../feature/b";',
+      'import { extra } from "./extra";',
+      "export class C { value: B; }",
+      "export const useExtra = extra;",
+      "",
+    ].join("\n"),
+    "shared/extra.ts": "export const extra = 1;\n",
+    "consumer.ts": ['import { Root } from "./feature/root";', "export class Consumer { value: Root; }", ""].join("\n"),
+    "unrelated.ts": "export class Unrelated {}\n",
+    "empty.ts": "",
+    "helper.js": "export function helper(value) { return value + 1; }\n",
+    "caller.js": ['import { helper } from "./helper.js";', "export function caller(n) { return helper(n); }", ""].join("\n"),
+  };
+  await Promise.all(
+    Object.entries(files).map(([path, content]) => writeFile(join(fixtureRoot, path), content)),
+  );
+  return fixtureRoot;
+}
+
 async function createNestedPackagesFixture(resource: TestResource): Promise<string> {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-packages-e2e-"));
   resource.fixtureRoot = fixtureRoot;
@@ -357,7 +412,8 @@ async function createNestedPackagesFixture(resource: TestResource): Promise<stri
   return fixtureRoot;
 }
 
-async function createFixture(resource: TestResource): Promise<string> {
+/** A deliberately slow project: the tree must paint long before the cache finishes. */
+async function createBulkFixture(resource: TestResource): Promise<string> {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-e2e-"));
   resource.fixtureRoot = fixtureRoot;
   await writeFile(
@@ -441,6 +497,10 @@ async function createFixture(resource: TestResource): Promise<string> {
   );
   return fixtureRoot;
 }
+
+// ---------------------------------------------------------------------------
+// Watcher + CLI helpers
+// ---------------------------------------------------------------------------
 
 function isWatchMessage(value: unknown): value is WatchMessage {
   if (typeof value !== "object" || value === null) return false;
@@ -571,112 +631,6 @@ async function navigateToCli(
   throw new Error(`CLI did not accept navigation within 30 seconds\n${cli ? describeCli(cli) : "CLI was not spawned"}`);
 }
 
-type DefinitionRequestObservation = {
-  path: string;
-  line: number;
-  column: number;
-};
-
-type DefinitionResponseObservation = DefinitionRequestObservation & {
-  status: number;
-  body: GotoDefinitionLookupResponse;
-};
-
-type PreprocessResponseObservation = {
-  request: PreprocessControlRequest;
-  status: number;
-  body: PreprocessPriorityResponse;
-};
-
-function observeDefinitionApi(page: Page): {
-  definitionRequests: DefinitionRequestObservation[];
-  definitionResponses: DefinitionResponseObservation[];
-  preprocessRequests: PreprocessControlRequest[];
-  preprocessResponses: PreprocessResponseObservation[];
-  flush(): Promise<void>;
-  stop(): Promise<void>;
-} {
-  const definitionRequests: DefinitionRequestObservation[] = [];
-  const definitionResponses: DefinitionResponseObservation[] = [];
-  const preprocessRequests: PreprocessControlRequest[] = [];
-  const preprocessResponses: PreprocessResponseObservation[] = [];
-  const pending = new Set<Promise<void>>();
-
-  const locationFromUrl = (url: URL): DefinitionRequestObservation => ({
-    path: url.searchParams.get("path") ?? "",
-    line: Number(url.searchParams.get("line")),
-    column: Number(url.searchParams.get("column")),
-  });
-  const onRequest = (request: Request) => {
-    const url = new URL(request.url());
-    if (url.pathname === "/api/goto-definition") {
-      definitionRequests.push(locationFromUrl(url));
-      return;
-    }
-    if (url.pathname !== "/api/preprocess" || request.method() !== "POST") return;
-    const body = request.postDataJSON() as PreprocessControlRequest;
-    preprocessRequests.push(body);
-  };
-  const onResponse = (response: Response) => {
-    const url = new URL(response.url());
-    if (url.pathname !== "/api/goto-definition" && url.pathname !== "/api/preprocess") return;
-    let capture!: Promise<void>;
-    capture = (async () => {
-      if (url.pathname === "/api/goto-definition") {
-        definitionResponses.push({
-          ...locationFromUrl(url),
-          status: response.status(),
-          body: await response.json() as GotoDefinitionLookupResponse,
-        });
-        return;
-      }
-      preprocessResponses.push({
-        request: response.request().postDataJSON() as PreprocessControlRequest,
-        status: response.status(),
-        body: await response.json() as PreprocessPriorityResponse,
-      });
-    })().finally(() => pending.delete(capture));
-    pending.add(capture);
-    void capture.catch(() => undefined);
-  };
-
-  page.on("request", onRequest);
-  page.on("response", onResponse);
-  const flush = async () => {
-    while (pending.size > 0) await Promise.all([...pending]);
-  };
-  return {
-    definitionRequests,
-    definitionResponses,
-    preprocessRequests,
-    preprocessResponses,
-    flush,
-    async stop() {
-      page.off("request", onRequest);
-      page.off("response", onResponse);
-      await flush();
-    },
-  };
-}
-
-async function readDefinition(
-  page: Page,
-  location: DefinitionRequestObservation,
-): Promise<{ status: number; body: GotoDefinitionLookupResponse }> {
-  return page.evaluate(async (requested) => {
-    const query = new URLSearchParams({
-      path: requested.path,
-      line: String(requested.line),
-      column: String(requested.column),
-    });
-    const response = await fetch(`/api/goto-definition?${query}`);
-    return {
-      status: response.status,
-      body: await response.json() as GotoDefinitionLookupResponse,
-    };
-  }, location);
-}
-
 async function expectCliOutput(
   cli: SpawnedCli,
   expected: string,
@@ -691,174 +645,1003 @@ async function expectCliOutput(
   ).toContain(expected);
 }
 
+// ---------------------------------------------------------------------------
+// Response gating
+// ---------------------------------------------------------------------------
+
+type ResponseGate = {
+  handler(route: Route): Promise<void>;
+  /** Resolves once a matching response has been fetched from the server and is being held. */
+  captured: Promise<void>;
+  /** Resolves once the held response has been delivered to the page. */
+  finished: Promise<void>;
+  release(): void;
+};
+
+/** Holds the *first* matching response; every later request passes straight through. */
+function createResponseGate(matches: (url: URL) => boolean): ResponseGate {
+  const captured = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  let held = false;
+  return {
+    captured: captured.promise,
+    finished: finished.promise,
+    release: () => released.resolve(),
+    async handler(route: Route): Promise<void> {
+      if (held || !matches(new URL(route.request().url()))) {
+        await route.continue();
+        return;
+      }
+      held = true;
+      const response = await route.fetch();
+      captured.resolve();
+      await released.promise;
+      await route.fulfill({ response });
+      finished.resolve();
+    },
+  };
+}
+
+function isUmlDiagramUrl(url: URL, target: string, path: string): boolean {
+  return url.pathname === "/api/diagram" &&
+    url.searchParams.get("kind") === "uml" &&
+    url.searchParams.get("target") === target &&
+    url.searchParams.get("path") === path;
+}
+
+// ---------------------------------------------------------------------------
+// Tree helpers
+// ---------------------------------------------------------------------------
+
+function treeRow(page: Page, path: string) {
+  return page.locator(`.tree-row[data-tree-path="${path}"]`);
+}
+
+function treeToggle(page: Page, path: string) {
+  return page.locator(`.tree-toggle[data-tree-path="${path}"]`);
+}
+
+function definitionRow(page: Page, path: string, qualifiedName: string) {
+  return page
+    .locator(`.tree-definition-row[data-source-path="${path}"]`)
+    .filter({
+      has: page.locator(".tree-definition-name", { hasText: new RegExp(`^${qualifiedName}$`) }),
+    });
+}
+
+function definitionNames(page: Page, path: string) {
+  return page.locator(`.tree-definition-row[data-source-path="${path}"] .tree-definition-name`);
+}
+
+function outlineMessage(page: Page, path: string) {
+  return page.locator(`.tree-definitions[aria-label="Definitions in ${path}"] .tree-definition-message`);
+}
+
+/** Expansion is chevron-only: a label click never changes it. */
+async function expandTree(page: Page, path: string): Promise<void> {
+  const toggle = treeToggle(page, path);
+  await expect(toggle).toBeVisible({ timeout: 15_000 });
+  if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+}
+
+async function collapseTree(page: Page, path: string): Promise<void> {
+  const toggle = treeToggle(page, path);
+  await expect(toggle).toBeVisible({ timeout: 15_000 });
+  if (await toggle.getAttribute("aria-expanded") === "true") await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+}
+
+/** Expands a file through its chevron, then opens Editor by double-clicking one definition. */
+async function openDefinitionSource(
+  page: Page,
+  filePath: string,
+  qualifiedName: string,
+): Promise<void> {
+  await expandTree(page, filePath);
+  const row = definitionRow(page, filePath, qualifiedName);
+  await expect(row).toHaveCount(1, { timeout: 30_000 });
+  await row.dblclick();
+}
+
+async function readDefinitionKey(
+  page: Page,
+  path: string,
+  qualifiedName: string,
+): Promise<string> {
+  const key = await page.evaluate(async (request) => {
+    const response = await fetch(
+      `/api/file-definitions?${new URLSearchParams({ path: request.path })}`,
+    );
+    const body = await response.json() as {
+      definitions: { key: string; qualifiedName: string }[];
+    };
+    return body.definitions.find(
+      (definition) => definition.qualifiedName === request.qualifiedName,
+    )?.key ?? null;
+  }, { path, qualifiedName });
+  if (key === null) throw new Error(`${qualifiedName} is not indexed in ${path}`);
+  return key;
+}
+
+// ---------------------------------------------------------------------------
+// Diagram helpers
+// ---------------------------------------------------------------------------
+
+function frameHeadings(page: Page) {
+  return page.locator("#svg-holder .uml-frame .uml-frame-heading");
+}
+
+function definitionLink(page: Page, qualifiedName: string) {
+  return page.locator(
+    `#svg-holder [data-diagram-link][aria-label="Select ${qualifiedName}; double-click to open its source"]`,
+  );
+}
+
+/**
+ * Tags the SVG node a gesture is about to press. A repaint replaces the whole `#svg-holder`, so
+ * the marker disappearing is proof that the pressed node is no longer under the pointer.
+ */
+async function markPressedLink(page: Page, qualifiedName: string): Promise<void> {
+  await page.evaluate((label) => {
+    document
+      .querySelector(`#svg-holder [data-diagram-link][aria-label="${label}"]`)
+      ?.setAttribute("data-pressed-link", "1");
+  }, `Select ${qualifiedName}; double-click to open its source`);
+  await expect(page.locator("[data-pressed-link]")).toHaveCount(1);
+}
+
+/** Node identities as painted, sorted so a layout order change cannot break the assertion. */
+function diagramNodeNames(page: Page, frameIndex?: number): Promise<string[]> {
+  return page.evaluate((index) => {
+    const scope = index === undefined
+      ? document.querySelector("#svg-holder")
+      : document.querySelectorAll(".uml-frame")[index];
+    if (!scope) return [];
+    return [...scope.querySelectorAll("g.node")]
+      .map((node) => {
+        const label = node.querySelector(".label-group .label")
+          ?? node.querySelector(".nodeLabel")
+          ?? node;
+        return (label.textContent ?? "").trim();
+      })
+      .sort();
+  }, frameIndex);
+}
+
+/** The painted outline of every definition box; the selected root is drawn thicker. */
+function definitionNodeOutlines(page: Page): Promise<
+  { name: string; root: boolean; strokeWidth: string }[]
+> {
+  return page.evaluate(() =>
+    [...document.querySelectorAll<SVGGElement>("#svg-holder g.node")].map((node) => {
+      const shape = [...node.querySelectorAll<SVGPathElement>(".label-container > path")].at(-1);
+      return {
+        name: (node.querySelector(".label-group .label")?.textContent ?? "").trim(),
+        root: node.classList.contains("rootNode"),
+        strokeWidth: shape ? getComputedStyle(shape).strokeWidth : "",
+      };
+    })
+  );
+}
+
+function fileNodeOutlines(page: Page): Promise<
+  { path: string; boundary: boolean; test: boolean; dashed: boolean }[]
+> {
+  return page.evaluate(() =>
+    [...document.querySelectorAll<SVGGElement>("#svg-holder g.node")].map((node) => {
+      const shape = node.querySelector<SVGGraphicsElement>("rect, path, polygon");
+      return {
+        path: (node.querySelector(".nodeLabel")?.textContent ?? "").trim(),
+        boundary: node.classList.contains("boundaryFile"),
+        test: node.classList.contains("testFile"),
+        dashed: shape ? getComputedStyle(shape).strokeDasharray !== "none" : false,
+      };
+    })
+  );
+}
+
+function afterTwoAnimationFrames(page: Page): Promise<void> {
+  return page.evaluate(() =>
+    new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    })
+  );
+}
+
+/** Viewport coordinates of an element, scrolled into the stage first so a press can reach it. */
+async function centreOf(
+  locator: ReturnType<Page["locator"]>,
+): Promise<{ x: number; y: number }> {
+  await locator.scrollIntoViewIfNeeded();
+  const box = await locator.boundingBox();
+  if (!box) throw new Error("the element has no bounding box");
+  return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+}
+
+/** One primary tap: pointerdown + pointerup without moving. */
+async function tap(page: Page, point: { x: number; y: number }): Promise<void> {
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.down();
+  await page.mouse.up();
+}
+
+/** Keeps the rendered diagram as an inspectable artefact next to the run's other output. */
+async function attachScreenshot(page: Page, testInfo: TestInfo, name: string): Promise<void> {
+  const path = testInfo.outputPath(`${name}.png`);
+  await page.screenshot({ path });
+  await testInfo.attach(name, { path, contentType: "image/png" });
+}
+
+function countRequests(page: Page, matches: (url: URL) => boolean): {
+  readonly count: number;
+  stop(): void;
+} {
+  let count = 0;
+  const listener = (request: Request): void => {
+    if (matches(new URL(request.url()))) count += 1;
+  };
+  page.on("request", listener);
+  return {
+    get count() {
+      return count;
+    },
+    stop() {
+      page.off("request", listener);
+    },
+  };
+}
+
 test.afterEach(async ({ browserName }, testInfo) => {
   void browserName;
   testInfo.setTimeout(20_000);
   await cleanupAll();
 });
 
-test("clicking a nested source directory selects its UML scope", async ({ browser }) => {
+// ---------------------------------------------------------------------------
+// Selection, expansion and activation
+// ---------------------------------------------------------------------------
+
+test("tree labels select UML targets while chevrons only change expansion", async ({ browser }) => {
+  test.setTimeout(150_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createNestedPackagesFixture(resource);
+    const fixtureRoot = await createUmlFixture(resource);
     resource.context = await browser.newContext();
     resource.page = await resource.context.newPage();
     const page = resource.page;
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
 
-    const runtimeRow = page.locator(
-      '.tree-row[data-tree-path="junco-runtime"]',
+    // A chevron only expands; Packages stays painted and the editor stays closed.
+    const paintedBeforeExpansion = await page.locator("#dsl-content").textContent();
+    await expandTree(page, "feature");
+    await expect(treeRow(page, "feature/root.ts")).toBeVisible();
+    await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
+    await expect(page.locator("#dsl-content")).toHaveText(paintedBeforeExpansion ?? "");
+    await expect(page.locator("#editor-panel")).toBeHidden();
+
+    // A file label selects that file: one frame per top-level definition, in source order.
+    await treeRow(page, "feature/root.ts").click();
+    await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
     );
-    await Promise.all([
-      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
-        timeout: 10_000,
-      }),
-      expect(runtimeRow).toBeVisible({ timeout: 10_000 }),
-      withBound(watch.cacheReady, 45_000, "nested packages cache-ready version 0"),
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    await expect(treeRow(page, "feature/root.ts")).toHaveAttribute("aria-current", "true");
+    // Selecting never expands.
+    await expect(treeToggle(page, "feature/root.ts")).toHaveAttribute("aria-expanded", "false");
+    expect(await diagramNodeNames(page, 0)).toEqual(["B", "C", "Root"]);
+    expect(await diagramNodeNames(page, 1)).toEqual(["Isolated"]);
+
+    // Expanding the selected file changes the outline, never the painted view.
+    const paintedBeforeOutline = await page.locator("#dsl-content").textContent();
+    await expandTree(page, "feature/root.ts");
+    await expect(definitionNames(page, "feature/root.ts")).toHaveText(
+      ["Root", "Root.value", "Root.run", "Isolated"],
+      { timeout: 30_000 },
+    );
+    await expect(page.locator("#dsl-content")).toHaveText(paintedBeforeOutline ?? "");
+    await expect(treeRow(page, "feature/root.ts")).toHaveAttribute("aria-current", "true");
+
+    // A definition label selects exactly that root.
+    const rootKey = await readDefinitionKey(page, "feature/root.ts", "Root");
+    const rootRow = definitionRow(page, "feature/root.ts", "Root");
+    await expect(rootRow).toHaveAttribute("data-definition-key", rootKey);
+    await rootRow.click();
+    await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    await expect(rootRow).toHaveAttribute("aria-current", "true");
+    await expect(treeRow(page, "feature/root.ts")).not.toHaveAttribute("aria-current", "true");
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    // Outgoing transitive closure only: Consumer imports Root, Isolated is a sibling root.
+    expect(await diagramNodeNames(page)).toEqual(["B", "C", "Root"]);
+
+    // A method is its own root and carries only its own outgoing references.
+    await definitionRow(page, "feature/root.ts", "Root.run").click();
+    await expect(frameHeadings(page)).toHaveText(["Root.run · feature/root.ts"], { timeout: 60_000 });
+    expect(await diagramNodeNames(page)).toEqual(["B", "C", "run"]);
+
+    // A directory label selects the file-import view for that subtree.
+    await treeRow(page, "feature").click();
+    await expect(frameHeadings(page)).toHaveText(["feature"], { timeout: 60_000 });
+    await expect(page.locator("#dsl-content")).toContainText("flowchart LR");
+    expect(await diagramNodeNames(page)).toEqual([
+      "feature/b.ts",
+      "feature/boxed.ts",
+      "feature/root.test.ts",
+      "feature/root.ts",
+      "feature/side-effect.ts",
+      "shared/c.ts",
+      "shared/extra.ts",
     ]);
-    await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo", {
-      timeout: 30_000,
-    });
+    await expect(treeRow(page, "feature")).toHaveAttribute("aria-current", "true");
+    await expect(page.locator("#editor-panel")).toBeHidden();
 
-    await runtimeRow.click();
-    const dsl = page.locator("#dsl-content");
-    await expect(page.locator("#diagram-loading")).toBeHidden({
-      timeout: 30_000,
-    });
-    await expect(dsl).toContainText("classDiagram");
+    // Collapsing keeps the selection and the painted view.
+    const paintedBeforeCollapse = await page.locator("#dsl-content").textContent();
+    await collapseTree(page, "feature/root.ts");
+    await expect(definitionNames(page, "feature/root.ts")).toHaveCount(0);
+    await expect(page.locator("#dsl-content")).toHaveText(paintedBeforeCollapse ?? "");
+    await expect(treeRow(page, "feature")).toHaveAttribute("aria-current", "true");
+  } finally {
+    await cleanupResource(resource);
+  }
+});
 
-    const preprocessRoutePattern = "**/api/preprocess";
-    type HeldSourcePriority = {
-      request: Extract<PreprocessControlRequest, { action: "prioritize" }>;
-      body: PreprocessPriorityResponse;
-      status: number;
-    };
-    let resolveCaptured!: (priority: HeldSourcePriority) => void;
-    const captured = new Promise<HeldSourcePriority>((resolve) => {
-      resolveCaptured = resolve;
-    });
-    let resolveRelease!: () => void;
-    const releaseSignal = new Promise<void>((resolve) => {
-      resolveRelease = resolve;
-    });
-    let resolveFinished!: () => void;
-    const finished = new Promise<void>((resolve) => {
-      resolveFinished = resolve;
-    });
-    let held = false;
-    let released = false;
-    const release = (): void => {
-      if (released) return;
-      released = true;
-      resolveRelease();
-    };
-    const priorityGate = async (route: Route): Promise<void> => {
-      const request = route.request();
-      if (request.method() !== "POST") {
-        await route.continue();
-        return;
-      }
-      const requestBody = request.postDataJSON() as PreprocessControlRequest;
-      if (
-        held ||
-        requestBody.action !== "prioritize" ||
-        requestBody.resource !== "./junco-runtime"
-      ) {
-        await route.continue();
-        return;
-      }
-      held = true;
-      const fetchedResponse = await route.fetch();
-      const responseBody = await fetchedResponse.json() as PreprocessPriorityResponse;
-      resolveCaptured({
-        request: requestBody,
-        body: responseBody,
-        status: fetchedResponse.status(),
-      });
-      await releaseSignal;
-      await route.fulfill({ response: fetchedResponse });
-      resolveFinished();
-    };
-    const nestedSourceDiagramRequests: Request[] = [];
-    let resolveNestedSourceDiagramRequest!: (request: Request) => void;
-    const nestedSourceDiagramRequest = new Promise<Request>((resolve) => {
-      resolveNestedSourceDiagramRequest = resolve;
-    });
-    const observeNestedSourceDiagramRequest = (request: Request): void => {
-      const url = new URL(request.url());
-      if (
-        url.pathname === "/api/diagram" &&
-        url.searchParams.get("kind") === "uml" &&
-        url.searchParams.get("path") === "junco-runtime"
-      ) {
-        nestedSourceDiagramRequests.push(request);
-        if (nestedSourceDiagramRequests.length === 1) {
-          resolveNestedSourceDiagramRequest(request);
-        }
-      }
-    };
-    page.on("request", observeNestedSourceDiagramRequest);
-    await page.route(preprocessRoutePattern, priorityGate);
+test("double-click opens the exact source while its diagram response is held", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "consumer.ts")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+
+    // A fast held response: the selection the first click started must not steal the editor.
+    const fileGate = createResponseGate((url) => isUmlDiagramUrl(url, "file", "consumer.ts"));
+    await page.route("**/api/diagram?*", fileGate.handler);
     try {
-      await runtimeRow.click();
-      const heldPriority = await withBound(
-        captured,
-        10_000,
-        "junco-runtime prioritize response",
-      );
-
-      await expect(page.locator("#diagram-loading")).toBeVisible();
-      await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-      expect(nestedSourceDiagramRequests).toHaveLength(0);
-      await expect(dsl).toContainText("classDiagram");
-      await expect(dsl).not.toContainText("flowchart LR");
-
-      release();
-      await withBound(
-        finished,
-        10_000,
-        "released junco-runtime prioritize response",
-      );
-      expect(heldPriority.request).toEqual({
-        action: "prioritize",
-        resource: "./junco-runtime",
-      });
-      expect(heldPriority.status).toBe(200);
-      expect(heldPriority.body.resource).toBe("junco-runtime");
-      expect(Number.isSafeInteger(heldPriority.body.requestId)).toBe(true);
-      expect(heldPriority.body.requestId).toBeGreaterThan(0);
-      expect(["queued", "processing", "done"]).toContain(heldPriority.body.status);
-
-      const diagramRequest = await withBound(
-        nestedSourceDiagramRequest,
-        30_000,
-        "junco-runtime UML diagram request after priority completion",
-      );
-      const diagramUrl = new URL(diagramRequest.url());
-      expect(diagramUrl.searchParams.get("kind")).toBe("uml");
-      expect(diagramUrl.searchParams.get("path")).toBe("junco-runtime");
-      expect((await diagramRequest.response())?.status()).toBe(200);
-      await expect(dsl).toContainText("classDiagram");
-      await expect(dsl).toContainText("JuncoRuntimeDemo");
-      await expect(dsl).not.toContainText("flowchart LR");
-      await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
-      await expect(page.locator("#packages-mode")).not.toHaveClass(/\bactive\b/);
-      await expect(page.locator("#diagram-loading")).toBeHidden();
-      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
-      await expect(page.locator("#error-panel")).toBeHidden();
+      await treeRow(page, "consumer.ts").dblclick();
+      await withBound(fileGate.captured, 30_000, "held consumer.ts file diagram");
+      await expect(page.locator("#editor-path")).toHaveText("consumer.ts", { timeout: 30_000 });
+      await expect(page.locator(".cm-content")).toContainText("export class Consumer");
+      fileGate.release();
+      await withBound(fileGate.finished, 15_000, "released consumer.ts file diagram");
+      await afterTwoAnimationFrames(page);
+      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+      await expect(page.locator("#editor-panel")).toBeVisible();
+      await expect(page.locator("#graph-panel")).toBeHidden();
+      await expect(page.locator("#editor-path")).toHaveText("consumer.ts");
     } finally {
-      release();
-      await page.unroute(preprocessRoutePattern, priorityGate);
-      page.off("request", observeNestedSourceDiagramRequest);
+      fileGate.release();
+      await page.unroute("**/api/diagram?*", fileGate.handler);
+    }
+
+    // A delayed held response, released well after the editor settled.
+    await expandTree(page, "feature");
+    await expandTree(page, "feature/root.ts");
+    await expect(definitionRow(page, "feature/root.ts", "Root")).toHaveCount(1, { timeout: 30_000 });
+    const rootKey = await readDefinitionKey(page, "feature/root.ts", "Root");
+    const definitionGate = createResponseGate(
+      (url) => url.pathname === "/api/diagram" && url.searchParams.get("definition") === rootKey,
+    );
+    await page.route("**/api/diagram?*", definitionGate.handler);
+    try {
+      await definitionRow(page, "feature/root.ts", "Root").dblclick();
+      await withBound(definitionGate.captured, 30_000, "held Root definition diagram");
+      await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+      await expect(page.locator(".cm-activeLine")).toContainText("export class Root");
+      await delay(1_500);
+      definitionGate.release();
+      await withBound(definitionGate.finished, 15_000, "released Root definition diagram");
+      await afterTwoAnimationFrames(page);
+      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+      await expect(page.locator("#editor-panel")).toBeVisible();
+      await expect(page.locator("#graph-panel")).toBeHidden();
+      await expect(page.locator("#editor-path")).toHaveText("feature/root.ts");
+    } finally {
+      definitionGate.release();
+      await page.unroute("**/api/diagram?*", definitionGate.handler);
+    }
+
+    // Another file's outline settling between the two presses must not destroy the pressed row.
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+    await expandTree(page, "shared");
+    const outlineGate = createResponseGate(
+      (url) => url.pathname === "/api/file-definitions" && url.searchParams.get("path") === "shared/c.ts",
+    );
+    await page.route("**/api/file-definitions?*", outlineGate.handler);
+    try {
+      await treeToggle(page, "shared/c.ts").click();
+      await withBound(outlineGate.captured, 30_000, "held shared/c.ts outline");
+      const isolatedRow = definitionRow(page, "feature/root.ts", "Isolated");
+      const point = await centreOf(isolatedRow);
+      await page.mouse.move(point.x, point.y);
+      await page.mouse.down();
+      await page.mouse.up();
+      outlineGate.release();
+      await expect(definitionNames(page, "shared/c.ts")).toHaveText(["C", "C.value", "useExtra"], {
+        timeout: 30_000,
+      });
+      // The retained row still occupies its original position, so the second press lands on it.
+      await page.mouse.down({ clickCount: 2 });
+      await page.mouse.up({ clickCount: 2 });
+      await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+      await expect(page.locator(".cm-activeLine")).toContainText("export class Isolated");
+      expect(await centreOf(isolatedRow)).toEqual(point);
+    } finally {
+      outlineGate.release();
+      await page.unroute("**/api/file-definitions?*", outlineGate.handler);
     }
   } finally {
     await cleanupResource(resource);
   }
 });
 
-test("clicking a packages container directory shows the package graph", async ({ browser }) => {
+test("a diagram double-tap opens the first pressed target", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await expandTree(page, "feature");
+
+    const selectRootFile = async (): Promise<void> => {
+      await treeRow(page, "feature/root.ts").click();
+      await expect(frameHeadings(page)).toHaveText(
+        ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+        { timeout: 60_000 },
+      );
+    };
+    await selectRootFile();
+
+    const fileReads = countRequests(
+      page,
+      (url) => url.pathname === "/api/file" && url.searchParams.get("path") === "feature/root.ts",
+    );
+    try {
+      // The root response repaints between the presses, so the pressed node is gone and the
+      // second press lands on something else; the *first* target must still open.
+      await markPressedLink(page, "Root");
+      const point = await centreOf(definitionLink(page, "Root"));
+      await tap(page, point);
+      await page.waitForFunction(
+        () =>
+          document.querySelector("[data-pressed-link]") === null &&
+          document.querySelectorAll("#svg-holder .uml-frame svg").length === 1 &&
+          document.querySelector("#diagram-stage")?.getAttribute("aria-busy") === "false",
+        undefined,
+        { polling: "raf", timeout: 15_000 },
+      );
+      await tap(page, point);
+      await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+      await expect(page.locator(".cm-activeLine")).toContainText("export class Root");
+      // The superseded root paint must not come back over the editor.
+      await delay(1_500);
+      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+      await expect(page.locator("#graph-panel")).toBeHidden();
+      expect(fileReads.count).toBe(1);
+    } finally {
+      fileReads.stop();
+    }
+
+    // The SVG may also be replaced between the second pointerdown and pointerup.
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+    await selectRootFile();
+    const rootKey = await readDefinitionKey(page, "feature/root.ts", "Root");
+    const gate = createResponseGate(
+      (url) => url.pathname === "/api/diagram" && url.searchParams.get("definition") === rootKey,
+    );
+    await page.route("**/api/diagram?*", gate.handler);
+    try {
+      await markPressedLink(page, "Root");
+      const point = await centreOf(definitionLink(page, "Root"));
+      await tap(page, point);
+      await withBound(gate.captured, 30_000, "held Root definition diagram");
+      await page.mouse.down();
+      gate.release();
+      await page.waitForFunction(
+        () =>
+          document.querySelector("[data-pressed-link]") === null &&
+          document.querySelectorAll("#svg-holder .uml-frame svg").length === 1,
+        undefined,
+        { polling: "raf", timeout: 15_000 },
+      );
+      await page.mouse.up();
+      await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+    } finally {
+      gate.release();
+      await page.unroute("**/api/diagram?*", gate.handler);
+    }
+
+    // Negative gestures: a drag, a late second tap and a displaced second tap only ever select.
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+    await selectRootFile();
+
+    const dragStart = await centreOf(definitionLink(page, "Root"));
+    await page.mouse.move(dragStart.x, dragStart.y);
+    await page.mouse.down();
+    await page.mouse.move(dragStart.x + 60, dragStart.y + 40, { steps: 6 });
+    await page.mouse.up();
+    await afterTwoAnimationFrames(page);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+    );
+
+    await selectRootFile();
+    const latePoint = await centreOf(definitionLink(page, "Root"));
+    await tap(page, latePoint);
+    await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    await delay(700);
+    await tap(page, latePoint);
+    await afterTwoAnimationFrames(page);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+
+    await selectRootFile();
+    const nearPoint = await centreOf(definitionLink(page, "Root"));
+    await tap(page, nearPoint);
+    await tap(page, { x: nearPoint.x + 24, y: nearPoint.y });
+    await afterTwoAnimationFrames(page);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("a held root response never repaints over the next selection", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await expandTree(page, "feature");
+    await expandTree(page, "feature/root.ts");
+    await expect(definitionRow(page, "feature/root.ts", "Isolated")).toHaveCount(1, {
+      timeout: 30_000,
+    });
+    const rootKey = await readDefinitionKey(page, "feature/root.ts", "Root");
+
+    const gate = createResponseGate(
+      (url) => url.pathname === "/api/diagram" && url.searchParams.get("definition") === rootKey,
+    );
+    await page.route("**/api/diagram?*", gate.handler);
+    try {
+      await definitionRow(page, "feature/root.ts", "Root").click();
+      await withBound(gate.captured, 30_000, "held Root definition diagram");
+      await definitionRow(page, "feature/root.ts", "Isolated").click();
+      await expect(frameHeadings(page)).toHaveText(["Isolated · feature/root.ts"], {
+        timeout: 60_000,
+      });
+      gate.release();
+      await withBound(gate.finished, 15_000, "released Root definition diagram");
+      await afterTwoAnimationFrames(page);
+      await expect(frameHeadings(page)).toHaveText(["Isolated · feature/root.ts"]);
+      expect(await diagramNodeNames(page)).toEqual(["Isolated"]);
+      await expect(definitionRow(page, "feature/root.ts", "Isolated"))
+        .toHaveAttribute("aria-current", "true");
+    } finally {
+      gate.release();
+      await page.unroute("**/api/diagram?*", gate.handler);
+    }
+
+    // A line-only edit keeps the definition key, so the selected root survives the new generation.
+    await definitionRow(page, "feature/root.ts", "Root").click();
+    await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    await writeFile(join(fixtureRoot, "feature", "root.ts"), `// shifted by one line\n${ROOT_SOURCE}`);
+    await expect(definitionRow(page, "feature/root.ts", "Root"))
+      .toHaveAttribute("data-source-line", "3", { timeout: 60_000 });
+    await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    await expect(page.locator("#error-panel")).toBeHidden();
+    expect(await diagramNodeNames(page)).toEqual(["B", "C", "Root"]);
+
+    // Deleting the selected declaration reports it; other expansion state is kept.
+    await writeFile(join(fixtureRoot, "feature", "root.ts"), "export class Isolated {}\n");
+    await expect(page.locator("#error-panel")).toContainText("Definition not found", {
+      timeout: 60_000,
+    });
+    await expect(page.locator("#status")).toHaveClass(/\berror\b/);
+    await expect(treeToggle(page, "feature")).toHaveAttribute("aria-expanded", "true");
+    await expect(treeToggle(page, "feature/root.ts")).toHaveAttribute("aria-expanded", "true");
+    await expect(definitionNames(page, "feature/root.ts")).toHaveText(["Isolated"], {
+      timeout: 60_000,
+    });
+
+    // The replacement root is still selectable, so the error is not a dead end.
+    await definitionRow(page, "feature/root.ts", "Isolated").click();
+    await expect(frameHeadings(page)).toHaveText(["Isolated · feature/root.ts"], {
+      timeout: 60_000,
+    });
+    await expect(page.locator("#error-panel")).toBeHidden();
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("renders root frames, directory imports and their detail controls", async ({ browser }, testInfo) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await expandTree(page, "feature");
+
+    // A file selection shows exactly its root frames, each headed by its root and source path.
+    await treeRow(page, "feature/root.ts").click();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
+    );
+    const outlines = await definitionNodeOutlines(page);
+    expect(outlines.map((node) => ({ name: node.name, root: node.root }))).toEqual([
+      { name: "B", root: false },
+      { name: "Root", root: true },
+      { name: "C", root: false },
+      { name: "Isolated", root: true },
+    ]);
+    // The selected root is visibly thicker than the dependencies it reaches.
+    const rootWidths = new Set(outlines.filter((node) => node.root).map((node) => node.strokeWidth));
+    const leafWidths = new Set(outlines.filter((node) => !node.root).map((node) => node.strokeWidth));
+    expect([...rootWidths]).toEqual(["4px"]);
+    expect(leafWidths.has("4px")).toBe(false);
+    await attachScreenshot(page, testInfo, "definition-view");
+
+    // Mermaid-special characters in a source name and a member type survive as text.
+    await treeRow(page, "feature/boxed.ts").click();
+    await expect(frameHeadings(page)).toHaveText(["Box · feature/boxed.ts"], { timeout: 60_000 });
+    expect(await diagramNodeNames(page)).toEqual(["Box⟨TValue⟩"]);
+    await expect(page.locator("#svg-holder")).toContainText(
+      "+entries: Record⟨string, ｛ value: TValue ｝⟩",
+    );
+    await expect(page.locator("#dsl-content")).not.toContainText("~");
+    await expect(page.locator("#status")).not.toHaveClass(/\berror\b/);
+
+    // A syntactically valid empty file is a completed, empty selection.
+    await treeRow(page, "empty.ts").click();
+    await expect(page.locator("#svg-holder .uml-frame.empty .uml-frame-body")).toHaveText("No definitions", {
+      timeout: 60_000,
+    });
+    await expect(page.locator("#error-panel")).toBeHidden();
+
+    // A directory selection shows every file in the subtree plus dashed boundary leaves.
+    await treeRow(page, "feature").click();
+    await expect(frameHeadings(page)).toHaveText(["feature"], { timeout: 60_000 });
+    expect(await fileNodeOutlines(page)).toEqual([
+      { path: "feature/b.ts", boundary: false, test: false, dashed: false },
+      { path: "feature/boxed.ts", boundary: false, test: false, dashed: false },
+      { path: "feature/root.test.ts", boundary: false, test: true, dashed: true },
+      { path: "feature/root.ts", boundary: false, test: false, dashed: false },
+      { path: "feature/side-effect.ts", boundary: false, test: false, dashed: false },
+      { path: "shared/c.ts", boundary: true, test: false, dashed: true },
+      { path: "shared/extra.ts", boundary: true, test: false, dashed: true },
+    ]);
+    await attachScreenshot(page, testInfo, "directory-view");
+
+    // Tests hides test files and their incident edges inside the directory view.
+    const directoryRequests = countRequests(page, (url) => url.pathname === "/api/diagram");
+    try {
+      await page.locator("#uml-show-tests").uncheck();
+      await expect(page.locator("#dsl-content")).not.toContainText("feature/root.test.ts");
+      expect(await diagramNodeNames(page)).toEqual([
+        "feature/b.ts",
+        "feature/boxed.ts",
+        "feature/root.ts",
+        "feature/side-effect.ts",
+        "shared/c.ts",
+        "shared/extra.ts",
+      ]);
+      expect(directoryRequests.count).toBe(0);
+    } finally {
+      directoryRequests.stop();
+    }
+
+    // Attributes, Methods and Types change the compartments of a definition view only.
+    await treeRow(page, "feature/root.ts").click();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
+    );
+    const dsl = page.locator("#dsl-content");
+    const holder = page.locator("#svg-holder");
+    await expect(dsl).toContainText("+value: B");
+    await expect(dsl).toContainText("+run()");
+
+    const toggleRequests = countRequests(page, (url) => url.pathname === "/api/diagram");
+    try {
+      await page.locator("#uml-show-types").uncheck();
+      await expect(dsl).toContainText("+value");
+      await expect(dsl).not.toContainText("+value: B");
+      await expect(holder).not.toContainText("+value: B");
+
+      await page.locator("#uml-show-attributes").uncheck();
+      await expect(dsl).not.toContainText("+value");
+      await expect(holder).not.toContainText("+value");
+      await expect(dsl).toContainText("+run()");
+
+      await page.locator("#uml-show-methods").uncheck();
+      await expect(dsl).not.toContainText("+run()");
+      await expect(holder).not.toContainText("run()");
+      // Hiding compartments never hides the graph itself.
+      expect(await diagramNodeNames(page, 0)).toEqual(["B", "C", "Root"]);
+      expect(toggleRequests.count).toBe(0);
+    } finally {
+      toggleRequests.stop();
+    }
+
+    // Every stored choice survives a round trip through a directory selection.
+    await treeRow(page, "feature").click();
+    await expect(frameHeadings(page)).toHaveText(["feature"], { timeout: 60_000 });
+    await treeRow(page, "feature/root.ts").click();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
+    );
+    for (const id of ["attributes", "methods", "types", "tests"]) {
+      await expect(page.locator(`#uml-show-${id}`)).not.toBeChecked();
+    }
+    await expect(dsl).not.toContainText("+value");
+    await expect(dsl).not.toContainText("+run()");
+
+    await page.locator("#uml-show-attributes").check();
+    await page.locator("#uml-show-types").check();
+    await expect(dsl).toContainText("+value: B");
+    await expect(page.locator("#uml-visibility")).toBeVisible();
+    await page.locator("#packages-mode").click();
+    await expect(page.locator("#uml-visibility")).toBeHidden();
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("keyboard navigation selects UML and opens sources", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+
+    // ArrowRight expands, ArrowDown walks rows, Enter selects.
+    await treeRow(page, "feature").focus();
+    await expect(treeToggle(page, "feature")).toHaveAttribute("aria-expanded", "false");
+    await page.keyboard.press("ArrowRight");
+    await expect(treeToggle(page, "feature")).toHaveAttribute("aria-expanded", "true");
+    await expect(treeRow(page, "feature/b.ts")).toBeVisible();
+    await page.keyboard.press("ArrowDown");
+    await expect(treeRow(page, "feature/b.ts")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(frameHeadings(page)).toHaveText(["B · feature/b.ts"], { timeout: 60_000 });
+    await expect(page.locator("#editor-panel")).toBeHidden();
+
+    // ArrowUp walks back and Space selects the directory.
+    await page.keyboard.press("ArrowUp");
+    await expect(treeRow(page, "feature")).toBeFocused();
+    await page.keyboard.press("Space");
+    await expect(frameHeadings(page)).toHaveText(["feature"], { timeout: 60_000 });
+
+    // ArrowLeft collapses without changing the selection.
+    await page.keyboard.press("ArrowLeft");
+    await expect(treeToggle(page, "feature")).toHaveAttribute("aria-expanded", "false");
+    await expect(frameHeadings(page)).toHaveText(["feature"]);
+    await page.keyboard.press("ArrowRight");
+    await expect(treeToggle(page, "feature")).toHaveAttribute("aria-expanded", "true");
+
+    // Ctrl+Enter is the keyboard equivalent of a double-click on a focused file.
+    await treeRow(page, "feature/root.ts").focus();
+    await page.keyboard.press("Control+Enter");
+    await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+    await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+
+    // And on a focused definition row, which opens at its source position.
+    await expandTree(page, "feature/root.ts");
+    await expect(definitionRow(page, "feature/root.ts", "Root.run")).toHaveCount(1, {
+      timeout: 30_000,
+    });
+    await definitionRow(page, "feature/root.ts", "Root.run").focus();
+    await page.keyboard.press("Control+Enter");
+    await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+    await expect(page.locator(".cm-activeLine")).toContainText("run(): B");
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+
+    // A diagram link answers Enter with a selection and Ctrl+Enter with the editor.
+    await treeRow(page, "feature/root.ts").click();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
+    );
+    await definitionLink(page, "B").focus();
+    await page.keyboard.press("Enter");
+    await expect(frameHeadings(page)).toHaveText(["B · feature/b.ts"], { timeout: 60_000 });
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    await definitionLink(page, "C").focus();
+    await page.keyboard.press("Control+Enter");
+    await expect(page.locator("#editor-path")).toHaveText("shared/c.ts", { timeout: 30_000 });
+    await expect(page.locator(".cm-activeLine")).toContainText("export class C");
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("search results select definition roots and open their sources", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+
+    const searchInput = page.locator("#node-search");
+    const runSearch = async (query: string): Promise<void> => {
+      const response = page.waitForResponse((candidate) => {
+        const url = new URL(candidate.url());
+        return url.pathname === "/api/search" && url.searchParams.get("q") === query;
+      });
+      await searchInput.fill(query);
+      await searchInput.press("Enter");
+      expect((await response).status()).toBe(200);
+    };
+
+    await runSearch("Root");
+    const rootResult = page
+      .locator("#definition-results .definition-result", { hasText: "class · Root" })
+      .filter({ hasText: "feature/root.ts:2" });
+    await expect(rootResult).toBeVisible();
+    await expect(rootResult).toHaveAttribute("role", "option");
+
+    // A single click resolves the hit to its outline key and selects that root only.
+    await rootResult.click();
+    await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
+    expect(await diagramNodeNames(page)).toEqual(["B", "C", "Root"]);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+
+    // A double click opens the hit's own source position.
+    await rootResult.dblclick();
+    await expect(page.locator("#editor-path")).toHaveText("feature/root.ts", { timeout: 30_000 });
+    await expect(page.locator(".cm-activeLine")).toContainText("export class Root");
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+
+    // A double click while the outline read is held opens Editor and cancels the root selection.
+    await runSearch("Consumer");
+    const consumerResult = page
+      .locator("#definition-results .definition-result", { hasText: "class · Consumer" })
+      .filter({ hasText: "consumer.ts:2" });
+    await expect(consumerResult).toBeVisible();
+    const outlineGate = createResponseGate(
+      (url) => url.pathname === "/api/file-definitions" && url.searchParams.get("path") === "consumer.ts",
+    );
+    await page.route("**/api/file-definitions?*", outlineGate.handler);
+    const consumerDiagrams = countRequests(
+      page,
+      (url) => url.pathname === "/api/diagram" && url.searchParams.get("path") === "consumer.ts",
+    );
+    try {
+      await consumerResult.dblclick();
+      await withBound(outlineGate.captured, 30_000, "held consumer.ts outline");
+      await expect(page.locator("#editor-path")).toHaveText("consumer.ts", { timeout: 30_000 });
+      await expect(page.locator(".cm-activeLine")).toContainText("export class Consumer");
+      outlineGate.release();
+      await withBound(outlineGate.finished, 15_000, "released consumer.ts outline");
+      await afterTwoAnimationFrames(page);
+      await delay(500);
+      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
+      await expect(page.locator("#editor-panel")).toBeVisible();
+      await expect(page.locator("#graph-panel")).toBeHidden();
+      expect(consumerDiagrams.count).toBe(0);
+    } finally {
+      consumerDiagrams.stop();
+      outlineGate.release();
+      await page.unroute("**/api/file-definitions?*", outlineGate.handler);
+    }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("pans and zooms the diagram viewport", async ({ browser }) => {
+  test.setTimeout(150_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await expandTree(page, "feature");
+    await treeRow(page, "feature/root.ts").click();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+      { timeout: 60_000 },
+    );
+
+    const transform = () =>
+      page.evaluate(() => {
+        const holder = document.querySelector<HTMLElement>("#svg-holder");
+        return holder ? new DOMMatrixReadOnly(getComputedStyle(holder).transform) : null;
+      });
+    expect(await transform()).toMatchObject({ a: 1, d: 1, e: 0, f: 0 });
+
+    await page.locator("#zoom-in").click();
+    expect((await transform())?.a).toBeCloseTo(1.25, 5);
+    await page.locator("#zoom-out").click();
+    expect((await transform())?.a).toBeCloseTo(1, 5);
+
+    // A drag pans and suppresses activation of the link it started on.
+    const start = await centreOf(definitionLink(page, "Root"));
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.mouse.move(start.x + 80, start.y + 50, { steps: 8 });
+    await page.mouse.up();
+    await afterTwoAnimationFrames(page);
+    const panned = await transform();
+    expect(panned?.e).toBeCloseTo(80, 0);
+    expect(panned?.f).toBeCloseTo(50, 0);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    await expect(frameHeadings(page)).toHaveText(
+      ["Root · feature/root.ts", "Isolated · feature/root.ts"],
+    );
+
+    await page.locator("#zoom-reset").click();
+    expect(await transform()).toMatchObject({ a: 1, d: 1, e: 0, f: 0 });
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Packages
+// ---------------------------------------------------------------------------
+
+test("directories select import graphs while the Packages tab keeps the manifest graph", async ({ browser }) => {
+  test.setTimeout(120_000);
   const resource = registerResource();
   try {
     const fixtureRoot = await createNestedPackagesFixture(resource);
@@ -867,49 +1650,64 @@ test("clicking a packages container directory shows the package graph", async ({
     const page = resource.page;
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
-
-    const runtimeRow = page.locator(
-      '.tree-row[data-tree-path="junco-runtime"]',
-    );
+    const runtimeRow = treeRow(page, "junco-runtime");
     await Promise.all([
-      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
-        timeout: 10_000,
-      }),
-      expect(runtimeRow).toBeVisible({ timeout: 10_000 }),
-      withBound(watch.cacheReady, 45_000, "packages container cache-ready version 0"),
+      expect(page.locator("#source-label")).not.toHaveText("Loading source…", { timeout: 15_000 }),
+      expect(runtimeRow).toBeVisible({ timeout: 15_000 }),
+      withBound(watch.cacheReady, 60_000, "nested packages cache-ready version 0"),
     ]);
     await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo", {
       timeout: 30_000,
     });
-
-    await runtimeRow.click();
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
     const dsl = page.locator("#dsl-content");
-    await expect(page.locator("#diagram-loading")).toBeHidden({
-      timeout: 30_000,
-    });
-    await expect(dsl).toContainText("classDiagram");
 
-    const packagesRow = page.locator(
-      '.tree-row[data-tree-path="junco-runtime/packages"]',
+    // A source directory selects its file-import view, not the package graph.
+    const umlRequest = page.waitForRequest((request) =>
+      isUmlDiagramUrl(new URL(request.url()), "directory", "junco-runtime")
     );
-    await expect(packagesRow).toBeVisible();
+    await runtimeRow.click();
+    expect((await (await umlRequest).response())?.status()).toBe(200);
+    await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
+    await expect(page.locator("#packages-mode")).not.toHaveClass(/\bactive\b/);
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
+    await expect(frameHeadings(page)).toHaveText(["junco-runtime"]);
+    await expect(dsl).toContainText("flowchart LR");
+    expect(await diagramNodeNames(page)).toEqual([
+      "junco-runtime/packages/demo/index.ts",
+      "junco-runtime/packages/demo/package.json",
+    ]);
+    await expect(page.locator("#error-panel")).toBeHidden();
 
-    const packagesDiagramResponse = page.waitForResponse((response) => {
+    // A package *container* directory is just another directory now.
+    await expandTree(page, "junco-runtime");
+    await treeRow(page, "junco-runtime/packages").click();
+    await expect(frameHeadings(page)).toHaveText(["junco-runtime/packages"], { timeout: 30_000 });
+    await expect(dsl).toContainText("flowchart LR");
+    await expect(dsl).not.toContainText("classDiagram");
+
+    // The manifest graph is reachable only through its own tab.
+    const packagesResponse = page.waitForResponse((response) => {
       const url = new URL(response.url());
       return url.pathname === "/api/diagram" &&
         url.searchParams.get("kind") === "packages" &&
         url.searchParams.get("path") === "";
     });
-    await packagesRow.click();
-    expect((await packagesDiagramResponse).status()).toBe(200);
+    await page.locator("#packages-mode").click();
+    expect((await packagesResponse).status()).toBe(200);
     await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
-    await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
-    await expect(page.locator("#diagram-loading")).toBeHidden({
-      timeout: 30_000,
-    });
-    await expect(dsl).toContainText("flowchart LR");
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
     await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo");
     await expect(page.locator("#error-panel")).toBeHidden();
+
+    // A package node selects that package's directory import view.
+    const packageNode = page.locator("#svg-holder .package-link").first();
+    await expect(packageNode).toHaveAttribute("role", "link");
+    await packageNode.click();
+    await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
+    await expect(frameHeadings(page)).toHaveText(["junco-runtime/packages/demo"], {
+      timeout: 30_000,
+    });
   } finally {
     await cleanupResource(resource);
   }
@@ -919,41 +1717,31 @@ test("a failed diagram shows the server error instead of mermaid output", async 
   test.setTimeout(120_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createFixture(resource);
+    const fixtureRoot = await createUmlFixture(resource);
     resource.context = await browser.newContext();
     resource.page = await resource.context.newPage();
     const page = resource.page;
     const watch = watchCacheReady(page);
     const diagramRoute = (url: URL): boolean => url.pathname === "/api/diagram";
     const failUmlDiagram = async (route: Route): Promise<void> => {
-      if (new URL(route.request().url()).searchParams.get("kind") !== "uml") {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("kind") !== "uml") {
         await route.continue();
         return;
       }
+      const path = url.searchParams.get("path") ?? "";
       await route.fulfill({
         status: 200,
         contentType: "application/json",
         body: JSON.stringify(
           {
             kind: "uml",
-            scopePath: "",
+            scopePath: path,
             version: 0,
+            target: { kind: "file", path },
             status: "error",
             error: "forced failure",
-            view: {
-              declarations: [],
-              frames: [],
-              testEntityIds: [],
-              categories: [],
-              methodReturnDependencies: [],
-              usageEdges: [],
-              localUsers: [],
-              externalUsers: [],
-            },
-            packageNodes: [],
-            definitions: [],
-            externalUsers: [],
-            localUsers: [],
+            view: { kind: "definitions", nodes: [], edges: [], frames: [] },
           } satisfies DiagramResponse,
         ),
       });
@@ -961,23 +1749,16 @@ test("a failed diagram shows the server error instead of mermaid output", async 
     await page.route(diagramRoute, failUmlDiagram);
     try {
       await navigateToCli(page, fixtureRoot, resource);
-      const lateRow = page.locator('.tree-row[data-tree-path="z-late"]');
-      await Promise.all([
-        expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
-          timeout: 10_000,
-        }),
-        expect(lateRow).toBeVisible({ timeout: 10_000 }),
-      ]);
-      await withBound(watch.cacheReady, 45_000, "forced diagram failure cache-ready version 0");
+      await expect(treeRow(page, "unrelated.ts")).toBeVisible({ timeout: 15_000 });
+      await withBound(watch.cacheReady, 60_000, "forced diagram failure cache-ready version 0");
 
-      await lateRow.click();
-      await expect(page.locator(".uml-frame.error")).toContainText("forced failure", {
-        timeout: 60_000,
-      });
-      await expect(page.locator("#error-panel")).toBeVisible();
+      await treeRow(page, "unrelated.ts").click();
+      await expect(page.locator("#error-panel")).toBeVisible({ timeout: 60_000 });
       await expect(page.locator("#error-panel")).toContainText("forced failure");
+      await expect(page.locator("#svg-holder .uml-frame.empty .uml-frame-body"))
+        .toHaveText("No definitions");
       await expect(page.locator("#svg-holder")).not.toContainText("Parse error");
-      await expect(page.locator("#status")).toHaveText("Diagram unavailable");
+      await expect(page.locator("#status")).toHaveClass(/\berror\b/);
     } finally {
       await page.unroute(diagramRoute, failUmlDiagram);
     }
@@ -986,39 +1767,37 @@ test("a failed diagram shows the server error instead of mermaid output", async 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Tree, search and editor lifecycle
+// ---------------------------------------------------------------------------
+
 test("renders a live tree independently and observes cache completion", async ({ browser }) => {
+  test.setTimeout(150_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createFixture(resource);
+    const fixtureRoot = await createBulkFixture(resource);
     resource.context = await browser.newContext();
     resource.page = await resource.context.newPage();
     const page = resource.page;
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
 
-    const bulk00 = page.locator('.tree-row[data-tree-path="bulk-00"]');
     await Promise.all([
-      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
-        timeout: 5_000,
-      }),
-      expect(bulk00).toBeVisible({ timeout: 5_000 }),
+      expect(page.locator("#source-label")).not.toHaveText("Loading source…", { timeout: 10_000 }),
+      expect(treeRow(page, "bulk-00")).toBeVisible({ timeout: 10_000 }),
     ]);
-    await bulk00.click();
-    await expect(
-      page.locator('.tree-row[data-tree-path="bulk-00/generated-00.ts"]'),
-    ).toBeVisible();
+    await expandTree(page, "bulk-00");
+    await expect(treeRow(page, "bulk-00/generated-00.ts")).toBeVisible();
 
     const filter = page.locator("#tree-filter");
     await filter.fill("generated-09.ts");
-    await expect(
-      page.locator('.tree-row[data-tree-path="bulk-23/generated-09.ts"]'),
-    ).toBeVisible();
+    await expect(treeRow(page, "bulk-23/generated-09.ts")).toBeVisible();
     await filter.fill("");
 
-    await withBound(watch.cacheReady, 45_000, "cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "cache-ready version 0");
 
-    await page.locator('.tree-row[data-tree-path="marker.ts"]').click();
-    await expect(page.locator("#editor-path")).toHaveText("marker.ts");
+    await openDefinitionSource(page, "marker.ts", "marker");
+    await expect(page.locator("#editor-path")).toHaveText("marker.ts", { timeout: 30_000 });
     await expect(page.locator(".cm-content")).toContainText("TREE_READY_BEFORE_CACHE");
 
     const search = await page.evaluate(async () => {
@@ -1026,40 +1805,53 @@ test("renders a live tree independently and observes cache completion", async ({
       const body = await response.json() as { files?: string[] };
       return { status: response.status, files: body.files };
     });
-    expect(search).toEqual({
-      status: 200,
-      files: ["bulk-23/generated-09.ts"],
-    });
+    expect(search).toEqual({ status: 200, files: ["bulk-23/generated-09.ts"] });
 
-    await bulk00.click();
-    await expect(bulk00).toHaveAttribute("aria-expanded", "false");
-    await bulk00.click();
-    await expect(bulk00).toHaveAttribute("aria-expanded", "true");
-    await expect(
-      page.locator('.tree-row[data-tree-path="bulk-00/generated-00.ts"]'),
-    ).toBeVisible();
-    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
-    await expect(page.locator("#status")).not.toHaveText("Mermaid render error");
+    await page.locator("#editor-close").click();
+    await expect(page.locator("#graph-panel")).toBeVisible();
+    await collapseTree(page, "bulk-00");
+    await expect(treeRow(page, "bulk-00/generated-00.ts")).toHaveCount(0);
+    await expandTree(page, "bulk-00");
+    await expect(treeRow(page, "bulk-00/generated-00.ts")).toBeVisible();
+
+    await treeRow(page, "bulk-00/generated-00.ts").click();
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 60_000 });
+    await expect(page.locator("#status")).not.toHaveClass(/\berror\b/);
     await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+    await expect(frameHeadings(page)).toHaveText([
+      "SessionStorage · bulk-00/generated-00.ts",
+      "DurableSessionStorage · bulk-00/generated-00.ts",
+      "JuncoAgent · bulk-00/generated-00.ts",
+      "generated_00_00 · bulk-00/generated-00.ts",
+    ]);
     await expect(page.locator("#svg-holder")).toContainText("SessionStorage⟨TMetadata⟩");
     await expect(page.locator("#svg-holder")).toContainText("JuncoAgent⟨TSkill,TTool,Ctx⟩");
 
     const dsl = page.locator("#dsl-content");
-    await expect(dsl).toContainText('class SessionStorage["SessionStorage⟨TMetadata⟩"]');
-    await expect(dsl).toContainText('class JuncoAgent["JuncoAgent⟨TSkill,TTool,Ctx⟩"]');
+    await expect(dsl).toContainText('class d0["SessionStorage⟨TMetadata⟩"]');
     await expect(dsl).not.toContainText("~");
+    // The implementing class reaches its interface; the interface frame does not reach back.
+    expect(await diagramNodeNames(page, 1)).toEqual(["DurableSessionStorage", "SessionStorage⟨TMetadata⟩"]);
+    expect(await diagramNodeNames(page, 0)).toEqual(["SessionStorage⟨TMetadata⟩"]);
 
-    const juncoAgentLink = page.locator(
-      '.uml-definition-link[data-source-path="bulk-00/generated-00.ts"]' +
-      '[data-source-line="7"][data-source-column="14"]',
+    const agentLink = definitionLink(page, "JuncoAgent");
+    await expect(agentLink).toBeVisible();
+    await expect(agentLink).toHaveAttribute("role", "link");
+    await markPressedLink(page, "JuncoAgent");
+    const point = await centreOf(agentLink);
+    await tap(page, point);
+    await page.waitForFunction(
+      () =>
+        document.querySelector("[data-pressed-link]") === null &&
+        document.querySelectorAll("#svg-holder .uml-frame svg").length === 1 &&
+        document.querySelector("#diagram-stage")?.getAttribute("aria-busy") === "false",
+      undefined,
+      { polling: "raf", timeout: 15_000 },
     );
-    await expect(juncoAgentLink).toBeVisible();
-    await expect(juncoAgentLink).toHaveAttribute(
-      "aria-label",
-      "Open JuncoAgent UML definition",
-    );
-    await juncoAgentLink.click();
-    await expect(page.locator("#editor-path")).toHaveText("bulk-00/generated-00.ts");
+    await tap(page, point);
+    await expect(page.locator("#editor-path")).toHaveText("bulk-00/generated-00.ts", {
+      timeout: 30_000,
+    });
     await expect(page.locator(".cm-content")).toContainText(
       "export class JuncoAgent<TSkill, TTool, Ctx>",
     );
@@ -1068,703 +1860,8 @@ test("renders a live tree independently and observes cache completion", async ({
   }
 });
 
-test("UML visibility toggles re-render every frame without refetching diagrams", async ({ browser }) => {
-  const resource = registerResource();
-  try {
-    const fixtureRoot = await createFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-
-    const bulk00 = page.locator('.tree-row[data-tree-path="bulk-00"]');
-    await expect(bulk00).toBeVisible({ timeout: 10_000 });
-    await withBound(watch.cacheReady, 45_000, "cache-ready version 0");
-    await bulk00.click();
-    await expect(
-      page.locator('.tree-row[data-tree-path="bulk-00/generated-00.ts"]'),
-    ).toBeVisible();
-    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
-    await expect(page.locator("#svg-holder")).toContainText("SessionStorage⟨TMetadata⟩");
-
-    const visibility = page.locator("#uml-visibility");
-    const dsl = page.locator("#dsl-content");
-    const holder = page.locator("#svg-holder");
-    const stage = page.locator("#diagram-stage");
-    await expect(visibility).toBeVisible();
-    for (const id of ["attributes", "methods", "types", "tests"]) {
-      await expect(page.locator(`#uml-show-${id}`)).toBeChecked();
-    }
-    // Two communities -> two frames, so a global toggle must change both.
-    expect(await page.locator(".uml-frame").count()).toBeGreaterThan(1);
-
-    const svg = page.locator("#svg-holder svg").first();
-    const beforeBox = await svg.boundingBox();
-    if (!beforeBox) throw new Error("the UML diagram has no bounding box");
-
-    let diagramRequests = 0;
-    const countDiagramRequests = (request: Request): void => {
-      if (new URL(request.url()).pathname === "/api/diagram") diagramRequests += 1;
-    };
-    page.on("request", countDiagramRequests);
-    try {
-      await page.locator("#uml-show-attributes").uncheck();
-      await expect(dsl).not.toContainText("metadata");
-      await expect(holder).not.toContainText("metadata");
-      await expect(holder).not.toContainText("skill");
-      await expect(stage).toHaveAttribute("aria-busy", "false");
-      const afterBox = await svg.boundingBox();
-      if (!afterBox) throw new Error("the re-rendered UML diagram has no bounding box");
-      expect(afterBox.height).toBeLessThan(beforeBox.height);
-      expect(diagramRequests).toBe(0);
-
-      await page.locator("#uml-show-attributes").check();
-      await expect(dsl).toContainText("metadata");
-      await expect(holder).toContainText("metadata");
-
-      await page.locator("#uml-show-types").uncheck();
-      await expect(dsl).toContainText("metadata");
-      await expect(dsl).not.toContainText(": TMetadata");
-      expect(diagramRequests).toBe(0);
-    } finally {
-      page.off("request", countDiagramRequests);
-    }
-
-    await page.locator("#packages-mode").click();
-    await expect(visibility).toBeHidden();
-  } finally {
-    await cleanupResource(resource);
-  }
-});
-
-test("navigates definitions within the active surface and cancels stale priority work", async ({ browser }) => {
-  test.setTimeout(150_000);
-  const resource = registerResource();
-  try {
-    const fixtureRoot = await createFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    const afterTwoAnimationFrames = (): Promise<void> =>
-      page.evaluate(() =>
-        new Promise<void>((resolve) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-        })
-      );
-    const preprocessRoutePattern = "**/api/preprocess";
-    const createZLateDonePollGate = () => {
-      type HeldDonePoll = {
-        request: PreprocessControlRequest;
-        body: PreprocessPriorityResponse;
-      };
-      let resolveCaptured!: (poll: HeldDonePoll) => void;
-      const captured = new Promise<HeldDonePoll>((resolve) => {
-        resolveCaptured = resolve;
-      });
-      let resolveRelease!: () => void;
-      const releaseSignal = new Promise<void>((resolve) => {
-        resolveRelease = resolve;
-      });
-      let resolveFinished!: () => void;
-      const finished = new Promise<void>((resolve) => {
-        resolveFinished = resolve;
-      });
-      let held = false;
-      let released = false;
-      const release = () => {
-        if (released) return;
-        released = true;
-        resolveRelease();
-      };
-      const handler = async (route: Route): Promise<void> => {
-        const request = route.request();
-        if (request.method() !== "POST") {
-          await route.continue();
-          return;
-        }
-        const requestBody = request.postDataJSON() as PreprocessControlRequest;
-        if (requestBody.action !== "poll") {
-          await route.continue();
-          return;
-        }
-        const fetchedResponse = await route.fetch();
-        const responseBody = await fetchedResponse.json() as PreprocessPriorityResponse;
-        const shouldHold = !held &&
-          responseBody.resource === "z-late" &&
-          responseBody.status === "done";
-        if (shouldHold) {
-          held = true;
-          resolveCaptured({ request: requestBody, body: responseBody });
-          await releaseSignal;
-        }
-        await route.fulfill({ response: fetchedResponse });
-        if (shouldHold) resolveFinished();
-      };
-      return { captured, finished, handler, release };
-    };
-    await navigateToCli(page, fixtureRoot, resource);
-    await Promise.all([
-      expect(page.locator("#source-label")).not.toHaveText("Loading source…", {
-        timeout: 10_000,
-      }),
-      expect(page.locator('.tree-row[data-tree-path="00-ready.ts"]')).toBeVisible({
-        timeout: 10_000,
-      }),
-    ]);
-    const cli = resource.clis.at(-1);
-    if (!cli) throw new Error("managed CLI was not registered");
-
-    const immediateLocation = {
-      path: "00-ready.ts",
-      line: 1,
-      column: 14,
-    };
-    const lateLocation = {
-      path: "z-late/late-definition.ts",
-      line: 1,
-      column: 14,
-    };
-    await expect.poll(
-      async () => (await readDefinition(page, immediateLocation)).body.definition?.qualifiedName,
-      {
-        message: "the early fixture definition to be indexed before the late source",
-        timeout: 15_000,
-      },
-    ).toBe("ImmediateDefinition");
-    expect(await readDefinition(page, lateLocation)).toMatchObject({
-      status: 200,
-      body: { definition: null },
-    });
-
-    const observation = observeDefinitionApi(page);
-    try {
-      const lateLink = page.locator(
-        '#svg-holder .uml-definition-link[data-source-path="z-late/late-definition.ts"]' +
-        '[data-source-line="1"][data-source-column="14"]',
-      );
-      const firstRefreshHistoryStart = watch.history.length;
-      const firstRefreshCacheReadyVersion = watch.history.reduce(
-        (highest, message) =>
-          message.type === "cache-ready" ? Math.max(highest, message.version) : highest,
-        -1,
-      );
-      const directoryDoneGate = createZLateDonePollGate();
-      await page.route(preprocessRoutePattern, directoryDoneGate.handler);
-      try {
-        const directoryPriorityRequest = page.waitForRequest((request) => {
-          if (new URL(request.url()).pathname !== "/api/preprocess") return false;
-          const body = request.postDataJSON() as PreprocessControlRequest;
-          return body.action === "prioritize" && body.resource === "./z-late";
-        });
-        const directoryPriorityResponse = page.waitForResponse((response) => {
-          if (new URL(response.url()).pathname !== "/api/preprocess") return false;
-          const body = response.request().postDataJSON() as PreprocessControlRequest;
-          return body.action === "prioritize" && body.resource === "./z-late";
-        });
-        await page.locator('.tree-row[data-tree-path="z-late"]').click();
-
-        expect((await directoryPriorityRequest).postDataJSON()).toEqual({
-          action: "prioritize",
-          resource: "./z-late",
-        });
-        await expect(page.locator("#diagram-loading")).toBeVisible();
-        await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-
-        const directoryPriorityBody = await (await directoryPriorityResponse).json() as
-          PreprocessPriorityResponse;
-        expect(directoryPriorityBody.status).not.toBe("done");
-        const heldDirectoryDone = await withBound(
-          directoryDoneGate.captured,
-          30_000,
-          "correlated z-late directory done poll",
-        );
-
-        await writeFile(
-          join(fixtureRoot, "refresh-trigger.ts"),
-          "export const refreshTrigger = true;\n",
-        );
-        let refreshChangedHistoryIndex = -1;
-        await expect.poll(
-          () => {
-            refreshChangedHistoryIndex = watch.history.findIndex(
-              (message, index) =>
-                index >= firstRefreshHistoryStart &&
-                message.type === "changed" &&
-                message.paths.some((path) => path.includes("refresh-trigger.ts")),
-            );
-            return refreshChangedHistoryIndex;
-          },
-          {
-            message: "a changed watcher message for refresh-trigger.ts",
-            timeout: 30_000,
-          },
-        ).toBeGreaterThanOrEqual(firstRefreshHistoryStart);
-        await expect.poll(
-          () =>
-            watch.history.find(
-              (message, index) =>
-                index > refreshChangedHistoryIndex &&
-                message.type === "cache-ready" &&
-                message.version > firstRefreshCacheReadyVersion,
-            )?.version ?? firstRefreshCacheReadyVersion,
-          {
-            message: "a later cache-ready watcher generation after refresh-trigger.ts",
-            timeout: 30_000,
-          },
-        ).toBeGreaterThan(firstRefreshCacheReadyVersion);
-
-        await afterTwoAnimationFrames();
-        await expect(page.locator("#diagram-loading")).toBeVisible();
-        await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-        await expect(lateLink).toHaveCount(0);
-
-        directoryDoneGate.release();
-        await withBound(
-          directoryDoneGate.finished,
-          10_000,
-          "released z-late directory done response",
-        );
-        expect(heldDirectoryDone.request).toEqual({
-          action: "poll",
-          requestId: directoryPriorityBody.requestId,
-        });
-        expect(heldDirectoryDone.body).toEqual({
-          status: "done",
-          resource: "z-late",
-          requestId: directoryPriorityBody.requestId,
-        });
-
-        await expect(lateLink).toBeVisible({ timeout: 30_000 });
-        await expect(page.locator("#diagram-loading")).toBeHidden();
-        await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
-        await observation.flush();
-        const directoryPolls = observation.preprocessResponses.filter(
-          (response) => response.request.action === "poll" &&
-            response.request.requestId === directoryPriorityBody.requestId,
-        );
-        expect(directoryPolls.length).toBeGreaterThan(0);
-        expect(directoryPolls.at(-1)?.body.status).toBe("done");
-        await expect(lateLink).toHaveAttribute("role", "link");
-        await expect(lateLink).toHaveAttribute(
-          "aria-label",
-          "Open LateDefinition UML definition",
-        );
-      } finally {
-        directoryDoneGate.release();
-        await page.unroute(preprocessRoutePattern, directoryDoneGate.handler);
-      }
-
-      const inFlight = new Map<string, number>();
-      const windowStart = Date.now();
-      const stamp = (): string => String(Date.now() - windowStart).padStart(6);
-      page.on("request", (r) => {
-        inFlight.set(r.url(), Date.now());
-        console.log(`${stamp()} REQ  ${new URL(r.url()).pathname} inflight=${inFlight.size}`);
-        if (new URL(r.url()).pathname === "/api/goto-definition") {
-          console.log(`${stamp()} OUTSTANDING: ${[...inFlight.keys()].map((u) => new URL(u).pathname + new URL(u).search.slice(0, 30)).join(" | ")}`);
-        }
-      });
-      page.on("response", (r) => {
-        inFlight.delete(r.url());
-        console.log(`${stamp()} RES  ${r.status()} ${new URL(r.url()).pathname} inflight=${inFlight.size}`);
-      });
-      page.on("requestfailed", (r) => {
-        inFlight.delete(r.url());
-        console.log(`${stamp()} FAIL ${new URL(r.url()).pathname} ${r.failure()?.errorText}`);
-      });
-      const definitionResetHistoryStart = watch.history.length;
-      await appendFile(
-        join(fixtureRoot, lateLocation.path),
-        "export const lateGenerationReset = true;\n",
-      );
-      await expect.poll(
-        () =>
-          watch.history.findIndex(
-            (message, index) =>
-              index >= definitionResetHistoryStart &&
-              message.type === "changed" &&
-              message.paths.some((path) =>
-                path.replaceAll("\\", "/").endsWith(lateLocation.path)
-              ),
-          ),
-        {
-          message: "a changed watcher generation for the late definition source",
-          timeout: 30_000,
-        },
-      ).toBeGreaterThanOrEqual(definitionResetHistoryStart);
-
-      const firstLookup = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/api/goto-definition" &&
-          url.searchParams.get("path") === lateLocation.path &&
-          url.searchParams.get("line") === String(lateLocation.line) &&
-          url.searchParams.get("column") === String(lateLocation.column);
-      });
-      const firstPriority = page.waitForResponse((response) => {
-        if (new URL(response.url()).pathname !== "/api/preprocess") return false;
-        const body = response.request().postDataJSON() as PreprocessControlRequest;
-        return body.action === "prioritize" &&
-          body.resource === `./${lateLocation.path}`;
-      });
-      await lateLink.focus();
-      await lateLink.press("Space");
-
-      const firstLookupBody = await (await firstLookup).json() as GotoDefinitionLookupResponse;
-      expect(firstLookupBody.definition).toBeNull();
-      await expect(page.locator("#diagram-loading")).toBeVisible();
-      await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-
-      const priorityBody = await (await firstPriority).json() as PreprocessPriorityResponse;
-      await expect.poll(
-        () => observation.preprocessRequests.filter(
-          (request) => request.action === "poll" &&
-            request.requestId === priorityBody.requestId,
-        ).length,
-        {
-          message: "a correlated browser poll for the late definition priority request",
-          timeout: 15_000,
-        },
-      ).toBeGreaterThan(0);
-
-      const canonicalTarget = page.locator(
-        '#svg-holder .definition-target[data-source-path="z-late/late-definition.ts"]' +
-        '[data-source-line="1"][data-source-column="14"]',
-      );
-      await expect(canonicalTarget).toBeVisible({ timeout: 30_000 });
-      await expect(canonicalTarget).toBeFocused();
-      await expect(page.locator("#uml-mode")).toHaveClass(/\bactive\b/);
-      await expect(page.locator("#graph-panel")).toBeVisible();
-      await expect(page.locator("#editor-panel")).toBeHidden();
-      await expect(page.locator("#diagram-loading")).toBeHidden();
-
-      await observation.flush();
-      const lateDefinitionResponses = observation.definitionResponses.filter(
-        (response) => response.path === lateLocation.path &&
-          response.line === lateLocation.line &&
-          response.column === lateLocation.column,
-      );
-      expect(lateDefinitionResponses.map((response) => ({
-        status: response.status,
-        definition: response.body.definition?.qualifiedName ?? null,
-      }))).toEqual([
-        { status: 200, definition: null },
-        { status: 200, definition: "LateDefinition" },
-      ]);
-      const latePriorities = observation.preprocessResponses.filter(
-        (response) => response.request.action === "prioritize" &&
-          response.request.resource === `./${lateLocation.path}`,
-      );
-      expect(latePriorities).toHaveLength(1);
-      expect(latePriorities[0]?.body.requestId).toBe(priorityBody.requestId);
-      const latePolls = observation.preprocessResponses.filter(
-        (response) => response.request.action === "poll" &&
-          response.request.requestId === priorityBody.requestId,
-      );
-      expect(latePolls.length).toBeGreaterThan(0);
-      expect(latePolls.every(
-        (response) => response.status === 200 &&
-          response.body.requestId === priorityBody.requestId,
-      )).toBe(true);
-      expect(latePolls.at(-1)?.body.status).toBe("done");
-
-      const repeatedDirectoryFileRequests: Request[] = [];
-      const observeRepeatedDirectoryFileRequest = (request: Request): void => {
-        const url = new URL(request.url());
-        if (
-          url.pathname === "/api/file" &&
-          url.searchParams.get("path") === lateLocation.path
-        ) {
-          repeatedDirectoryFileRequests.push(request);
-        }
-      };
-      page.on("request", observeRepeatedDirectoryFileRequest);
-      try {
-        const repeatRefreshHistoryStart = watch.history.length;
-        const repeatDoneGate = createZLateDonePollGate();
-        await page.route(preprocessRoutePattern, repeatDoneGate.handler);
-        try {
-          const repeatDirectoryPriorityResponse = page.waitForResponse((response) => {
-            if (new URL(response.url()).pathname !== "/api/preprocess") return false;
-            const body = response.request().postDataJSON() as PreprocessControlRequest;
-            return body.action === "prioritize" && body.resource === "./z-late";
-          });
-          await page.locator('.tree-row[data-tree-path="z-late"]').click();
-          const repeatDirectoryPriorityBody =
-            await (await repeatDirectoryPriorityResponse).json() as PreprocessPriorityResponse;
-          expect(repeatDirectoryPriorityBody.status).not.toBe("done");
-          await expect(page.locator("#diagram-loading")).toBeVisible();
-          await expect(page.locator("#diagram-loading")).toHaveText("Loading...");
-          await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
-
-          const heldRepeatDone = await withBound(
-            repeatDoneGate.captured,
-            30_000,
-            "correlated repeated z-late directory done poll",
-          );
-          await writeFile(
-            join(fixtureRoot, "refresh-trigger-cancel.ts"),
-            "export const refreshTriggerCancel = true;\n",
-          );
-          await expect.poll(
-            () =>
-              watch.history.findIndex(
-                (message, index) =>
-                  index >= repeatRefreshHistoryStart &&
-                  message.type === "changed" &&
-                  message.paths.some((path) =>
-                    path.includes("refresh-trigger-cancel.ts")
-                  ),
-              ),
-            {
-              message: "a changed watcher message for refresh-trigger-cancel.ts",
-              timeout: 30_000,
-            },
-          ).toBeGreaterThanOrEqual(repeatRefreshHistoryStart);
-          await afterTwoAnimationFrames();
-          expect(repeatedDirectoryFileRequests).toHaveLength(0);
-
-          const packagesDiagramResponse = page.waitForResponse((response) => {
-            const url = new URL(response.url());
-            return url.pathname === "/api/diagram" &&
-              url.searchParams.get("kind") === "packages" &&
-              url.searchParams.get("path") === "";
-          });
-          await page.locator("#packages-mode").click();
-          expect((await packagesDiagramResponse).status()).toBe(200);
-          await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
-          await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
-          await expect(page.locator("#graph-panel")).toBeVisible();
-          await expect(page.locator("#editor-panel")).toBeHidden();
-          await expect(page.locator("#diagram-loading")).toBeHidden({
-            timeout: 30_000,
-          });
-          await expect(page.locator("#diagram-stage")).toHaveAttribute(
-            "aria-busy",
-            "false",
-          );
-          const packageDsl = page.locator("#dsl-content");
-          await expect(packageDsl).toContainText("flowchart LR");
-          const packageDslBeforeStaleRelease = await packageDsl.textContent();
-          if (packageDslBeforeStaleRelease === null) {
-            throw new Error("package DSL content was unavailable before stale release");
-          }
-          const fileRequestsBeforeStaleRelease =
-            repeatedDirectoryFileRequests.length;
-
-          repeatDoneGate.release();
-          await withBound(
-            repeatDoneGate.finished,
-            10_000,
-            "released repeated z-late directory done response",
-          );
-          expect(heldRepeatDone.request).toEqual({
-            action: "poll",
-            requestId: repeatDirectoryPriorityBody.requestId,
-          });
-          expect(heldRepeatDone.body).toEqual({
-            status: "done",
-            resource: "z-late",
-            requestId: repeatDirectoryPriorityBody.requestId,
-          });
-          await afterTwoAnimationFrames();
-
-          expect(repeatedDirectoryFileRequests).toHaveLength(
-            fileRequestsBeforeStaleRelease,
-          );
-          await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
-          await expect(page.locator("#uml-mode")).not.toHaveClass(/\bactive\b/);
-          await expect(page.locator("#graph-panel")).toBeVisible();
-          await expect(page.locator("#editor-panel")).toBeHidden();
-          await expect(page.locator("#diagram-loading")).toBeHidden();
-          await expect(page.locator("#diagram-stage")).toHaveAttribute(
-            "aria-busy",
-            "false",
-          );
-          await expect(packageDsl).toHaveText(packageDslBeforeStaleRelease);
-          await expect(lateLink).toHaveCount(0);
-        } finally {
-          repeatDoneGate.release();
-          await page.unroute(preprocessRoutePattern, repeatDoneGate.handler);
-        }
-      } finally {
-        page.off("request", observeRepeatedDirectoryFileRequest);
-      }
-
-      const immediateTreeRow = page.locator('.tree-row[data-tree-path="00-ready.ts"]');
-      await page.locator('.tree-row[data-tree-path="zz-stale"]').click();
-      const staleLocation = {
-        path: "zz-stale/stale-definition.ts",
-        line: 1,
-        column: 14,
-      };
-      const staleLink = page.locator(
-        '#svg-holder .uml-definition-link[data-source-path="zz-stale/stale-definition.ts"]' +
-        '[data-source-line="1"][data-source-column="14"]',
-      );
-      await expect(staleLink).toBeVisible({ timeout: 30_000 });
-      expect(await readDefinition(page, staleLocation)).toMatchObject({
-        status: 200,
-        body: { definition: null },
-      });
-
-      await page.locator("#tree-filter").fill("00-ready.ts");
-      await expect(immediateTreeRow).toBeVisible();
-      const staleLookup = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/api/goto-definition" &&
-          url.searchParams.get("path") === staleLocation.path &&
-          url.searchParams.get("line") === String(staleLocation.line) &&
-          url.searchParams.get("column") === String(staleLocation.column);
-      });
-      const stalePriority = page.waitForResponse((response) => {
-        if (new URL(response.url()).pathname !== "/api/preprocess") return false;
-        const body = response.request().postDataJSON() as PreprocessControlRequest;
-        return body.action === "prioritize" &&
-          body.resource === `./${staleLocation.path}`;
-      });
-      await staleLink.focus();
-      await staleLink.press("Enter");
-      expect(
-        (await (await staleLookup).json() as GotoDefinitionLookupResponse).definition,
-      ).toBeNull();
-      await expect(page.locator("#diagram-loading")).toBeVisible();
-      const stalePriorityBody = await (await stalePriority).json() as PreprocessPriorityResponse;
-
-      await immediateTreeRow.click();
-      await expect(page.locator("#editor-path")).toHaveText("00-ready.ts");
-      await expect(page.locator("#editor-panel")).toBeVisible();
-      const staleLookupsAtCancellation = observation.definitionRequests.filter(
-        (request) => request.path === staleLocation.path &&
-          request.line === staleLocation.line &&
-          request.column === staleLocation.column,
-      ).length;
-      const stalePollsAtCancellation = observation.preprocessRequests.filter(
-        (request) => request.action === "poll" &&
-          request.requestId === stalePriorityBody.requestId,
-      ).length;
-
-      await expectCliOutput(
-        cli,
-        "[sync] done code ./zz-stale/stale-definition.ts",
-        30_000,
-      );
-      await observation.flush();
-      expect(observation.definitionRequests.filter(
-        (request) => request.path === staleLocation.path &&
-          request.line === staleLocation.line &&
-          request.column === staleLocation.column,
-      )).toHaveLength(staleLookupsAtCancellation);
-      expect(observation.preprocessRequests.filter(
-        (request) => request.action === "poll" &&
-          request.requestId === stalePriorityBody.requestId,
-      )).toHaveLength(stalePollsAtCancellation);
-      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
-      await expect(page.locator("#editor-panel")).toBeVisible();
-      await expect(page.locator("#graph-panel")).toBeHidden();
-      await expect(page.locator("#editor-path")).toHaveText("00-ready.ts");
-      await expect(page.locator(
-        '#svg-holder .definition-target[data-source-path="zz-stale/stale-definition.ts"]',
-      )).toHaveCount(0);
-      const structuredSearchGeneration = watch.history.reduce(
-        (latest, message) =>
-          message.type === "changed" ? Math.max(latest, message.version) : latest,
-        -1,
-      );
-      await expect.poll(
-        () =>
-          watch.history.reduce(
-            (latest, message) =>
-              message.type === "cache-ready"
-                ? Math.max(latest, message.version)
-                : latest,
-            -1,
-          ),
-        {
-          message: "the latest watcher generation to finish before structured search",
-          timeout: 45_000,
-        },
-      ).toBeGreaterThanOrEqual(structuredSearchGeneration);
-      await immediateTreeRow.click();
-      await expect(page.locator("#editor-path")).toHaveText("00-ready.ts");
-      await expect(page.locator("#editor-panel")).toBeVisible();
-
-      const searchInput = page.locator("#node-search");
-      const searchResponse = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/api/search" &&
-          url.searchParams.get("q") === "ImmediateDefinition" &&
-          url.searchParams.get("caseInsensitive") === "false";
-      });
-      await searchInput.fill("ImmediateDefinition");
-      await searchInput.press("Enter");
-      expect((await searchResponse).status()).toBe(200);
-
-      const immediateResult = page.locator("#definition-results .definition-result", {
-        hasText: "class · ImmediateDefinition",
-      }).filter({ hasText: "00-ready.ts:1" });
-      await expect(immediateResult).toBeVisible();
-      await expect(immediateResult).toHaveAttribute("role", "option");
-      const resultLookup = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/api/goto-definition" &&
-          url.searchParams.get("path") === immediateLocation.path &&
-          url.searchParams.get("line") === String(immediateLocation.line) &&
-          url.searchParams.get("column") === String(immediateLocation.column);
-      });
-      const resultFile = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/api/file" &&
-          url.searchParams.get("path") === immediateLocation.path &&
-          url.searchParams.get("line") === String(immediateLocation.line) &&
-          url.searchParams.get("column") === String(immediateLocation.column);
-      });
-      await immediateResult.focus();
-      await immediateResult.press("Enter");
-      expect(
-        (await (await resultLookup).json() as GotoDefinitionLookupResponse)
-          .definition?.qualifiedName,
-      ).toBe("ImmediateDefinition");
-      const resultFileResponse = await resultFile;
-      expect(resultFileResponse.status()).toBe(200);
-      const resultFileBody = await resultFileResponse.json() as FileResponse;
-      const immediateFileDefinition = resultFileBody.definitions.find(
-        (definition) => definition.source.path === immediateLocation.path &&
-          definition.source.line === immediateLocation.line &&
-          definition.source.column === immediateLocation.column,
-      );
-      expect(immediateFileDefinition?.qualifiedName).toBe("ImmediateDefinition");
-      expect(resultFileBody.cursorOffset).toBe(immediateFileDefinition?.displayFrom);
-
-      await expect(page.locator("#editor-mode")).toHaveClass(/\bactive\b/);
-      await expect(page.locator("#editor-panel")).toBeVisible();
-      await expect(page.locator("#graph-panel")).toBeHidden();
-      await expect(page.locator("#editor-path")).toHaveText("00-ready.ts");
-      const immediateMark = page.locator(
-        '.editor-definition-link[data-source-path="00-ready.ts"]' +
-        '[data-source-line="1"][data-source-column="14"]',
-      );
-      await expect(immediateMark).toHaveText("ImmediateDefinition");
-      await expect(immediateMark).toBeVisible();
-      await expect(page.locator(".cm-activeLine")).toContainText(
-        "export class ImmediateDefinition",
-      );
-      await expect(page.locator(
-        '.cm-activeLine .editor-definition-link[data-source-path="00-ready.ts"]' +
-        '[data-source-line="1"][data-source-column="14"]',
-      )).toHaveText("ImmediateDefinition");
-    } finally {
-      await observation.stop();
-    }
-  } finally {
-    await cleanupResource(resource);
-  }
-});
-
 test("submits case-insensitive search only after Enter", async ({ browser }) => {
+  test.setTimeout(150_000);
   const resource = registerResource();
   try {
     const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-search-mode-e2e-"));
@@ -1791,9 +1888,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
       45_000,
       "case-insensitive search cache-ready version 0",
     );
-    await expect(page.locator('.tree-row[data-tree-path="index.ts"]')).toBeVisible({
-      timeout: 10_000,
-    });
+    await expect(treeRow(page, "index.ts")).toBeVisible({ timeout: 10_000 });
 
     const query = "mixedcasewidget";
     const searchInput = page.locator("#node-search");
@@ -1801,9 +1896,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     const definitionResult = page.locator("#definition-results .definition-result", {
       hasText: "class · MixedCaseWidget",
     }).filter({ hasText: "index.ts:1" });
-    const matchedTreeRow = page.locator(
-      '.tree-row.search-match[data-tree-path="index.ts"]',
-    );
+    const matchedTreeRow = page.locator('.tree-row.search-match[data-tree-path="index.ts"]');
     const isSearchRequest = (request: Request, caseInsensitive: boolean): boolean => {
       const url = new URL(request.url());
       return url.pathname === "/api/search" &&
@@ -1818,12 +1911,6 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
         observedSearchRequests.push(request);
       }
     });
-    const afterTwoAnimationFrames = (): Promise<void> =>
-      page.evaluate(() =>
-        new Promise<void>((resolve) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-        })
-      );
     const readSearchDom = () =>
       page.evaluate(() => ({
         definitions: [...document.querySelectorAll("#definition-results .definition-result")]
@@ -1842,7 +1929,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     const falseResponse = await initialFalseResponse;
     expect(falseResponse.status()).toBe(200);
     await falseResponse.finished();
-    await afterTwoAnimationFrames();
+    await afterTwoAnimationFrames(page);
     await expect(definitionResult).toHaveCount(0);
     await expect(matchedTreeRow).toHaveCount(0);
     await expect(searchInput).toHaveAttribute("aria-invalid", "true");
@@ -1850,7 +1937,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     const falseDom = await readSearchDom();
     const requestsBeforeCheckedToggle = observedSearchRequests.length;
     await checkbox.check();
-    await afterTwoAnimationFrames();
+    await afterTwoAnimationFrames(page);
     expect(observedSearchRequests).toHaveLength(requestsBeforeCheckedToggle);
     expect(await readSearchDom()).toEqual(falseDom);
 
@@ -1864,13 +1951,13 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     await expect(searchInput).not.toHaveAttribute("aria-invalid");
     await expect(page.locator("#dsl-content")).toContainText("%% Scope: .");
     await expect(page.locator("#svg-holder.stacked .uml-frame")).toHaveCount(1);
-    await expect(page.locator("#svg-holder")).toContainText("MixedCaseWidget");
+    await expect(page.locator("#svg-holder")).toContainText("index.ts");
     await expect(page.locator("#status")).toContainText("Search · 1 files");
 
     const trueDom = await readSearchDom();
     const requestsBeforeUncheckedToggle = observedSearchRequests.length;
     await checkbox.uncheck();
-    await afterTwoAnimationFrames();
+    await afterTwoAnimationFrames(page);
     expect(observedSearchRequests).toHaveLength(requestsBeforeUncheckedToggle);
     expect(await readSearchDom()).toEqual(trueDom);
 
@@ -1920,7 +2007,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     expect(releasedFalseResponse.status()).toBe(200);
     await releasedFalseResponse.finished();
     await page.unroute("**/api/search?*", falseGate);
-    await afterTwoAnimationFrames();
+    await afterTwoAnimationFrames(page);
     expect(await readSearchDom()).toEqual(winningTrueDom);
     await expect(definitionResult).toBeVisible();
     await expect(matchedTreeRow).toBeVisible();
@@ -1955,7 +2042,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     const failedDom = await readSearchDom();
     const requestsBeforePendingRefreshToggle = observedSearchRequests.length;
     await checkbox.check();
-    await afterTwoAnimationFrames();
+    await afterTwoAnimationFrames(page);
     expect(observedSearchRequests).toHaveLength(requestsBeforePendingRefreshToggle);
     expect(await readSearchDom()).toEqual(failedDom);
     await expect(page.locator("#status")).toHaveText("forced search failure");
@@ -2034,8 +2121,11 @@ test("prints the open file with light syntax colors", async ({ browser }) => {
     await withBound(watch.cacheReady, 45_000, "print fixture cache-ready version 0");
 
     await expect(page.locator("#editor-print")).toBeHidden();
-    await page.locator('.tree-row[data-tree-path="index.ts"]').click();
-    await expect(page.locator("#editor-path")).toHaveText("index.ts");
+    await expect(page.locator("#editor-empty")).toHaveText(
+      "Double-click a file or definition to open its source.",
+    );
+    await openDefinitionSource(page, "index.ts", "PrintableWidget");
+    await expect(page.locator("#editor-path")).toHaveText("index.ts", { timeout: 30_000 });
     await expect(page.locator("#editor-print")).toBeVisible();
 
     await page.locator("#editor-print").click();
@@ -2067,6 +2157,143 @@ test("prints the open file with light syntax colors", async ({ browser }) => {
       close: "none",
     });
     await page.emulateMedia({ media: null });
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("resolves concurrent file outlines independently and discards superseded ones", async ({ browser }) => {
+  test.setTimeout(150_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-outline-e2e-"));
+    resource.fixtureRoot = fixtureRoot;
+    await writeFile(join(fixtureRoot, "package.json"), JSON.stringify({ name: "outline-e2e" }));
+    await writeFile(join(fixtureRoot, "alpha.ts"), "export const ALPHA: number = 1;\n");
+    await writeFile(join(fixtureRoot, "beta.ts"), 'export const BETA: string = "b";\n');
+    await writeFile(join(fixtureRoot, "gamma.ts"), "export const GAMMA: boolean = true;\n");
+
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await withBound(watch.cacheReady, 45_000, "outline fixture cache-ready version 0");
+
+    const outlineRoute = "**/api/file-definitions?*";
+
+    /**
+     * Holds only the *first* outline response for each named path; every later request passes
+     * straight through, so a watcher-driven refetch can overtake a response that is still held.
+     */
+    const createOutlineGate = (paths: readonly string[]) => {
+      type Signal = { promise: Promise<void>; resolve: () => void };
+      const seen = new Map<string, Signal>();
+      const held = new Map<string, Signal>();
+      for (const path of paths) {
+        seen.set(path, Promise.withResolvers<void>());
+        held.set(path, Promise.withResolvers<void>());
+      }
+      const holding = new Set<string>();
+      const handler = async (route: Route): Promise<void> => {
+        const requested = new URL(route.request().url()).searchParams.get("path") ?? "";
+        const gate = held.get(requested);
+        if (!gate || holding.has(requested)) {
+          await route.continue();
+          return;
+        }
+        holding.add(requested);
+        seen.get(requested)?.resolve();
+        await gate.promise;
+        await route.continue();
+      };
+      return {
+        handler,
+        captured: (path: string): Promise<void> =>
+          seen.get(path)?.promise ?? Promise.reject(new Error(`ungated outline path: ${path}`)),
+        release: (path: string) => held.get(path)?.resolve(),
+      };
+    };
+
+    // Two outlines in flight, delivered in reverse order: each file settles on its own.
+    const reverseGate = createOutlineGate(["alpha.ts", "beta.ts"]);
+    await page.route(outlineRoute, reverseGate.handler);
+    await treeToggle(page, "alpha.ts").click();
+    await treeToggle(page, "beta.ts").click();
+    await withBound(reverseGate.captured("alpha.ts"), 15_000, "alpha outline request");
+    await withBound(reverseGate.captured("beta.ts"), 15_000, "beta outline request");
+    await expect(outlineMessage(page, "alpha.ts")).toHaveText("Loading definitions…");
+    await expect(outlineMessage(page, "beta.ts")).toHaveText("Loading definitions…");
+    reverseGate.release("beta.ts");
+    await expect(definitionNames(page, "beta.ts")).toHaveText(["BETA"]);
+    await expect(outlineMessage(page, "alpha.ts")).toHaveText("Loading definitions…");
+    reverseGate.release("alpha.ts");
+    await expect(definitionNames(page, "alpha.ts")).toHaveText(["ALPHA"]);
+    await expect(definitionNames(page, "beta.ts")).toHaveText(["BETA"]);
+    await page.unroute(outlineRoute, reverseGate.handler);
+
+    // Collapsing before delivery must neither re-expand the file nor open Editor.
+    const collapseGate = createOutlineGate(["gamma.ts"]);
+    await page.route(outlineRoute, collapseGate.handler);
+    await treeToggle(page, "gamma.ts").click();
+    await withBound(collapseGate.captured("gamma.ts"), 15_000, "held gamma outline");
+    await treeToggle(page, "gamma.ts").click();
+    await expect(treeToggle(page, "gamma.ts")).toHaveAttribute("aria-expanded", "false");
+    await expect(definitionNames(page, "beta.ts")).toHaveText(["BETA"]);
+    collapseGate.release("gamma.ts");
+    await expect(treeToggle(page, "gamma.ts")).toHaveAttribute("aria-expanded", "false");
+    await expect(definitionNames(page, "gamma.ts")).toHaveCount(0);
+    await expect(definitionNames(page, "beta.ts")).toHaveText(["BETA"]);
+    await expect(page.locator("#editor-panel")).toBeHidden();
+    await page.unroute(outlineRoute, collapseGate.handler);
+
+    // Re-expansion reuses the settled result instead of issuing another request.
+    let requestsAfterSettle = 0;
+    const countOutlineRequests = async (route: Route): Promise<void> => {
+      requestsAfterSettle += 1;
+      await route.continue();
+    };
+    await page.route(outlineRoute, countOutlineRequests);
+    await treeToggle(page, "gamma.ts").click();
+    await expect(definitionNames(page, "gamma.ts")).toHaveText(["GAMMA"]);
+    expect(requestsAfterSettle).toBe(0);
+    await page.unroute(outlineRoute, countOutlineRequests);
+
+    // A response held from before a watcher invalidation must not overwrite the fresh list.
+    const staleGate = createOutlineGate(["alpha.ts"]);
+    await page.route(outlineRoute, staleGate.handler);
+    await writeFile(join(fixtureRoot, "alpha.ts"), "export const ALPHA_TWO: number = 2;\n");
+    await withBound(staleGate.captured("alpha.ts"), 45_000, "stale alpha outline");
+    await writeFile(join(fixtureRoot, "alpha.ts"), "export const ALPHA_THREE: boolean = true;\n");
+    await expect(definitionNames(page, "alpha.ts")).toHaveText(["ALPHA_THREE"], { timeout: 45_000 });
+    staleGate.release("alpha.ts");
+    await expect(definitionNames(page, "alpha.ts")).toHaveText(["ALPHA_THREE"]);
+    await page.unroute(outlineRoute, staleGate.handler);
+
+    // A failing outline reports its error inline; collapse and re-expand recovers the real list.
+    let failBeta = true;
+    const failOutline = async (route: Route): Promise<void> => {
+      if (!failBeta || new URL(route.request().url()).searchParams.get("path") !== "beta.ts") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "forced outline failure" }),
+      });
+    };
+    await page.route(outlineRoute, failOutline);
+    await writeFile(join(fixtureRoot, "beta.ts"), 'export const BETA_TWO: string = "c";\n');
+    await expect(outlineMessage(page, "beta.ts")).toHaveText("forced outline failure", {
+      timeout: 45_000,
+    });
+    failBeta = false;
+    await page.unroute(outlineRoute, failOutline);
+    await treeToggle(page, "beta.ts").click();
+    await treeToggle(page, "beta.ts").click();
+    await expect(definitionNames(page, "beta.ts")).toHaveText(["BETA_TWO"], { timeout: 30_000 });
+    await expect(page.locator("#editor-panel")).toBeHidden();
   } finally {
     await cleanupResource(resource);
   }

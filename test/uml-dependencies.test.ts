@@ -1,404 +1,229 @@
 import { afterEach, expect, test } from "bun:test";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { extractContract, normalizeRoot } from "./support/uml-contract.ts";
+import { memberLabels, toUmlContract } from "./support/uml-contract.ts";
+import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
+const projects: UmlProject[] = [];
 
 afterEach(async () => {
+  for (const project of projects.splice(0)) project.close();
   await fixtures.cleanup();
 });
 
-test("reference syntaxes that produce usage edges", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-syntax-", {
-    "src/targets.ts": `export class ArgTarget {}
-export class NewTarget {}
-export class ParamTarget {}
-export class ReturnTarget {}
-export class PropTarget {}
-export class GenericTarget {}
-export class AssertTarget {}
-export class TypeofTarget {}
-export class ConstraintTarget {}
-export class SatisfiesTarget {}
-export class IndexedTarget {
-  field!: string;
+async function openProject(
+  prefix: string,
+  files: Record<string, string>,
+): Promise<UmlProject> {
+  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
+  projects.push(project);
+  return project;
 }
-export class JsdocTarget {}
-export class TypeOnlyTarget {}
-export class Consumer {
-  prop!: PropTarget;
-  take(value: ParamTarget): ReturnTarget {
-    return new ReturnTarget();
-  }
-  build(): void {
-    accept(new ArgTarget());
-    const made = new NewTarget();
-    const box: Array<GenericTarget> = [];
-    const cast = made as unknown as AssertTarget;
-    const shape: typeof TypeofTarget = TypeofTarget;
-    const idx: IndexedTarget["field"] = "";
-    const sat = {} satisfies Partial<SatisfiesTarget>;
-  }
-  limit<T extends ConstraintTarget>(value: T): T {
-    return value;
-  }
-  /** @param value {JsdocTarget} */
-  documented(value: unknown): void {}
-}
-function accept(value: ArgTarget): void {}
+
+/** The fixture the rooted-navigation design is specified against. */
+const ROOT_FILES = {
+  "feature/root.ts": `import { B } from "./b";
+export class Root { value: B; run(): B { return new B(); } }
+export class Isolated {}
 `,
-    "src/type-only.ts": `import type { TypeOnlyTarget } from "./targets.ts";
-export class TypeOnlyUser {
-  value!: TypeOnlyTarget;
-}
+  "feature/b.ts": `import { C } from "../shared/c";
+export class B { value: C; }
 `,
-  });
-
-  const { contract } = await extractContract(root);
-
-  // characterizes: every reference position except JSDoc yields one usage edge per pair, sorted by
-  // source name then target name. `ReturnTarget` is absent because a method return type is carried
-  // by methodReturnDependencies instead. A type-only import still counts as a use.
-  expect(contract.usage).toEqual([
-    { source: "Consumer", target: "ArgTarget" },
-    { source: "Consumer", target: "AssertTarget" },
-    { source: "Consumer", target: "ConstraintTarget" },
-    { source: "Consumer", target: "GenericTarget" },
-    { source: "Consumer", target: "IndexedTarget" },
-    { source: "Consumer", target: "NewTarget" },
-    { source: "Consumer", target: "ParamTarget" },
-    { source: "Consumer", target: "PropTarget" },
-    { source: "Consumer", target: "SatisfiesTarget" },
-    { source: "Consumer", target: "TypeofTarget" },
-    { source: "TypeOnlyUser", target: "TypeOnlyTarget" },
-  ]);
-  // characterizes: a scope-local free function is a local user, never a usage edge
-  expect(contract.localUsers).toEqual([
-    {
-      label: "local: src/targets.ts: accept(ArgTarget)",
-      path: "src/targets.ts",
-      line: 36,
-      column: 10,
-      kind: "function",
-      owner: null,
-      targets: ["ArgTarget"],
-    },
-  ]);
-  expect(contract.externalUsers).toEqual([]);
-}, 30_000);
-
-test("method return types are traversed through aliases, unions, intersections, arrays, generics and cycles", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-returns-", {
-    "src/returns.ts": `export class Direct {}
-export class Wrapped {}
-export class UnionA {}
-export class UnionB {}
-export class InterA {}
-export class InterB {}
-export class Elem {}
-export class KeyType {}
-export class ValueType {}
-export class AliasTarget {}
-export type AliasOne = AliasTarget;
-export type AliasTwo = AliasOne;
-export class Cycle1 {
-  next(): Cycle2 {
-    return new Cycle2();
-  }
-}
-export class Cycle2 {
-  prev(): Cycle1 {
-    return new Cycle1();
-  }
-}
-export class Returns {
-  direct(): Direct {
-    return new Direct();
-  }
-  promised(): Promise<Wrapped> {
-    return Promise.resolve(new Wrapped());
-  }
-  either(): UnionA | UnionB {
-    return new UnionA();
-  }
-  both(): InterA & InterB {
-    return new InterA() as InterA & InterB;
-  }
-  list(): Elem[] {
-    return [];
-  }
-  mapped(): Map<KeyType, ValueType> {
-    return new Map();
-  }
-  aliased(): AliasTwo {
-    return new AliasTarget();
-  }
-  self(): this {
-    return this;
-  }
-}
-export type LiteralHost = {
-  produce(): Direct;
+  "shared/c.ts": `import { B } from "../feature/b";
+export class C { value: B; }
+`,
+  "consumer.ts": `import { Root } from "./feature/root";
+export class Consumer { value: Root; }
+`,
+  "unrelated.ts": `export class Unrelated {}
+`,
+  "empty.ts": "",
 };
-`,
-  });
 
-  const { contract } = await extractContract(root);
+test("a definition root closes over its outgoing references and keeps the cycle it reaches", async () => {
+  const project = await openProject("ts-explorer-uml-root-", ROOT_FILES);
+  const target = {
+    kind: "definition",
+    path: "feature/root.ts",
+    definitionKey: project.key("feature/root.ts", "Root"),
+  } as const;
 
-  // characterizes: rows keep declaration order (they are never sorted); traversal descends through
-  // type arguments, unions, intersections and array elements, resolves an alias chain to the
-  // declaring class, drops `this`, and tolerates mutual recursion.
-  expect(contract.methodReturns).toEqual([
-    { source: "Cycle1", target: "Cycle2" },
-    { source: "Cycle2", target: "Cycle1" },
-    { source: "Returns", target: "Direct" },
-    { source: "Returns", target: "Wrapped" },
-    { source: "Returns", target: "UnionA" },
-    { source: "Returns", target: "UnionB" },
-    { source: "Returns", target: "InterA" },
-    { source: "Returns", target: "InterB" },
-    { source: "Returns", target: "Elem" },
-    { source: "Returns", target: "KeyType" },
-    { source: "Returns", target: "ValueType" },
-    { source: "Returns", target: "AliasTarget" },
-    // characterizes: a type-literal alias that uses another entity is turned into a local-user node
-    // and its entity is deleted, so its own return dependency keeps a dangling source id
-    { source: '<unmapped:"<root>/src/returns".LiteralHost>', target: "Direct" },
-  ]);
-  expect(contract.entities.map((entity) => entity.name)).toEqual([
-    "Direct",
-    "Wrapped",
-    "UnionA",
-    "UnionB",
-    "InterA",
-    "InterB",
-    "Elem",
-    "KeyType",
-    "ValueType",
-    "AliasTarget",
-    "Cycle1",
-    "Cycle2",
-    "Returns",
-  ]);
-  // characterizes: the deleted alias entities resurface as local users owned by dangling ids
-  expect(contract.localUsers).toEqual([
-    {
-      label: "local: src/returns.ts: AliasOne",
-      path: "src/returns.ts",
-      line: 11,
-      column: 13,
-      kind: "type",
-      owner: '<unmapped:"<root>/src/returns".AliasOne>',
-      targets: ["AliasTarget"],
-    },
-    {
-      label: "local: src/returns.ts: AliasTwo",
-      path: "src/returns.ts",
-      line: 12,
-      column: 13,
-      kind: "type",
-      owner: '<unmapped:"<root>/src/returns".AliasTwo>',
-      targets: ['<unmapped:"<root>/src/returns".AliasOne>'],
-    },
-    {
-      label: "local: src/returns.ts: LiteralHost.produce()",
-      path: "src/returns.ts",
-      line: 50,
-      column: 3,
-      kind: "method",
-      owner: '<unmapped:"<root>/src/returns".LiteralHost>',
-      targets: ["Direct"],
-    },
-  ]);
-}, 30_000);
+  const contract = toUmlContract(readCompleteUml(project, target));
 
-test("only methods create return dependencies", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-non-methods-", {
-    "src/model.ts": `export class Target {}
-export class Holder {
-  factory: () => Target = () => new Target();
-  take(value: Target): void {}
-  constructor() {}
-}
-export function make(): Target {
-  return new Target();
-}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  // characterizes: a callable property, a free function and a constructor contribute nothing here
-  expect(contract.methodReturns).toEqual([]);
-  // characterizes: the method parameter and the property initializer still make Holder a user
-  expect(contract.usage).toEqual([{ source: "Holder", target: "Target" }]);
-  expect(contract.localUsers).toEqual([
-    {
-      label: "local: src/model.ts: make()",
-      path: "src/model.ts",
-      line: 7,
-      column: 17,
-      kind: "function",
-      owner: null,
-      targets: ["Target"],
-    },
-  ]);
-}, 30_000);
-
-test("unresolved usage endpoints are dropped while heritage keeps a boundary node", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-boundary-", {
-    "src/vendor.d.ts": `export declare class Missing {}
-export declare class Absent {}
-`,
-    "src/model.ts": `import { Absent, Missing } from "./vendor";
-export class Consumer extends Missing {
-  use(): void {
-    new Absent();
-  }
-}
-`,
-  });
-
-  const { contract } = await extractContract(root);
-
-  // characterizes: the asymmetry between resolveEndpoint (src/uml/graph.ts:74-92), which invents a
-  // boundary node for an unknown heritage endpoint, and the usage collector, which never registers
-  // a reference declaration for an entity that lives outside the extracted scope.
+  expect(contract.status).toBe("ready");
+  // Ordered by source position: b.ts, root.ts, c.ts. Consumer only points *at* Root, Isolated and
+  // Unrelated are never reached, and Root's own members stay inside their class box.
   expect(contract.nodes).toEqual([
-    { name: "Consumer", kind: "entity", community: 0 },
-    { name: "Missing", kind: "boundary", community: 0 },
+    "B@feature/b.ts",
+    "Root@feature/root.ts",
+    "C@shared/c.ts",
   ]);
-  expect(contract.usage).toEqual([]);
-  expect(contract.localUsers).toEqual([]);
-  expect(contract.relations).toEqual([
-    { kind: "heritage", source: "Consumer", target: "Missing" },
+  expect(contract.edges).toEqual([
+    { kind: "references", source: "B@feature/b.ts", target: "C@shared/c.ts" },
+    { kind: "references", source: "C@shared/c.ts", target: "B@feature/b.ts" },
+    { kind: "references", source: "Root@feature/root.ts", target: "B@feature/b.ts" },
   ]);
-  expect(contract.edges).toEqual([{ a: "Consumer", b: "Missing", weight: 1 }]);
-}, 30_000);
+  expect(contract.frames).toEqual([{
+    root: "Root@feature/root.ts",
+    nodeKeys: ["B@feature/b.ts", "C@shared/c.ts", "Root@feature/root.ts"],
+  }]);
+  // Re-reading the same selection is byte-identical: no traversal order leaks into the payload.
+  expect(toUmlContract(readCompleteUml(project, target))).toEqual(contract);
+});
 
-test("local and external users are grouped by owner signature", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-users-", {
-    "src/inner/model.ts": `export class Widget {}
-`,
-    "src/inner/users.ts": `import { Widget } from "./model.ts";
-export function freeFunction(value: Widget): void {}
-export const arrow = (value: Widget) => value;
-export const holder = {
-  handle: (value: Widget) => value,
-};
-export type Alias = Widget;
-export { Widget };
-`,
-    "src/outer/sibling.ts": `import { Widget } from "../inner/model.ts";
-export function outsider(value: Widget): void {}
-`,
+test("a file selection renders one frame per top-level definition", async () => {
+  const project = await openProject("ts-explorer-uml-file-roots-", ROOT_FILES);
+
+  const contract = toUmlContract(
+    readCompleteUml(project, { kind: "file", path: "feature/root.ts" }),
+  );
+
+  expect(contract.frames).toEqual([
+    {
+      root: "Root@feature/root.ts",
+      nodeKeys: ["B@feature/b.ts", "C@shared/c.ts", "Root@feature/root.ts"],
+    },
+    { root: "Isolated@feature/root.ts", nodeKeys: ["Isolated@feature/root.ts"] },
+  ]);
+  // The union of both closures, still excluding the file's importers.
+  expect(contract.nodes).toEqual([
+    "B@feature/b.ts",
+    "Root@feature/root.ts",
+    "Isolated@feature/root.ts",
+    "C@shared/c.ts",
+  ]);
+});
+
+test("an unreferenced definition is a one-node graph and an empty file has no frames", async () => {
+  const project = await openProject("ts-explorer-uml-empty-", ROOT_FILES);
+
+  const isolated = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "unrelated.ts",
+    definitionKey: project.key("unrelated.ts", "Unrelated"),
+  }));
+  expect(isolated).toEqual({
+    status: "ready",
+    nodes: ["Unrelated@unrelated.ts"],
+    edges: [],
+    frames: [{ root: "Unrelated@unrelated.ts", nodeKeys: ["Unrelated@unrelated.ts"] }],
   });
 
-  const { contract } = await extractContract(root, "src/inner");
+  const empty = toUmlContract(readCompleteUml(project, { kind: "file", path: "empty.ts" }));
+  expect(empty).toEqual({ status: "ready", nodes: [], edges: [], frames: [] });
+});
 
-  // characterizes: local users sort by scope path, signature then kind; a top-level arrow const and
-  // an object-literal callable both render as callables, a type alias renders bare, and an export
-  // specifier switches the label prefix from `local:` to `export:`.
-  expect(contract.localUsers).toEqual([
-    {
-      label: "local: src/inner/users.ts: Alias",
-      path: "src/inner/users.ts",
-      line: 7,
-      column: 13,
-      kind: "type",
-      owner: '<unmapped:"<root>/src/inner/users".Alias>',
-      targets: ["Widget"],
-    },
-    {
-      label: "local: src/inner/users.ts: arrow(Widget)",
-      path: "src/inner/users.ts",
-      line: 3,
-      column: 14,
-      kind: "function",
-      owner: null,
-      targets: ["Widget"],
-    },
-    {
-      label: "local: src/inner/users.ts: freeFunction(Widget)",
-      path: "src/inner/users.ts",
-      line: 2,
-      column: 17,
-      kind: "function",
-      owner: null,
-      targets: ["Widget"],
-    },
-    {
-      label: "local: src/inner/users.ts: holder.handle(Widget)",
-      path: "src/inner/users.ts",
-      line: 5,
-      column: 3,
-      kind: "method",
-      owner: null,
-      targets: ["Widget"],
-    },
-    {
-      label: "export: src/inner/users.ts: Widget",
-      path: "src/inner/users.ts",
-      line: 8,
-      column: 10,
-      kind: "export",
-      owner: null,
-      targets: ["Widget"],
-    },
-  ]);
-  // characterizes: an out-of-scope sibling becomes one external user keyed by its file scope path
-  expect(contract.externalUsers).toEqual([
-    {
-      label: "extern: src/outer/sibling.ts: outsider(Widget)",
-      scopePath: "src/outer/sibling.ts",
-      kind: "function",
-      targets: ["Widget"],
-    },
-  ]);
-}, 30_000);
-
-test("same-name references resolve to the declaring entity", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-usage-shadowing-", {
-    "src/first.ts": `export class Same {}
-export namespace Space {
-  export class Nested {}
+test("a method root carries only its own references, not a sibling method's", async () => {
+  const project = await openProject("ts-explorer-uml-method-root-", {
+    "pair.ts": `import { Helper } from "./helper";
+import { Other } from "./other";
+export class Pair {
+  first(): Helper { return new Helper(); }
+  second(): Other { return new Other(); }
 }
 `,
-    "src/second.ts": `export class Same {}
-`,
-    "src/user.ts": `import { Same, Space } from "./first.ts";
-export class Consumer {
-  hold!: Same;
-  shadow(): void {
-    const Same = 1;
-    void Same;
-  }
-  nested(): void {
-    const value = new Space.Nested();
-    void value;
-  }
+    "helper.ts": "export class Helper {}\n",
+    "other.ts": "export class Other {}\n",
+  });
+
+  const first = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "pair.ts",
+    definitionKey: project.key("pair.ts", "Pair.first"),
+  }));
+  expect(first.nodes).toEqual(["Helper@helper.ts", "Pair.first@pair.ts"]);
+  expect(first.edges).toEqual([
+    { kind: "references", source: "Pair.first@pair.ts", target: "Helper@helper.ts" },
+  ]);
+
+  // The declaring class aggregates both methods' dependencies instead.
+  const pair = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "pair.ts",
+    definitionKey: project.key("pair.ts", "Pair"),
+  }));
+  expect(pair.nodes).toEqual(["Helper@helper.ts", "Other@other.ts", "Pair@pair.ts"]);
+  expect(pair.edges).toEqual([
+    { kind: "references", source: "Pair@pair.ts", target: "Helper@helper.ts" },
+    { kind: "references", source: "Pair@pair.ts", target: "Other@other.ts" },
+  ]);
+});
+
+test("a class root absorbs its own members while each member stays a selectable root", async () => {
+  const project = await openProject("ts-explorer-uml-self-members-", {
+    "machine.ts": `export class Machine {
+  private state: number = 0;
+  start(): void { this.step(); }
+  step(): void { this.state += 1; }
 }
 `,
   });
 
-  const graph = await normalizeRoot(root, await extractUmlDiagramGraph(root, "", []));
+  const machine = readCompleteUml(project, {
+    kind: "definition",
+    path: "machine.ts",
+    definitionKey: project.key("machine.ts", "Machine"),
+  });
+  const classRoot = toUmlContract(machine);
+  // `start -> step -> state` is internal to the box: one node, no arrows, no extra member boxes.
+  expect(classRoot.nodes).toEqual(["Machine@machine.ts"]);
+  expect(classRoot.edges).toEqual([]);
+  // The compartments still address the real member definitions.
+  expect(memberLabels(machine, "Machine@machine.ts")).toEqual([
+    "Machine.state@machine.ts",
+    "Machine.start@machine.ts",
+    "Machine.step@machine.ts",
+  ]);
 
-  // characterizes: the reference resolves through the symbol, so the shadowing local `Same` adds
-  // nothing and the edge lands on src/first.ts rather than the same-named class in src/second.ts
-  expect(graph.usageEdges).toEqual([
-    {
-      dependencyOrdinal: 0,
-      sourceId: '"<root>/src/user".Consumer',
-      sourceName: "Consumer",
-      targetId: '"<root>/src/first".Same',
-      targetName: "Same",
-    },
+  const method = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "machine.ts",
+    definitionKey: project.key("machine.ts", "Machine.start"),
+  }));
+  expect(method.frames).toEqual([{
+    root: "Machine.start@machine.ts",
+    nodeKeys: [
+      "Machine.start@machine.ts",
+      "Machine.state@machine.ts",
+      "Machine.step@machine.ts",
+    ],
+  }]);
+  expect(method.edges).toEqual([
+    { kind: "references", source: "Machine.start@machine.ts", target: "Machine.step@machine.ts" },
+    { kind: "references", source: "Machine.step@machine.ts", target: "Machine.state@machine.ts" },
   ]);
-  // characterizes: a namespace-nested class is not an entity, so `Space.Nested` has no node at all
-  expect(graph.nodes.map((node) => `${node.nodeKind}:${node.nodeId}`)).toEqual([
-    'entity:"<root>/src/first".Same',
-    'entity:"<root>/src/second".Same',
-    'entity:"<root>/src/user".Consumer',
+
+  const property = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "machine.ts",
+    definitionKey: project.key("machine.ts", "Machine.state"),
+  }));
+  expect(property.nodes).toEqual(["Machine.state@machine.ts"]);
+  expect(property.edges).toEqual([]);
+});
+
+test("an alias stays an intermediate node in the chain it forwards", async () => {
+  const project = await openProject("ts-explorer-uml-alias-chain-", {
+    "alias.ts": `import { Target } from "./target";
+export type Alias = Target;
+export class AliasRoot { value: Alias; }
+`,
+    "target.ts": "export class Target {}\n",
+  });
+
+  const contract = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "alias.ts",
+    definitionKey: project.key("alias.ts", "AliasRoot"),
+  }));
+
+  expect(contract.nodes).toEqual([
+    "Alias@alias.ts",
+    "AliasRoot@alias.ts",
+    "Target@target.ts",
   ]);
-}, 30_000);
+  expect(contract.edges).toEqual([
+    { kind: "references", source: "Alias@alias.ts", target: "Target@target.ts" },
+    { kind: "references", source: "AliasRoot@alias.ts", target: "Alias@alias.ts" },
+  ]);
+});

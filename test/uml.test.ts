@@ -1,1621 +1,294 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join, sep } from "node:path";
-import type { UmlDiagramGraph } from "../src/diagram-graph.ts";
-import type { PackageInfo } from "../src/types.ts";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
+import type { UmlDiagramPayload } from "../src/types.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import {
-  expectCachedRendering,
-  expectNormalizedUmlRoundTrip,
-  materializeUmlGraph,
-} from "./support/normalized-graph.ts";
+import { toFileContract, toUmlContract, umlLabel } from "./support/uml-contract.ts";
+import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
-
-async function materializeUml(
-  sourceDir: string,
-  scopePath: string,
-  packages: readonly PackageInfo[],
-  prepare?: (graph: UmlDiagramGraph) => UmlDiagramGraph,
-) {
-  const sourceGraph = await extractUmlDiagramGraph(sourceDir, scopePath, packages);
-  const extracted = prepare?.(sourceGraph) ?? sourceGraph;
-  return materializeUmlGraph(sourceDir, extracted);
-}
+const projects: UmlProject[] = [];
 
 afterEach(async () => {
+  for (const project of projects.splice(0)) project.close();
   await fixtures.cleanup();
 });
 
-test("renders generic and semantic UML styles including tests", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await mkdir(join(root, "tests"), { recursive: true });
-  await writeFile(join(root, "src", "model.ts"), `
-    export interface Box<T> { value: T; }
-    export abstract class Base { abstract run(): void; }
-    export class Concrete extends Base implements Box<string> {
-      value = "ok";
-      run(): void {}
-    }
-    export interface Output { value: string; }
-    export class ResultService {
-      result!: { ok: true; output: Output } | { ok: false; rejection: Error };
-      execute(): Promise<
-        { ok: true; output: Output } |
-        { ok: false; rejection: Error }
-      > {
-        throw new Error("not implemented");
-      }
-    }
-  `);
-  await writeFile(join(root, "tests", "example.test.ts"), `export class ExampleTest {}`);
-
-  const dsl = (await materializeUml(root, "", [])).dsl;
-  const lines = dsl.split(/\r?\n/);
-  const resultIndex = lines.findIndex((line) => line.includes("result:"));
-  const executeIndex = lines.findIndex((line) => line.includes("execute()"));
-  if (resultIndex === -1) {
-    throw new Error("Expected generated UML to include the result property");
-  }
-  if (executeIndex === -1) {
-    throw new Error("Expected generated UML to include the execute method");
-  }
-
-  const resultLine = lines[resultIndex].trim();
-  const executeLine = lines[executeIndex].trim();
-  const executeReturnRow =
-    "§() Promise⟨ ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝ ⟩";
-  expect(resultLine).toContain(
-    "result: ｛ ok: true; output: Output ｝ | ｛ ok: false; rejection: Error ｝",
-  );
-  expect(resultLine).not.toContain("§()");
-  expect(executeLine).toBe("+execute()");
-  expect(lines[executeIndex + 1]?.trim()).toBe(executeReturnRow);
-  expect(lines.filter((line) => line.trim() === executeReturnRow)).toHaveLength(1);
-  expect(dsl).toContain("ResultService");
-  expect(dsl).not.toMatch(/\|\s*\{/);
-  expect(dsl).toContain('cssClass "Output" interface');
-  expect(dsl).toContain('cssClass "Base" abstract');
-  expect(dsl).toContain('cssClass "ResultService" concrete');
-  expect(dsl).toContain("classDiagram");
-  expect(dsl).toContain('class Box["Box⟨T⟩"]');
-  expect(dsl).toContain("Base<|--Concrete");
-  expect(dsl).toContain("Box<|..Concrete");
-  expect(dsl).toContain("classDef interface");
-  expect(dsl).toContain("classDef abstract");
-  expect(dsl).toContain("classDef concrete");
-  expect(dsl).toContain("stroke:#ff5c5c");
-  expect(dsl).toContain("stroke-dasharray: 6 4");
-});
-
-test("keeps generic labels Unicode while Mermaid identifiers remain parser-safe", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-generic-identifiers-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "model.ts"),
-    `export interface SessionStorage<TMetadata> {
-  metadata: TMetadata;
+async function openProject(
+  prefix: string,
+  files: Record<string, string>,
+): Promise<UmlProject> {
+  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
+  projects.push(project);
+  return project;
 }
-export class DurableSessionStorage implements SessionStorage<string> {
-  metadata = "";
+
+/** `label -> test` for every node of a definition selection. */
+function nodeTestFlags(diagram: UmlDiagramPayload): [string, boolean][] {
+  if (diagram.view.kind !== "definitions") throw new Error("expected a definitions view");
+  return diagram.view.nodes.map((node) => [umlLabel(node.definition), node.test]);
 }
-export class JuncoAgent<TSkill, TTool, Ctx> {
-  skill!: TSkill;
-  tool!: TTool;
-  context!: Ctx;
-}
+
+const DIRECTORY_FILES = {
+  "area/isolated.ts": "export class Alone {}\n",
+  "area/notes.md": "not a source file\n",
+  "area/unused.ts": `import { Unused } from "../outside/unused-target";
+export const nothing = 1;
 `,
-  );
+  "area/typeonly.ts": `import type { Shape } from "../outside/shape";
+export type Alias = Shape;
+`,
+  "area/reexport.ts": `export { Shape } from "../outside/shape";
+`,
+  "area/side-effect.ts": `import "../outside/effect";
+export const flag = true;
+`,
+  "outside/unused-target.ts": "export class Unused {}\n",
+  "outside/shape.ts": "export interface Shape { size: number; }\n",
+  "outside/effect.ts": "export const effect = 1;\n",
+  "outside/back.ts": `import { Alone } from "../area/isolated";
+export class Back { value: Alone; }
+`,
+};
 
-  const dsl = (await materializeUml(root, "", [])).dsl;
-  const lines = dsl.split(/\r?\n/);
+test("a directory selection graphs its subtree plus the project files it imports", async () => {
+  const project = await openProject("ts-explorer-uml-directory-", DIRECTORY_FILES);
 
-  expect(dsl).toContain('class SessionStorage["SessionStorage⟨TMetadata⟩"]');
-  expect(dsl).toContain('class JuncoAgent["JuncoAgent⟨TSkill,TTool,Ctx⟩"]');
-  expect(dsl).toContain("SessionStorage<|..DurableSessionStorage");
-  for (const line of lines.filter(
-    (line) => /^class\s+/.test(line) || /(?:--|<\|\.\.|\.\.>)/.test(line),
-  )) {
-    expect(line.replace(/\["[^"]*"\]/g, "")).not.toMatch(/[⟨⟩]/);
+  const contract = toFileContract(readCompleteUml(project, { kind: "directory", path: "area" }));
+
+  expect(contract.status).toBe("ready");
+  // Every visible regular file in the subtree — including the isolated one and the Markdown file —
+  // plus the three outside targets as boundary leaves. `outside/back.ts` only imports *into* the
+  // subtree, so it is absent.
+  expect(contract.nodes).toEqual([
+    { path: "area/isolated.ts", boundary: false, test: false },
+    { path: "area/notes.md", boundary: false, test: false },
+    { path: "area/reexport.ts", boundary: false, test: false },
+    { path: "area/side-effect.ts", boundary: false, test: false },
+    { path: "area/typeonly.ts", boundary: false, test: false },
+    { path: "area/unused.ts", boundary: false, test: false },
+    { path: "outside/effect.ts", boundary: true, test: false },
+    { path: "outside/shape.ts", boundary: true, test: false },
+    { path: "outside/unused-target.ts", boundary: true, test: false },
+  ]);
+  // Unused, type-only, re-exported and side-effect-only imports all count; a boundary leaf never
+  // contributes its own imports.
+  expect(contract.edges).toEqual([
+    { source: "area/reexport.ts", target: "outside/shape.ts" },
+    { source: "area/side-effect.ts", target: "outside/effect.ts" },
+    { source: "area/typeonly.ts", target: "outside/shape.ts" },
+    { source: "area/unused.ts", target: "outside/unused-target.ts" },
+  ]);
+});
+
+test("the root directory contains every visible file and its imports point both ways", async () => {
+  const project = await openProject("ts-explorer-uml-root-directory-", DIRECTORY_FILES);
+
+  const contract = toFileContract(readCompleteUml(project, { kind: "directory", path: "" }));
+
+  expect(contract.nodes.map((node) => node.path)).toEqual([
+    "area/isolated.ts",
+    "area/notes.md",
+    "area/reexport.ts",
+    "area/side-effect.ts",
+    "area/typeonly.ts",
+    "area/unused.ts",
+    "outside/back.ts",
+    "outside/effect.ts",
+    "outside/shape.ts",
+    "outside/unused-target.ts",
+  ]);
+  expect(contract.nodes.every((node) => !node.boundary)).toBe(true);
+  // The importer excluded from the `area` view is an ordinary node here, with its edge.
+  expect(contract.edges).toContainEqual({
+    source: "outside/back.ts",
+    target: "area/isolated.ts",
+  });
+  expect(contract.edges).toHaveLength(5);
+});
+
+test("local bindings shadow project declarations instead of creating edges", async () => {
+  const project = await openProject("ts-explorer-uml-shadowing-", {
+    "shadow.ts": `import { Helper } from "./helper";
+export class Shadowed {
+  run(): void {
+    const Other = 1;
+    void Other;
   }
-  expect(dsl).not.toContain("~");
+  generic<Helper>(value: Helper): void { void value; }
+}
+export function shadows(Helper: string): string { return Helper; }
+`,
+    "helper.ts": "export class Helper {}\n",
+    "other.ts": "export class Other {}\n",
+  });
+
+  const contract = toUmlContract(readCompleteUml(project, { kind: "file", path: "shadow.ts" }));
+
+  // A local constant, a generic parameter and a parameter each shadow an equally named project
+  // declaration, so neither Helper nor Other is reachable.
+  expect(contract.nodes).toEqual(["Shadowed@shadow.ts", "shadows@shadow.ts"]);
+  expect(contract.edges).toEqual([]);
 });
 
-test("renders const-only scopes without the tsuml2 no-entity sentinel", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-const-only-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(join(root, "src", "value.ts"), "export const value = 1;\n");
+test("member references resolve to the intended member and unknown receivers resolve to nothing", async () => {
+  const project = await openProject("ts-explorer-uml-members-", {
+    "statics.ts": `export class Holder {
+  static make(): void {}
+  run(): void { this.helper(); }
+  helper(): void {}
+}
+export function callsStatic(): void { Holder.make(); }
+export function unknownReceiver(value: { make(): void }): void { value.make(); }
+`,
+  });
 
-  const bundle = await materializeUml(root, "", []);
+  const staticCall = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "statics.ts",
+    definitionKey: project.key("statics.ts", "callsStatic"),
+  }));
+  expect(staticCall.edges).toEqual([
+    {
+      kind: "references",
+      source: "callsStatic@statics.ts",
+      target: "Holder.make@statics.ts",
+    },
+  ]);
 
-  expect(bundle.dsl.startsWith("classDiagram")).toBe(true);
-  expect(bundle.dsl).not.toContain("[Could not process any class / interface / enum / type]");
-  expect(bundle.dsls).toEqual([bundle.dsl]);
+  const thisCall = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "statics.ts",
+    definitionKey: project.key("statics.ts", "Holder.run"),
+  }));
+  expect(thisCall.edges).toEqual([
+    {
+      kind: "references",
+      source: "Holder.run@statics.ts",
+      target: "Holder.helper@statics.ts",
+    },
+  ]);
+
+  // An anonymous structural receiver has no project declaration; nothing is invented for it.
+  const unknown = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "statics.ts",
+    definitionKey: project.key("statics.ts", "unknownReceiver"),
+  }));
+  expect(unknown.nodes).toEqual(["unknownReceiver@statics.ts"]);
+  expect(unknown.edges).toEqual([]);
 });
 
-test("preserves absent versus empty optional UML model fields through normalized rows", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-optional-fields-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "a.ts"),
-    "export class AbsentMembers { absent(): void {} empty(): void {} }\n",
-  );
-  await writeFile(join(root, "src", "b.ts"), "export class EmptyMembers {}\n");
+test("a qualified namespace member resolves to one target, not to its namespace", async () => {
+  const project = await openProject("ts-explorer-uml-namespace-", {
+    "ns.ts": `export namespace Space {
+  export class Inner {}
+  export class Sibling {}
+}
+export class NsUser { value: Space.Inner; }
+`,
+  });
 
-  const bundle = await materializeUml(root, "", [], (graph) => ({
-    ...graph,
-    declarations: graph.declarations.map((declaration) => ({
-      ...declaration,
-      memberAssociationsPresent: declaration.fileName.endsWith("b.ts"),
-    })),
-    methods: graph.methods.map((method) => ({
-      ...method,
-      returnTypeIdsPresent: method.name === "empty",
-    })),
-    methodReturnTypeIds: [],
-    memberAssociations: [],
+  const contract = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "ns.ts",
+    definitionKey: project.key("ns.ts", "NsUser"),
   }));
 
-  expect(bundle.record.declarations.map(({ fileName, memberAssociationsPresent }) => ({
-    file: fileName.endsWith("a.ts") ? "a.ts" : "b.ts",
-    memberAssociationsPresent,
-  }))).toEqual([
-    { file: "a.ts", memberAssociationsPresent: false },
-    { file: "b.ts", memberAssociationsPresent: true },
-  ]);
-  expect(bundle.record.methods.map(({ name, returnTypeIdsPresent }) => ({
-    name,
-    returnTypeIdsPresent,
-  }))).toEqual([
-    { name: "absent", returnTypeIdsPresent: false },
-    { name: "empty", returnTypeIdsPresent: true },
-  ]);
-  expect(bundle.record.methodReturnTypeIds).toEqual([]);
-  expect(bundle.dsl).toMatch(/^class AbsentMembers\s*\{$/m);
-  expect(bundle.dsl).toMatch(/^class EmptyMembers\s*\{$/m);
-});
-
-test("renders directed method-return edges for project-local types", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-returns-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "machines.ts"),
-    `
-      export class AbstractStateMachine {}
-      export class AsyncStateMachine {}
-      export class OptionalStateMachine {}
-    `,
-  );
-  await writeFile(
-    join(root, "src", "runtime.ts"),
-    `
-      import {
-        AbstractStateMachine,
-        AsyncStateMachine,
-        OptionalStateMachine,
-      } from "./machines";
-
-      export class DataflowRuntime {
-        getMachine(): AbstractStateMachine {
-          throw new Error("not implemented");
-        }
-
-        getMachineAgain(): AbstractStateMachine {
-          throw new Error("not implemented");
-        }
-
-        getAsyncMachine(): Promise<AsyncStateMachine> {
-          throw new Error("not implemented");
-        }
-
-        getOptionalMachine(): OptionalStateMachine | undefined {
-          throw new Error("not implemented");
-        }
-
-        getSelf(): DataflowRuntime {
-          return this;
-        }
-
-        getDate(): Date {
-          return new Date(0);
-        }
-      }
-    `,
-  );
-
-  const dsl = (await materializeUml(root, "", [])).dsl;
-
-  expect(
-    [...dsl.matchAll(/^[ \t]*DataflowRuntime[ \t]*-->[ \t]*AbstractStateMachine[ \t]*\r?$/gm)],
-  ).toHaveLength(1);
-  expect(
-    [...dsl.matchAll(/^[ \t]*DataflowRuntime[ \t]*-->[ \t]*AsyncStateMachine[ \t]*\r?$/gm)],
-  ).toHaveLength(1);
-  expect(
-    [...dsl.matchAll(/^[ \t]*DataflowRuntime[ \t]*-->[ \t]*OptionalStateMachine[ \t]*\r?$/gm)],
-  ).toHaveLength(1);
-  expect(dsl).not.toMatch(
-    /^[ \t]*DataflowRuntime[ \t]*-->[ \t]*DataflowRuntime[ \t]*\r?$/gm,
-  );
-  expect(dsl).not.toMatch(/^[ \t]*DataflowRuntime[ \t]*-->[ \t]*Date[ \t]*\r?$/gm);
-});
-
-test("encodes nested generic member return types without Mermaid tildes", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-nested-generics-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(join(root, "src", "model.ts"), `
-    export interface GitCell { value: string; }
-    export interface CapsResponse<C, T> { context: C; value: T; }
-    export class Checker<C> {
-      check(): CapsResponse<C, Readonly<Record<string, Readonly<Record<string, GitCell>>>>> {
-        throw new Error("not implemented");
-      }
-    }
-  `);
-  await writeFile(join(root, "src", "sentinel.ts"), "export class Sentinel {}\n");
-
-  const dsl = (await materializeUml(root, "", [])).dsl;
-  const lines = dsl.split(/\r?\n/);
-  const checkIndex = lines.findIndex((line) => line.includes("check()"));
-  if (checkIndex === -1) {
-    throw new Error("Expected generated UML to include the generic check method");
-  }
-
-  const checkLine = lines[checkIndex].trim();
-  const genericTypeLine = lines[checkIndex + 1]?.trim();
-  expect(checkLine).toBe("+check()");
-  expect(genericTypeLine).toBe(
-    "§() CapsResponse⟨C, Readonly⟨Record⟨string, Readonly⟨Record⟨string, GitCell⟩⟩⟩⟩⟩",
-  );
-  expect(dsl).not.toContain("~");
-  expect(genericTypeLine).not.toMatch(/[<>]/);
-  expect(genericTypeLine).not.toMatch(/&(?:lt|gt);/);
-});
-
-test("removes import qualifiers from nested generic property and method labels", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-import-types-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "types.ts"),
-    [
-      "export interface Skill { name: string; }",
-      "export interface AgentTool<TSchema, TContext> {",
-      "  schema: TSchema;",
-      "  context: TContext;",
-      "}",
-      "export interface DurableContext { durable: true; }",
-      "export declare function definitions<TSchema>(): Map<Skill, AgentTool<TSchema, any>>;",
-      "export declare function current<TSchema>(): {",
-      "  tool: AgentTool<TSchema, any>;",
-      "  context: DurableContext;",
-      "};",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "runtime.ts"),
-    [
-      'import { current, definitions } from "./types";',
-      "export class Runtime<TSchema> {",
-      "  readonly registry: Map<Skill, AgentTool<TSchema, any>> = definitions<TSchema>();",
-      "  resolve(): { tool: AgentTool<TSchema, any>; context: DurableContext } { return current<TSchema>(); }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-
-  const dsl = (await materializeUml(root, "", [])).dsl;
-  const lines = dsl.split(/\r?\n/).map((line) => line.trim());
-  const registryLine = lines.find((line) => line.includes("registry:"));
-  const resolveIndex = lines.findIndex((line) => line.includes("resolve()"));
-
-  expect(registryLine).toBe("+registry: Map⟨Skill, AgentTool⟨TSchema, any⟩⟩");
-  expect(lines[resolveIndex]).toBe("+resolve()");
-  expect(lines[resolveIndex + 1]).toBe(
-    "§() ｛ tool: AgentTool⟨TSchema, any⟩; context: DurableContext ｝",
-  );
-});
-
-test("reports canonical definition metadata with deterministic duplicate-name ordering", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-sources-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "z-contracts.ts"),
-    [
-      "export interface Runner {",
-      "  execute(): void;",
-      "}",
-      "",
-      "export type Hooks = {",
-      "  before(): boolean;",
-      "};",
-      "",
-      "export enum Status { Other }",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "a-models.ts"),
-    [
-      "export enum Status {",
-      "  Ready,",
-      "}",
-      "",
-      "export declare class Processor<T> {",
-      "  process(value: string): string;",
-      "  process(value: number): number;",
-      "  reset(): void;",
-      "}",
-      "",
-      "export function hidden(): void {}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.definitions).toEqual([
-    {
-      key: '["enum","Status",0,null,null]',
-      kind: "enum",
-      name: "Status",
-      qualifiedName: "Status",
-      source: { path: "src/a-models.ts", line: 1, column: 13 },
-      uml: { scopePath: "src/a-models.ts", entityName: "Status" },
-    },
-    {
-      key: '["class","Processor",0,null,null]',
-      kind: "class",
-      name: "Processor",
-      qualifiedName: "Processor",
-      source: { path: "src/a-models.ts", line: 5, column: 22 },
-      uml: { scopePath: "src/a-models.ts", entityName: "Processor<T>" },
-    },
-    {
-      key: '["class","Processor",0,"process",0]',
-      kind: "method",
-      name: "process",
-      qualifiedName: "Processor.process",
-      source: { path: "src/a-models.ts", line: 6, column: 3 },
-      uml: {
-        scopePath: "src/a-models.ts",
-        entityName: "Processor<T>",
-        memberName: "process",
-        memberOccurrence: 0,
-      },
-    },
-    {
-      key: '["class","Processor",0,"process",1]',
-      kind: "method",
-      name: "process",
-      qualifiedName: "Processor.process",
-      source: { path: "src/a-models.ts", line: 7, column: 3 },
-      uml: {
-        scopePath: "src/a-models.ts",
-        entityName: "Processor<T>",
-        memberName: "process",
-        memberOccurrence: 1,
-      },
-    },
-    {
-      key: '["class","Processor",0,"reset",0]',
-      kind: "method",
-      name: "reset",
-      qualifiedName: "Processor.reset",
-      source: { path: "src/a-models.ts", line: 8, column: 3 },
-      uml: {
-        scopePath: "src/a-models.ts",
-        entityName: "Processor<T>",
-        memberName: "reset",
-        memberOccurrence: 0,
-      },
-    },
-    {
-      key: '["interface","Runner",0,null,null]',
-      kind: "interface",
-      name: "Runner",
-      qualifiedName: "Runner",
-      source: { path: "src/z-contracts.ts", line: 1, column: 18 },
-      uml: { scopePath: "src/z-contracts.ts", entityName: "Runner" },
-    },
-    {
-      key: '["interface","Runner",0,"execute",0]',
-      kind: "method",
-      name: "execute",
-      qualifiedName: "Runner.execute",
-      source: { path: "src/z-contracts.ts", line: 2, column: 3 },
-      uml: {
-        scopePath: "src/z-contracts.ts",
-        entityName: "Runner",
-        memberName: "execute",
-        memberOccurrence: 0,
-      },
-    },
-    {
-      key: '["type","Hooks",0,null,null]',
-      kind: "type",
-      name: "Hooks",
-      qualifiedName: "Hooks",
-      source: { path: "src/z-contracts.ts", line: 5, column: 13 },
-      uml: { scopePath: "src/z-contracts.ts", entityName: "Hooks" },
-    },
-    {
-      key: '["type","Hooks",0,"before",0]',
-      kind: "method",
-      name: "before",
-      qualifiedName: "Hooks.before",
-      source: { path: "src/z-contracts.ts", line: 6, column: 3 },
-      uml: {
-        scopePath: "src/z-contracts.ts",
-        entityName: "Hooks",
-        memberName: "before",
-        memberOccurrence: 0,
-      },
-    },
-    {
-      key: '["enum","Status",0,null,null]',
-      kind: "enum",
-      name: "Status",
-      qualifiedName: "Status",
-      source: { path: "src/z-contracts.ts", line: 9, column: 13 },
-      uml: { scopePath: "src/z-contracts.ts", entityName: "Status" },
-    },
-  ]);
-  expect(bundle.definitions.map(({ name }) => name)).not.toContain("hidden");
-});
-
-test("groups cross-scope method references into one fan-out external user", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-external-fanout-");
-  await mkdir(join(root, "src", "lib"), { recursive: true });
-  await mkdir(join(root, "src", "app"), { recursive: true });
-  await writeFile(
-    join(root, "src", "lib", "gadget.ts"),
-    [
-      "export class Gadget {",
-      "  constructor(readonly source: unknown) {}",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "lib", "widget.ts"),
-    [
-      "export class Widget {",
-      "  readonly value = 1;",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "consumer.ts"),
-    [
-      'import { Gadget } from "../lib/gadget";',
-      'import { Widget } from "../lib/widget";',
-      "",
-      "export class Consumer {",
-      "  build(input: Widget): Gadget {",
-      "    const first: Widget = input;",
-      "    const second = first as Widget;",
-      "    return new Gadget(second);",
-      "  }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "import-only.ts"),
-    [
-      'import type { Gadget } from "../lib/gadget";',
-      'import type { Widget } from "../lib/widget";',
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "re-export-only.ts"),
-    [
-      'export type { Gadget } from "../lib/gadget";',
-      'export { Widget } from "../lib/widget";',
-      "",
-    ].join("\n"),
-  );
-
-  const scoped = await materializeUml(root, "src/lib", []);
-
-  expect(scoped.externalUsers).toEqual([
-    {
-      nodeId: "extern0",
-      label: "extern: src/app/consumer.ts: Consumer.build(Widget)",
-      scopePath: "src/app/consumer.ts",
-      kind: "method",
-    },
-    {
-      nodeId: "extern1",
-      label: "extern: src/app/re-export-only.ts: Gadget",
-      scopePath: "src/app/re-export-only.ts",
-      kind: "export",
-    },
-    {
-      nodeId: "extern2",
-      label: "extern: src/app/re-export-only.ts: Widget",
-      scopePath: "src/app/re-export-only.ts",
-      kind: "export",
-    },
-  ]);
-  expect(scoped.definitions).toEqual([
-    {
-      key: '["class","Gadget",0,null,null]',
-      kind: "class",
-      name: "Gadget",
-      qualifiedName: "Gadget",
-      source: { path: "src/lib/gadget.ts", line: 1, column: 14 },
-      uml: { scopePath: "src/lib/gadget.ts", entityName: "Gadget" },
-    },
-    {
-      key: '["class","Widget",0,null,null]',
-      kind: "class",
-      name: "Widget",
-      qualifiedName: "Widget",
-      source: { path: "src/lib/widget.ts", line: 1, column: 14 },
-      uml: { scopePath: "src/lib/widget.ts", entityName: "Widget" },
-    },
-  ]);
-  expect(
-    scoped.dsl.match(
-      /^class extern0\["extern: src\/app\/consumer\.ts<br\/>Consumer\.build\(Widget\)"\]$/gm,
-    ) ?? [],
-  ).toHaveLength(1);
-  expect(scoped.dsl.match(/^extern0 --> (?:Gadget|Widget)$/gm)?.sort()).toEqual([
-    "extern0 --> Gadget",
-    "extern0 --> Widget",
-  ]);
-  expect(scoped.dsl).not.toContain("extern3");
-
-  const consumer = await materializeUml(root, "src/app/consumer.ts", []);
-  expect(consumer.definitions).toEqual([
-    {
-      key: '["class","Consumer",0,null,null]',
-      kind: "class",
-      name: "Consumer",
-      qualifiedName: "Consumer",
-      source: { path: "src/app/consumer.ts", line: 4, column: 14 },
-      uml: { scopePath: "src/app/consumer.ts", entityName: "Consumer" },
-    },
-    {
-      key: '["class","Consumer",0,"build",0]',
-      kind: "method",
-      name: "build",
-      qualifiedName: "Consumer.build",
-      source: { path: "src/app/consumer.ts", line: 5, column: 3 },
-      uml: {
-        scopePath: "src/app/consumer.ts",
-        entityName: "Consumer",
-        memberName: "build",
-        memberOccurrence: 0,
-      },
-    },
-  ]);
-  expect(consumer.dsl).toMatch(/^class Consumer\s*\{$/m);
-
-  const rootBundle = await materializeUml(root, "", []);
-  expect(rootBundle.externalUsers).toEqual([]);
-}, 15_000);
-
-test("filters same-package test external users and renders retained extern nodes purple", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-same-package-tests-");
-  await Promise.all([
-    mkdir(join(root, "packages", "demo", "src", "target"), { recursive: true }),
-    mkdir(join(root, "packages", "demo", "z-child", "test"), { recursive: true }),
-    mkdir(join(root, "packages", "demo", "test"), { recursive: true }),
-    mkdir(join(root, "packages", "demo", "tests"), { recursive: true }),
-    mkdir(join(root, "packages", "demo", "__tests__"), { recursive: true }),
-    mkdir(join(root, "packages", "other", "test"), { recursive: true }),
-  ]);
-  await Promise.all([
-    writeFile(
-      join(root, "packages", "demo", "src", "target", "widget.ts"),
-      "export class Widget {}\n",
-    ),
-    writeFile(
-      join(root, "packages", "demo", "src", "consumer.ts"),
-      [
-        'import { Widget } from "./target/widget";',
-        "export class SourceConsumer {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "z-child", "test", "consumer.test.ts"),
-      [
-        'import { Widget } from "../../src/target/widget";',
-        "export class ChildPackageTest {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "other", "test", "consumer.test.ts"),
-      [
-        'import { Widget } from "../../demo/src/target/widget";',
-        "export class OtherPackageTest {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "test", "test-user.ts"),
-      [
-        'import { Widget } from "../src/target/widget";',
-        "export class TestDirectoryUser {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "tests", "tests-user.ts"),
-      [
-        'import { Widget } from "../src/target/widget";',
-        "export class TestsDirectoryUser {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "__tests__", "dunder-user.ts"),
-      [
-        'import { Widget } from "../src/target/widget";',
-        "export class DunderTestUser {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "src", "co-located.test.ts"),
-      [
-        'import { Widget } from "./target/widget";',
-        "export class CoLocatedTestUser {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "demo", "src", "co-located.spec.ts"),
-      [
-        'import { Widget } from "./target/widget";',
-        "export class CoLocatedSpecUser {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-  ]);
-
-  const bundle = await materializeUml(root, "packages/demo/src/target", [
-    { name: "demo", path: "packages/demo", dependencies: [] },
-    { name: "demo-child", path: "packages/demo/z-child", dependencies: ["demo"] },
-    { name: "other", path: "packages/other", dependencies: ["demo"] },
-  ]);
-
-  expect(bundle.externalUsers).toEqual([
-    {
-      nodeId: "extern0",
-      label: "extern: packages/demo/src/consumer.ts: SourceConsumer.build()",
-      scopePath: "packages/demo/src/consumer.ts",
-      kind: "method",
-    },
-    {
-      nodeId: "extern1",
-      label:
-        "extern: packages/demo/z-child/test/consumer.test.ts: ChildPackageTest.build()",
-      scopePath: "packages/demo/z-child/test/consumer.test.ts",
-      kind: "method",
-    },
-    {
-      nodeId: "extern2",
-      label: "extern: packages/other/test/consumer.test.ts: OtherPackageTest.build()",
-      scopePath: "packages/other/test/consumer.test.ts",
-      kind: "method",
-    },
-  ]);
-  expect(bundle.definitions).toEqual([
-    {
-      key: '["class","Widget",0,null,null]',
-      kind: "class",
-      name: "Widget",
-      qualifiedName: "Widget",
-      source: { path: "packages/demo/src/target/widget.ts", line: 1, column: 14 },
-      uml: {
-        scopePath: "packages/demo/src/target/widget.ts",
-        entityName: "Widget",
-      },
-    },
-  ]);
-
-  expect(bundle.dsl).toContain(
-    'class extern0["extern: packages/demo/src/consumer.ts<br/>SourceConsumer.build()"]',
-  );
-  expect(bundle.dsl).toContain(
-    'class extern1["extern: packages/demo/z-child/test/consumer.test.ts<br/>ChildPackageTest.build()"]',
-  );
-  expect(bundle.dsl).toContain(
-    'class extern2["extern: packages/other/test/consumer.test.ts<br/>OtherPackageTest.build()"]',
-  );
-  const dslLines = bundle.dsl.split(/\r?\n/).map((line) => line.trim());
-  for (const nodeId of ["extern0", "extern1", "extern2"]) {
-    expect(dslLines.filter((line) => line === `${nodeId} --> Widget`)).toHaveLength(1);
-    expect(bundle.dsl).toContain(`cssClass "${nodeId}" external`);
-  }
-
-  const filteredPaths = [
-    "packages/demo/test/test-user.ts",
-    "packages/demo/tests/tests-user.ts",
-    "packages/demo/__tests__/dunder-user.ts",
-    "packages/demo/src/co-located.test.ts",
-    "packages/demo/src/co-located.spec.ts",
-  ];
-  const externalMetadata = JSON.stringify(bundle.externalUsers);
-  for (const filteredPath of filteredPaths) {
-    expect(externalMetadata).not.toContain(filteredPath);
-    expect(bundle.dsl).not.toContain(filteredPath);
-    for (const communityDsl of bundle.dsls) {
-      expect(communityDsl).not.toContain(filteredPath);
-    }
-  }
-  expect(externalMetadata).not.toContain("extern3");
-  expect(bundle.dsl).not.toContain("extern3");
-  for (const communityDsl of bundle.dsls) {
-    expect(communityDsl).not.toContain("extern3");
-  }
-
-  const externalGraphNodeIds = bundle.graph
-    .nodes()
-    .filter((node) => bundle.graph.getNodeAttribute(node, "kind") === "external-user")
-    .sort();
-  expect(externalGraphNodeIds).toEqual([
-    "external-user:extern0",
-    "external-user:extern1",
-    "external-user:extern2",
-  ]);
-  const widgetEntityIds = bundle.graph.nodes().filter((node) => {
-    const attributes = bundle.graph.getNodeAttributes(node);
-    return attributes.kind === "entity" && attributes.name === "Widget";
-  });
-  expect(widgetEntityIds).toHaveLength(1);
-  const widgetEntityId = widgetEntityIds[0];
-  if (widgetEntityId === undefined) {
-    throw new Error("Expected the Widget entity graph node");
-  }
-  const graphRelations = bundle.graph.edges().flatMap((edge) =>
-    bundle.graph.getEdgeAttribute(edge, "relations")
-  );
-  const externalRelations = graphRelations
-    .filter(({ kind }) => kind === "external-user")
-    .map(({ sourceId, targetId }) => ({ sourceId, targetId }))
-    .sort(({ sourceId: left }, { sourceId: right }) => left.localeCompare(right));
-  expect(externalRelations).toEqual([
-    { sourceId: "external-user:extern0", targetId: widgetEntityId },
-    { sourceId: "external-user:extern1", targetId: widgetEntityId },
-    { sourceId: "external-user:extern2", targetId: widgetEntityId },
-  ]);
-  const graphNodeNames = bundle.graph
-    .nodes()
-    .map((node) => bundle.graph.getNodeAttribute(node, "name"));
-  const relationNodeNames = graphRelations.flatMap(({ sourceId, targetId }) => [
-    bundle.graph.getNodeAttribute(sourceId, "name"),
-    bundle.graph.getNodeAttribute(targetId, "name"),
-  ]);
-  for (const filteredPath of filteredPaths) {
-    expect(graphNodeNames.some((name) => name.includes(filteredPath))).toBe(false);
-    expect(relationNodeNames.some((name) => name.includes(filteredPath))).toBe(false);
-  }
-
-  expect(bundle.dsl).toContain(
-    "classDef external fill:#3a2b52,stroke:#b58bff,color:#f4f7fb,stroke-dasharray: 4 3",
-  );
-});
-
-test("keeps nested-package tests external for a root source package", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-root-package-tests-");
-  await Promise.all([
-    mkdir(join(root, "src", "target"), { recursive: true }),
-    mkdir(join(root, "test"), { recursive: true }),
-    mkdir(join(root, "packages", "nested", "test"), { recursive: true }),
-  ]);
-  await Promise.all([
-    writeFile(join(root, "src", "target", "widget.ts"), "export class Widget {}\n"),
-    writeFile(
-      join(root, "test", "root-user.ts"),
-      [
-        'import { Widget } from "../src/target/widget";',
-        "export class RootTest {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-    writeFile(
-      join(root, "packages", "nested", "test", "consumer.test.ts"),
-      [
-        'import { Widget } from "../../../src/target/widget";',
-        "export class NestedPackageTest {",
-        "  build(): Widget { return new Widget(); }",
-        "}",
-        "",
-      ].join("\n"),
-    ),
-  ]);
-
-  const bundle = await materializeUml(root, "src/target", [
-    { name: "root", path: "", dependencies: [] },
-    { name: "nested", path: "packages/nested", dependencies: ["root"] },
-  ]);
-
-  expect(bundle.externalUsers).toEqual([
-    {
-      nodeId: "extern0",
-      label:
-        "extern: packages/nested/test/consumer.test.ts: NestedPackageTest.build()",
-      scopePath: "packages/nested/test/consumer.test.ts",
-      kind: "method",
-    },
-  ]);
-  const rootTestPath = "test/root-user.ts";
-  expect(JSON.stringify(bundle.externalUsers)).not.toContain(rootTestPath);
-  expect(bundle.dsl).not.toContain(rootTestPath);
-  for (const communityDsl of bundle.dsls) {
-    expect(communityDsl).not.toContain(rootTestPath);
-  }
-  expect(bundle.dsl.split(/\r?\n/).filter((line) => line.trim() === "extern0 --> Widget")).toHaveLength(1);
-  expect(bundle.dsl).not.toContain("extern1");
-});
-
-test("keeps external users for targets already connected inside the selected scope", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-external-connected-");
-  await mkdir(join(root, "src", "lib"), { recursive: true });
-  await mkdir(join(root, "src", "app"), { recursive: true });
-  await writeFile(join(root, "src", "lib", "base.ts"), "export class Base {}\n");
-  await writeFile(
-    join(root, "src", "lib", "connected.ts"),
-    [
-      'import { Base } from "./base";',
-      "",
-      "export class Connected extends Base {}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "connected-user.ts"),
-    [
-      'import { Connected } from "../lib/connected";',
-      "",
-      "export class ConnectedUser {",
-      "  read(input: Connected): Connected {",
-      "    return input;",
-      "  }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "connected-import.ts"),
-    'import type { Connected } from "../lib/connected";\n',
-  );
-
-  const scoped = await materializeUml(root, "src/lib", []);
-
-  expect(scoped.externalUsers).toEqual([
-    {
-      nodeId: "extern0",
-      label: "extern: src/app/connected-user.ts: ConnectedUser.read(Connected)",
-      scopePath: "src/app/connected-user.ts",
-      kind: "method",
-    },
-  ]);
-  expect(scoped.dsl).toContain("Base<|--Connected");
-  expect(scoped.dsl.match(/^extern0 --> Connected$/gm) ?? []).toHaveLength(1);
-});
-
-test("classifies and stably orders every supported external user owner", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-external-kinds-");
-  await mkdir(join(root, "src", "lib"), { recursive: true });
-  await mkdir(join(root, "src", "app"), { recursive: true });
-  await writeFile(join(root, "src", "lib", "widget.ts"), "export class Widget {}\n");
-  await writeFile(join(root, "src", "lib", "auxiliary.ts"), "export class Auxiliary {}\n");
-  await writeFile(
-    join(root, "src", "app", "a-owners.ts"),
-    [
-      'import { Widget } from "../lib/widget";',
-      "",
-      "export class AlphaHeritage extends Widget {}",
-      "",
-      "export class BetaConstructor {",
-      "  constructor(input: Set<{ item: Widget }>) {",
-      "    void input;",
-      "  }",
-      "}",
-      "",
-      "export class DeltaProperty {",
-      "  value: Map<string, { item: Widget }>;",
-      "}",
-      "",
-      "export class GammaMethod {",
-      "  build(input: Promise<Array<{ item: Widget }>>): Widget {",
-      "    void input;",
-      "    return {} as Widget;",
-      "  }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "z-top-level.ts"),
-    [
-      'import { Widget } from "../lib/widget";',
-      "",
-      "export function EpsilonFunction(",
-      "  input: ReadonlyArray<{ value: Widget }>,",
-      "): Widget {",
-      "  return input[0]!.value;",
-      "}",
-      "",
-      "export const ThetaVariable: (input: Widget) => Widget = (input) => input;",
-      "",
-      "export type ZetaAlias = Widget;",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "imports-only.ts"),
-    [
-      'import type { Widget } from "../lib/widget";',
-      'export { Widget as ReExportedWidget } from "../lib/widget";',
-      "",
-    ].join("\n"),
-  );
-
-  const scoped = await materializeUml(root, "src/lib", []);
-
-  expect(scoped.externalUsers).toEqual([
-    {
-      nodeId: "extern0",
-      label: "extern: src/app/a-owners.ts: AlphaHeritage",
-      scopePath: "src/app/a-owners.ts",
-      kind: "class",
-    },
-    {
-      nodeId: "extern1",
-      label: "extern: src/app/a-owners.ts: BetaConstructor.constructor(Set⟨｛ item: Widget ｝⟩)",
-      scopePath: "src/app/a-owners.ts",
-      kind: "constructor",
-    },
-    {
-      nodeId: "extern2",
-      label: "extern: src/app/a-owners.ts: DeltaProperty.item: Widget",
-      scopePath: "src/app/a-owners.ts",
-      kind: "property",
-    },
-    {
-      nodeId: "extern3",
-      label:
-        "extern: src/app/a-owners.ts: GammaMethod.build(Promise⟨Array⟨｛ item: Widget ｝⟩⟩)",
-      scopePath: "src/app/a-owners.ts",
-      kind: "method",
-    },
-    {
-      nodeId: "extern4",
-      label: "extern: src/app/imports-only.ts: ReExportedWidget",
-      scopePath: "src/app/imports-only.ts",
-      kind: "export",
-    },
-    {
-      nodeId: "extern5",
-      label:
-        "extern: src/app/z-top-level.ts: EpsilonFunction(ReadonlyArray⟨｛ value: Widget ｝⟩)",
-      scopePath: "src/app/z-top-level.ts",
-      kind: "function",
-    },
-    {
-      nodeId: "extern6",
-      label: "extern: src/app/z-top-level.ts: ThetaVariable(Widget)",
-      scopePath: "src/app/z-top-level.ts",
-      kind: "function",
-    },
-    {
-      nodeId: "extern7",
-      label: "extern: src/app/z-top-level.ts: ZetaAlias",
-      scopePath: "src/app/z-top-level.ts",
-      kind: "type",
-    },
+  // `Space.Inner` is one edge to the member; the qualifier adds neither a namespace node nor the
+  // namespace's other members.
+  expect(contract.nodes).toEqual(["Space.Inner@ns.ts", "NsUser@ns.ts"]);
+  expect(contract.edges).toEqual([
+    { kind: "references", source: "NsUser@ns.ts", target: "Space.Inner@ns.ts" },
   ]);
 });
 
-test("renders every local and re-exported user of a RetEdge-shaped type", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-local-users-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "edges.ts"),
-    [
-      "export type MsgEdge<N, ES> = {",
-      '  kind: "msg";',
-      "  message: N;",
-      "  effect: ES;",
-      "};",
-      "",
-      "export type RetEdge<T> = {",
-      '  kind: "ret";',
-      "  value: T;",
-      "};",
-      "",
-      "export type DataflowEdge<N, T, ES> = MsgEdge<N, ES> | RetEdge<T>;",
-      "",
-      "export const DataflowEdge = {",
-      "  ret: <T>(): RetEdge<T> => {",
-      '    throw new Error("not implemented");',
-      "  },",
-      "};",
-      "",
-      "export const isRetEdge = <N, T, ES>(",
-      "  edge: DataflowEdge<N, T, ES>,",
-      '): edge is RetEdge<T> => edge.kind === "ret";',
-      "",
-      "export type DeadEdge = {",
-      '  kind: "dead";',
-      "};",
-      "",
-      "export type RecursiveEdge = {",
-      "  next?: RecursiveEdge;",
-      "};",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "index.ts"),
-    'export type { RetEdge } from "./edges";\n',
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.externalUsers).toEqual([]);
-  expect(bundle.localUsers).toEqual([
-    {
-      nodeId: "local0",
-      label: "local: src/edges.ts: DataflowEdge.ret()",
-      kind: "method",
-      path: "src/edges.ts",
-      line: 15,
-      column: 3,
-    },
-    {
-      nodeId: "local1",
-      label: "local: src/edges.ts: isRetEdge(DataflowEdge⟨N, T, ES⟩)",
-      kind: "function",
-      path: "src/edges.ts",
-      line: 20,
-      column: 14,
-    },
-    {
-      nodeId: "local2",
-      label: "export: src/index.ts: RetEdge",
-      kind: "export",
-      path: "src/index.ts",
-      line: 1,
-      column: 15,
-    },
-  ]);
-  expect(
-    bundle.dsl
-      .split(/\r?\n/)
-      .filter((line) => / --> RetEdge$/.test(line))
-      .sort(),
-  ).toEqual([
-    "DataflowEdge --> RetEdge",
-    "local0 --> RetEdge",
-    "local1 --> RetEdge",
-    "local2 --> RetEdge",
-  ]);
-  expect(
-    bundle.dsl.split(/\r?\n/).filter((line) => / --> MsgEdge$/.test(line)),
-  ).toEqual(["DataflowEdge --> MsgEdge"]);
-  expect(bundle.definitions).toEqual([
-    {
-      key: '["type","MsgEdge",0,null,null]',
-      kind: "type",
-      name: "MsgEdge",
-      qualifiedName: "MsgEdge",
-      source: { path: "src/edges.ts", line: 1, column: 13 },
-      uml: { scopePath: "src/edges.ts", entityName: "MsgEdge<N,ES>" },
-    },
-    {
-      key: '["type","RetEdge",0,null,null]',
-      kind: "type",
-      name: "RetEdge",
-      qualifiedName: "RetEdge",
-      source: { path: "src/edges.ts", line: 7, column: 13 },
-      uml: { scopePath: "src/edges.ts", entityName: "RetEdge<T>" },
-    },
-    {
-      key: '["type","DataflowEdge",0,null,null]',
-      kind: "type",
-      name: "DataflowEdge",
-      qualifiedName: "DataflowEdge",
-      source: { path: "src/edges.ts", line: 12, column: 13 },
-      uml: { scopePath: "src/edges.ts", entityName: "DataflowEdge<N,T,ES>" },
-    },
-    {
-      key: '["type","DeadEdge",0,null,null]',
-      kind: "type",
-      name: "DeadEdge",
-      qualifiedName: "DeadEdge",
-      source: { path: "src/edges.ts", line: 24, column: 13 },
-      uml: { scopePath: "src/edges.ts", entityName: "DeadEdge" },
-    },
-    {
-      key: '["type","RecursiveEdge",0,null,null]',
-      kind: "type",
-      name: "RecursiveEdge",
-      qualifiedName: "RecursiveEdge",
-      source: { path: "src/edges.ts", line: 28, column: 13 },
-      uml: { scopePath: "src/edges.ts", entityName: "RecursiveEdge" },
-    },
-  ]);
-  expect(bundle.dsl).toMatch(/^class DataflowEdge\s*\{$/m);
-  expect(bundle.dsl).toContain('class MsgEdge["MsgEdge⟨N,ES⟩"]');
-  expect(bundle.dsl).toContain('class RetEdge["RetEdge⟨T⟩"]');
-  expect(bundle.dsl).toContain('class DataflowEdge["DataflowEdge⟨N,T,ES⟩"]');
-  expect(bundle.dsl).not.toContain("~");
-  const dataflowNode = bundle.graph.nodes().find(
-    (node) => bundle.graph.getNodeAttribute(node, "name") === "DataflowEdge<N,T,ES>",
-  );
-  expect(dataflowNode).toBeDefined();
-  if (dataflowNode === undefined) {
-    throw new Error("Expected the DataflowEdge graph node");
-  }
-  expect(bundle.graph.getNodeAttribute(dataflowNode, "kind")).toBe("entity");
-  expect(
-    bundle.dsl
-      .split(/\r?\n/)
-      .filter((line) => /(?:-->|--)\s+(?:DeadEdge|RecursiveEdge)$/.test(line)),
-  ).toEqual([]);
-  expect(bundle.dsl).not.toMatch(
-    /^[ \t]*RecursiveEdge[ \t]*-->[ \t]*RecursiveEdge[ \t]*\r?$/m,
-  );
-});
-
-test("deduplicates rendered method parameter and body uses into one direct arrow", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-rendered-method-user-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "model.ts"),
-    [
-      "export interface Target {",
-      "  value: string;",
-      "}",
-      "",
-      "export class User {",
-      "  consume(target: Target): void {",
-      "    const copy = target as Target;",
-      "    void copy;",
-      "  }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.localUsers).toEqual([]);
-  expect(bundle.externalUsers).toEqual([]);
-  expect(
-    bundle.dsl.match(/^[ \t]*User[ \t]*-->[ \t]*Target[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(1);
-});
-
-test("keeps a member association alongside its directed rendered-user arrow", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-property-user-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "model.ts"),
-    [
-      "export interface Target {",
-      "  value: string;",
-      "}",
-      "",
-      "export class User {",
-      "  target!: Target;",
-      "}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.localUsers).toEqual([]);
-  expect(
-    bundle.dsl.match(/^[ \t]*User[ \t]*--[ \t]*Target[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(1);
-  expect(
-    bundle.dsl.match(/^[ \t]*User[ \t]*-->[ \t]*Target[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(1);
-});
-
-test("does not duplicate same-direction method-return or inheritance relationships", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-directed-dedup-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "model.ts"),
-    [
-      "export class Parent {}",
-      "",
-      "export class Child extends Parent {}",
-      "",
-      "export class Product {}",
-      "",
-      "export class Factory {",
-      "  make(): Product {",
-      "    return new Product();",
-      "  }",
-      "}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.localUsers).toEqual([]);
-  expect(bundle.dsl.match(/^[ \t]*Parent<\|--Child[ \t]*\r?$/gm) ?? []).toHaveLength(1);
-  expect(
-    bundle.dsl.match(/^[ \t]*Child[ \t]*-->[ \t]*Parent[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(0);
-  expect(
-    bundle.dsl.match(/^[ \t]*Factory[ \t]*-->[ \t]*Product[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(1);
-});
-
-test("retains a rendered usage arrow opposite an existing inheritance direction", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-reverse-direction-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "model.ts"),
-    [
-      "export class Parent {",
-      "  accept(child: Child): void {",
-      "    void child;",
-      "  }",
-      "}",
-      "",
-      "export class Child extends Parent {}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-
-  expect(bundle.localUsers).toEqual([]);
-  expect(bundle.dsl.match(/^[ \t]*Parent<\|--Child[ \t]*\r?$/gm) ?? []).toHaveLength(1);
-  expect(
-    bundle.dsl.match(/^[ \t]*Parent[ \t]*-->[ \t]*Child[ \t]*\r?$/gm) ?? [],
-  ).toHaveLength(1);
-});
-
-test("exposes every UML relation through an assigned undirected simple graph", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-graph-");
-  await mkdir(join(root, "src", "lib"), { recursive: true });
-  await mkdir(join(root, "src", "app"), { recursive: true });
-  await writeFile(
-    join(root, "src", "lib", "model.ts"),
-    [
-      "export class Base {}",
-      "export interface Associated { value: string; }",
-      "export interface Used { token: string; }",
-      "export class Child extends Base {",
-      "  associated!: Associated;",
-      '  create(): Associated { return { value: "created" }; }',
-      "  consume(input: Used): void { void input; }",
-      "}",
-      "export function acceptAssociated(value: Associated): void { void value; }",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(root, "src", "app", "consumer.ts"),
-    [
-      'import type { Associated } from "../lib/model";',
-      "export class Consumer {",
-      '  create(): Associated { return { value: "external" }; }',
-      "}",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "src/lib", []);
-  expectNormalizedUmlRoundTrip(bundle.record, bundle.extracted);
-  expectCachedRendering(bundle);
-  const { graph } = bundle;
-  const entityId = (name: string): string => {
-    const id = graph.nodes().find((node) => {
-      const attributes = graph.getNodeAttributes(node);
-      return attributes.kind === "entity" && attributes.name === name;
-    });
-    if (id === undefined) throw new Error(`Expected entity graph node ${name}`);
-    return id;
-  };
-  const relationNames = graph.edges().flatMap((edge) =>
-    graph.getEdgeAttribute(edge, "relations").map((relation) => ({
-      kind: relation.kind,
-      source: graph.getNodeAttribute(relation.sourceId, "name"),
-      target: graph.getNodeAttribute(relation.targetId, "name"),
-    }))
-  );
-
-  expect(graph.type).toBe("undirected");
-  expect(graph.multi).toBe(false);
-  for (const name of ["Base", "Associated", "Used", "Child"]) {
-    expect(graph.getNodeAttributes(entityId(name))).toMatchObject({ kind: "entity", name });
-  }
-  expect(bundle.localUsers).toHaveLength(1);
-  expect(bundle.externalUsers).toHaveLength(1);
-  const local = bundle.localUsers[0];
-  const external = bundle.externalUsers[0];
-  if (local === undefined || external === undefined) {
-    throw new Error("Expected one local and one external UML user");
-  }
-  expect(graph.getNodeAttributes(`local-user:${local.nodeId}`)).toMatchObject({
-    kind: "local-user",
-    name: local.label,
-  });
-  expect(graph.getNodeAttributes(`external-user:${external.nodeId}`)).toMatchObject({
-    kind: "external-user",
-    name: external.label,
-  });
-  graph.forEachNode((_node, attributes) => {
-    expect(Number.isInteger(attributes.community)).toBe(true);
-  });
-  graph.forEachEdge((_edge, attributes, source, target) => {
-    expect(attributes.weight).toBe(attributes.relations.length);
-    expect(attributes.weight).toBeGreaterThan(0);
-    for (const relation of attributes.relations) {
-      expect(graph.hasNode(relation.sourceId)).toBe(true);
-      expect(graph.hasNode(relation.targetId)).toBe(true);
-      expect(new Set([relation.sourceId, relation.targetId])).toEqual(new Set([source, target]));
-    }
+test("merged namespace blocks share exported members but not private ones", async () => {
+  const project = await openProject("ts-explorer-uml-merged-namespace-", {
+    "blocks.ts": `export namespace Merged {
+  export class Shared {}
+  class Hidden {}
+}
+export namespace Merged {
+  export class UsesShared { value: Shared; }
+  export class UsesHidden { value: Hidden; }
+}
+`,
   });
 
-  expect([...new Set(relationNames.map(({ kind }) => kind))].sort()).toEqual([
-    "external-user",
-    "heritage",
-    "local-user",
-    "member-association",
-    "method-return",
-    "usage",
+  const usesShared = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "blocks.ts",
+    definitionKey: project.key("blocks.ts", "Merged.UsesShared"),
+  }));
+  expect(usesShared.edges).toEqual([
+    {
+      kind: "references",
+      source: "Merged.UsesShared@blocks.ts",
+      target: "Merged.Shared@blocks.ts",
+    },
   ]);
-  expect(relationNames).toContainEqual({ kind: "heritage", source: "Child", target: "Base" });
-  expect(relationNames).toContainEqual({
-    kind: "member-association",
-    source: "Child",
-    target: "Associated",
-  });
-  expect(relationNames).toContainEqual({
-    kind: "method-return",
-    source: "Child",
-    target: "Associated",
-  });
-  expect(relationNames).toContainEqual({ kind: "usage", source: "Child", target: "Used" });
-  expect(relationNames).toContainEqual({
-    kind: "local-user",
-    source: local.label,
-    target: "Associated",
-  });
-  expect(relationNames).toContainEqual({
-    kind: "external-user",
-    source: external.label,
-    target: "Associated",
+
+  // `Hidden` is private to the first block, so the second block cannot see it.
+  const usesHidden = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "blocks.ts",
+    definitionKey: project.key("blocks.ts", "Merged.UsesHidden"),
+  }));
+  expect(usesHidden.nodes).toEqual(["Merged.UsesHidden@blocks.ts"]);
+  expect(usesHidden.edges).toEqual([]);
+});
+
+test("JavaScript and declaration files produce real edges", async () => {
+  const project = await openProject("ts-explorer-uml-js-dts-", {
+    "lib.js": `import { helperFn } from "./helper-impl.js";
+export function caller() { return helperFn(); }
+`,
+    "helper-impl.js": "export function helperFn() { return 1; }\n",
+    "types.d.ts": `import type { Payload } from "./payload";
+export interface Wrapper { payload: Payload; }
+`,
+    "payload.d.ts": "export interface Payload { code: number; }\n",
   });
 
-  const repeatedPair = graph.getEdgeAttributes(entityId("Child"), entityId("Associated"));
-  expect(repeatedPair.weight).toBe(repeatedPair.relations.length);
-  expect(repeatedPair.weight).toBeGreaterThan(1);
-  expect(repeatedPair.relations.map(({ kind }) => kind)).toEqual([
-    "member-association",
-    "method-return",
+  const js = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "lib.js",
+    definitionKey: project.key("lib.js", "caller"),
+  }));
+  expect(js.edges).toEqual([
+    { kind: "references", source: "caller@lib.js", target: "helperFn@helper-impl.js" },
+  ]);
+
+  const declarations = toUmlContract(readCompleteUml(project, {
+    kind: "definition",
+    path: "types.d.ts",
+    definitionKey: project.key("types.d.ts", "Wrapper"),
+  }));
+  expect(declarations.edges).toEqual([
+    { kind: "references", source: "Wrapper@types.d.ts", target: "Payload@payload.d.ts" },
   ]);
 });
 
-test("preserves merged definition occurrences while reusing one graph entity node", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-merged-interface-");
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(
-    join(root, "src", "merged.ts"),
-    [
-      "export interface Merged { run(value: string): string; }",
-      "export interface Merged { run(value: number): number; stop(): void; }",
-      "",
-    ].join("\n"),
-  );
-
-  const bundle = await materializeUml(root, "", []);
-  const mergedNodes = bundle.graph.nodes().filter(
-    (node) => bundle.graph.getNodeAttribute(node, "name") === "Merged",
-  );
-
-  expect(bundle.definitions).toEqual([
-    {
-      key: '["interface","Merged",0,null,null]',
-      kind: "interface",
-      name: "Merged",
-      qualifiedName: "Merged",
-      source: { path: "src/merged.ts", line: 1, column: 18 },
-      uml: { scopePath: "src/merged.ts", entityName: "Merged" },
-    },
-    {
-      key: '["interface","Merged",0,"run",0]',
-      kind: "method",
-      name: "run",
-      qualifiedName: "Merged.run",
-      source: { path: "src/merged.ts", line: 1, column: 27 },
-      uml: {
-        scopePath: "src/merged.ts",
-        entityName: "Merged",
-        memberName: "run",
-        memberOccurrence: 0,
-      },
-    },
-    {
-      key: '["interface","Merged",1,null,null]',
-      kind: "interface",
-      name: "Merged",
-      qualifiedName: "Merged",
-      source: { path: "src/merged.ts", line: 2, column: 18 },
-      uml: { scopePath: "src/merged.ts", entityName: "Merged" },
-    },
-    {
-      key: '["interface","Merged",1,"run",1]',
-      kind: "method",
-      name: "run",
-      qualifiedName: "Merged.run",
-      source: { path: "src/merged.ts", line: 2, column: 27 },
-      uml: {
-        scopePath: "src/merged.ts",
-        entityName: "Merged",
-        memberName: "run",
-        memberOccurrence: 1,
-      },
-    },
-    {
-      key: '["interface","Merged",1,"stop",0]',
-      kind: "method",
-      name: "stop",
-      qualifiedName: "Merged.stop",
-      source: { path: "src/merged.ts", line: 2, column: 55 },
-      uml: {
-        scopePath: "src/merged.ts",
-        entityName: "Merged",
-        memberName: "stop",
-        memberOccurrence: 0,
-      },
-    },
-  ]);
-  expect(mergedNodes).toHaveLength(1);
-  const mergedNodeId = mergedNodes[0];
-  if (mergedNodeId === undefined) {
-    throw new Error("Expected one merged interface graph node");
-  }
-  expect(
-    bundle.record.entities
-      .filter(({ nodeId }) => nodeId === mergedNodeId)
-      .map(({ declarationOrdinal, entityKind, entityOrdinal, nodeId }) => ({
-        declarationOrdinal,
-        entityKind,
-        entityOrdinal,
-        nodeId,
-      })),
-  ).toEqual([
-    { declarationOrdinal: 0, entityKind: "interface", entityOrdinal: 0, nodeId: mergedNodeId },
-    { declarationOrdinal: 0, entityKind: "interface", entityOrdinal: 1, nodeId: mergedNodeId },
-  ]);
-  expect(
-    bundle.record.methods.map(
-      ({ declarationOrdinal, entityKind, entityOrdinal, methodOrdinal, name }) => ({
-        declarationOrdinal,
-        entityKind,
-        entityOrdinal,
-        methodOrdinal,
-        name,
-      }),
-    ),
-  ).toEqual([
-    {
-      declarationOrdinal: 0,
-      entityKind: "interface",
-      entityOrdinal: 0,
-      methodOrdinal: 0,
-      name: "run",
-    },
-    {
-      declarationOrdinal: 0,
-      entityKind: "interface",
-      entityOrdinal: 1,
-      methodOrdinal: 0,
-      name: "run",
-    },
-    {
-      declarationOrdinal: 0,
-      entityKind: "interface",
-      entityOrdinal: 1,
-      methodOrdinal: 1,
-      name: "stop",
-    },
-  ]);
-  expect(bundle.graph.getNodeAttribute(mergedNodeId, "kind")).toBe("entity");
-  expect(Number.isInteger(bundle.graph.getNodeAttribute(mergedNodeId, "community"))).toBe(true);
-});
-
-test("keeps undeclared heritage boundary nodes and edges renderable", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-boundary-");
-  await mkdir(join(root, "src", "lib"), { recursive: true });
-  await mkdir(join(root, "src", "shared"), { recursive: true });
-  await writeFile(
-    join(root, "src", "lib", "error.ts"),
-    [
-      'import { Error } from "../shared/error";',
-      "export class CustomError extends Error {}",
-      "",
-    ].join("\n"),
-  );
-  await writeFile(join(root, "src", "shared", "error.ts"), "export class Error {}\n");
-
-  const bundle = await materializeUml(root, "src/lib", []);
-  const errorId = bundle.graph.nodes().find(
-    (node) => bundle.graph.getNodeAttribute(node, "name") === "Error",
-  );
-  const customErrorId = bundle.graph.nodes().find(
-    (node) => bundle.graph.getNodeAttribute(node, "name") === "CustomError",
-  );
-  if (errorId === undefined || customErrorId === undefined) {
-    throw new Error("Expected Error and CustomError graph nodes");
-  }
-
-  expect(bundle.graph.getNodeAttributes(errorId)).toMatchObject({
-    kind: "boundary",
-    name: "Error",
+test("definitions and files from test paths are marked as tests", async () => {
+  const project = await openProject("ts-explorer-uml-test-paths-", {
+    "src/model.ts": "export class Model {}\n",
+    "test/harness.test.ts": `import { Model } from "../src/model";
+export class Harness { value: Model; }
+`,
   });
-  expect(bundle.graph.getEdgeAttribute(customErrorId, errorId, "relations")).toContainEqual({
-    kind: "heritage",
-    sourceId: customErrorId,
-    targetId: errorId,
+
+  const definitions = readCompleteUml(project, {
+    kind: "definition",
+    path: "test/harness.test.ts",
+    definitionKey: project.key("test/harness.test.ts", "Harness"),
   });
-  expect(bundle.dsl).toContain("Error<|--CustomError");
-  const customErrorFrames = bundle.dsls.filter((dsl) => /\bclass CustomError\s*\{/.test(dsl));
-  expect(customErrorFrames).toHaveLength(1);
-  expect(customErrorFrames[0]).toContain("Error<|--CustomError");
+  expect(nodeTestFlags(definitions)).toEqual([
+    ["Model@src/model.ts", false],
+    ["Harness@test/harness.test.ts", true],
+  ]);
+
+  const files = toFileContract(readCompleteUml(project, { kind: "directory", path: "" }));
+  expect(files.nodes).toEqual([
+    { path: "src/model.ts", boundary: false, test: false },
+    { path: "test/harness.test.ts", boundary: false, test: true },
+  ]);
 });
-
-test("parses scopes whose combined file paths exceed the brace glob limit", async () => {
-  const root = await fixtures.temporaryRoot("ts-explorer-uml-glob-");
-  await mkdir(join(root, "src"), { recursive: true });
-  const names: string[] = [];
-  const paths: string[] = [];
-  const braceGlobLength = () =>
-    `{${paths.map((path) => path.split(sep).join("/")).join(",")}}`.length;
-  do {
-    const index = String(names.length).padStart(3, "0");
-    names.push(`GeneratedModule${index}`);
-    paths.push(join(root, "src", `generated-module-with-a-long-name-${index}.ts`));
-  } while (braceGlobLength() <= 12_000);
-  await Promise.all(
-    paths.map((path, index) => writeFile(path, `export class ${names[index]} {}\n`)),
-  );
-
-  const dsl = (await materializeUml(root, "", [])).dsl;
-
-  expect(dsl).toContain(names[0]);
-  expect(dsl).toContain(names[names.length - 1]);
-}, 60_000);

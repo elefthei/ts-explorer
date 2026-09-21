@@ -2,9 +2,11 @@ import { expect, test } from "bun:test";
 import {
   adjacentTreeRowIndex,
   RequestSequence,
-  externalUserIdFromNodeId,
+  DiagramClickSequence,
+  type DiagramPointerTarget,
+  definitionNodeIdFromNodeId,
+  fileNodeIdFromNodeId,
   formatUmlMethodReturnLabel,
-  localUserIdFromNodeId,
   packageNodeIdFromNodeId,
   hasDiagramBody,
   hasPassedDragThreshold,
@@ -219,45 +221,50 @@ test("RequestSequence instances issue tokens independently", () => {
   expect(secondSequence.isCurrent(1)).toBe(true);
 });
 
-test("externalUserIdFromNodeId resolves only installed Mermaid synthetic external-node IDs", () => {
+test("definitionNodeIdFromNodeId resolves only installed Mermaid definition-node IDs", () => {
   const cases = [
-    { name: "standard installed ID", id: "classId-extern0-1", expected: "extern0" },
+    { name: "standard installed ID", id: "classId-d0-1", expected: "d0" },
     {
       name: "prefixed installed ID with multi-digit node and render counters",
-      id: "diagram-classId-extern27-314",
-      expected: "extern27",
+      id: "diagram-classId-d27-314",
+      expected: "d27",
     },
-    { name: "real class ID", id: "classId-Widget-1", expected: undefined },
-    { name: "extern marker without node index", id: "classId-extern-1", expected: undefined },
-    { name: "extern index with trailing text", id: "classId-extern12x-3", expected: undefined },
-    { name: "synthetic ID without render counter", id: "classId-extern12", expected: undefined },
-    { name: "raw external node name", id: "extern12", expected: undefined },
+    { name: "source name used as an identifier", id: "classId-Widget-1", expected: undefined },
+    { name: "definition marker without node index", id: "classId-d-1", expected: undefined },
+    { name: "node index with trailing text", id: "classId-d12x-3", expected: undefined },
+    { name: "node index with a leading letter", id: "classId-xd12-3", expected: undefined },
+    { name: "installed ID without render counter", id: "classId-d12", expected: undefined },
+    { name: "suffix after the render counter", id: "classId-d12-7-extra", expected: undefined },
+    { name: "file node in a flowchart", id: "flowchart-d0-1", expected: undefined },
+    { name: "raw response-local node ID", id: "d12", expected: undefined },
   ];
 
   for (const { name, id, expected } of cases) {
-    expect(externalUserIdFromNodeId(id), name).toBe(expected);
+    expect(definitionNodeIdFromNodeId(id), name).toBe(expected);
   }
 });
 
-test("localUserIdFromNodeId resolves only installed Mermaid synthetic local-node IDs", () => {
+test("fileNodeIdFromNodeId resolves only Mermaid flowchart file-node IDs", () => {
   const cases = [
-    { name: "standard installed ID", id: "classId-local0-1", expected: "local0" },
-    { name: "prefixed installed ID", id: "diagram-classId-local3-42", expected: "local3" },
+    { name: "unprefixed first file", id: "flowchart-f0-0", expected: "f0" },
     {
-      name: "multi-digit node and render counters",
-      id: "classId-local27-314",
-      expected: "local27",
+      name: "render-prefixed multi-digit file and counter",
+      id: "diagram-1-flowchart-f12-7",
+      expected: "f12",
     },
-    { name: "real class ID", id: "classId-Widget-1", expected: undefined },
-    { name: "external synthetic ID", id: "classId-extern0-1", expected: undefined },
-    { name: "local marker without node index", id: "classId-local-1", expected: undefined },
-    { name: "local index with trailing text", id: "classId-local12x-3", expected: undefined },
-    { name: "synthetic ID without render counter", id: "classId-local12", expected: undefined },
-    { name: "raw local node name", id: "local12", expected: undefined },
+    { name: "package node", id: "flowchart-p0-0", expected: undefined },
+    { name: "UML class ID", id: "classId-f0-0", expected: undefined },
+    { name: "missing file index", id: "flowchart-f-0", expected: undefined },
+    { name: "file index with trailing text", id: "flowchart-f12x-7", expected: undefined },
+    { name: "missing Mermaid counter", id: "flowchart-f12", expected: undefined },
+    { name: "non-numeric Mermaid counter", id: "flowchart-f12-last", expected: undefined },
+    { name: "suffix after Mermaid counter", id: "flowchart-f12-7-extra", expected: undefined },
+    { name: "render prefix that does not end in a separator", id: "xflowchart-f0-0", expected: undefined },
+    { name: "raw response-local node ID", id: "f12", expected: undefined },
   ];
 
   for (const { name, id, expected } of cases) {
-    expect(localUserIdFromNodeId(id), name).toBe(expected);
+    expect(fileNodeIdFromNodeId(id), name).toBe(expected);
   }
 });
 
@@ -287,6 +294,99 @@ test("packageNodeIdFromNodeId resolves only Mermaid flowchart package-node IDs",
   for (const { name, id, expected } of cases) {
     expect(packageNodeIdFromNodeId(id), name).toBe(expected);
   }
+});
+
+function definitionTarget(name: string): DiagramPointerTarget {
+  return {
+    kind: "definition",
+    definition: {
+      key: name,
+      parentKey: null,
+      isTopLevel: true,
+      name,
+      qualifiedName: name,
+      kind: "class",
+      type: name,
+      source: { path: "model.ts", line: 1, column: 14 },
+    },
+  };
+}
+
+const ROOT = definitionTarget("Root");
+const OTHER = definitionTarget("Other");
+const FILE: DiagramPointerTarget = { kind: "file", path: "feature/root.ts" };
+
+test("DiagramClickSequence selects one tap and opens the pressed target on the second", () => {
+  const sequence = new DiagramClickSequence();
+
+  expect(sequence.record(ROOT, 1, 1_000, 40, 60)).toEqual({ action: "select", target: ROOT });
+  // The repaint that the first tap triggered replaced the pressed SVG node, so the second press
+  // lands on nothing; it must still open what the user pressed.
+  expect(sequence.record(undefined, 1, 1_120, 40, 60)).toEqual({ action: "open", target: ROOT });
+  // The snapshot is consumed, so a third press starts over.
+  expect(sequence.record(undefined, 1, 1_140, 40, 60)).toBe(undefined);
+});
+
+test("DiagramClickSequence opens the first target even when the second press hits another node", () => {
+  const sequence = new DiagramClickSequence();
+
+  expect(sequence.record(ROOT, 7, 0, 10, 10)).toEqual({ action: "select", target: ROOT });
+  expect(sequence.record(OTHER, 7, 200, 12, 8)).toEqual({ action: "open", target: ROOT });
+
+  expect(sequence.record(FILE, 7, 400, 10, 10)).toEqual({ action: "select", target: FILE });
+  expect(sequence.record(ROOT, 7, 500, 10, 10)).toEqual({ action: "open", target: FILE });
+});
+
+test("DiagramClickSequence consumes a second tap only within 500 ms and 5 px of the first", () => {
+  const cases = [
+    { name: "same instant and position", timeStamp: 1_000, x: 40, y: 60, opens: true },
+    { name: "exactly at the interval bound", timeStamp: 1_500, x: 40, y: 60, opens: true },
+    { name: "one millisecond past the interval", timeStamp: 1_501, x: 40, y: 60, opens: false },
+    { name: "exactly at the radius bound on x", timeStamp: 1_100, x: 45, y: 60, opens: true },
+    { name: "exactly at the radius bound on y", timeStamp: 1_100, x: 40, y: 55, opens: true },
+    { name: "one pixel past the radius on x", timeStamp: 1_100, x: 46, y: 60, opens: false },
+    { name: "one pixel past the radius on y", timeStamp: 1_100, x: 40, y: 66, opens: false },
+  ] as const;
+
+  for (const { name, timeStamp, x, y, opens } of cases) {
+    const sequence = new DiagramClickSequence();
+    sequence.record(ROOT, 3, 1_000, 40, 60);
+    expect(sequence.record(OTHER, 3, timeStamp, x, y), name).toEqual(
+      opens ? { action: "open", target: ROOT } : { action: "select", target: OTHER },
+    );
+  }
+});
+
+test("DiagramClickSequence keeps a rejected second tap as the new first tap", () => {
+  const sequence = new DiagramClickSequence();
+
+  sequence.record(ROOT, 3, 1_000, 40, 60);
+  expect(sequence.record(OTHER, 3, 3_000, 40, 60)).toEqual({ action: "select", target: OTHER });
+  // The slow tap replaced the snapshot, so the next quick tap opens `Other`, never `Root`.
+  expect(sequence.record(undefined, 3, 3_100, 40, 60)).toEqual({ action: "open", target: OTHER });
+});
+
+test("DiagramClickSequence never lets a second pointer consume another pointer's tap", () => {
+  const sequence = new DiagramClickSequence();
+
+  sequence.record(ROOT, 1, 1_000, 40, 60);
+  expect(sequence.record(OTHER, 2, 1_010, 40, 60)).toEqual({ action: "select", target: OTHER });
+  // Pointer 1's snapshot is gone, so its own follow-up press cannot open anything either.
+  expect(sequence.record(undefined, 1, 1_020, 40, 60)).toBe(undefined);
+});
+
+test("DiagramClickSequence discards its snapshot on clear and on a targetless tap", () => {
+  const cleared = new DiagramClickSequence();
+  cleared.record(ROOT, 1, 1_000, 40, 60);
+  cleared.clear();
+  expect(cleared.record(OTHER, 1, 1_050, 40, 60)).toEqual({ action: "select", target: OTHER });
+
+  const abandoned = new DiagramClickSequence();
+  abandoned.record(ROOT, 1, 1_000, 40, 60);
+  // A press on empty canvas by another pointer matches nothing and leaves no snapshot behind.
+  expect(abandoned.record(undefined, 2, 1_050, 300, 300)).toBe(undefined);
+  expect(abandoned.record(undefined, 2, 1_060, 300, 300)).toBe(undefined);
+  expect(abandoned.record(undefined, 1, 1_060, 40, 60)).toBe(undefined);
 });
 
 test("formatUmlMethodReturnLabel formats only synthetic return rows with two-NBSP indentation", () => {

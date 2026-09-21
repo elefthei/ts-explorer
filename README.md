@@ -1,6 +1,6 @@
 # TypeScript Explorer
 
-A local TypeScript and Rust project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for source files. TypeScript and Rust feed one shared dependency graph: a directory holding both `.ts` and `.rs` sources renders a single diagram from a single symbol table, with name resolution kept inside each language.
+A local TypeScript and Rust project explorer for workspace repositories. It statically analyzes source files, renders package dependencies and UML relationships, watches the filesystem for external changes, and provides an editor for source files. TypeScript, JavaScript and Rust feed one project-wide declaration catalogue, so a dependency graph crosses files, directories and packages; name resolution stays inside each language.
 
 The explorer never imports or executes the inspected project.
 
@@ -85,12 +85,13 @@ switches to 1 s polling for those roots, because the redirector does not deliver
 ## Explorer workflow
 
 - **Packages** shows workspace package dependencies as a Mermaid graph.
-- **UML** shows class relationships for the selected package or folder, grouped into vertically stacked Louvain communities to keep large diagrams readable. Boundary types can appear in adjacent frames so cross-community relationships remain visible.
+- **UML** shows the outgoing dependency graph of whatever the tree has selected. Selecting a definition roots one graph at it; selecting a file stacks one frame per top-level declaration in source order; selecting a directory shows a file-import graph of its subtree, with directly imported files outside the subtree drawn as dashed boundary leaves. Dependencies are statically resolved uses: transitive, outgoing only, and never inferred by a compiler.
 - The file tree lists packages, folders, and files. Use the filter to narrow it.
-- Select a TypeScript, JavaScript, or Rust source file to open it in the read-only editor; other files are not viewable.
+- The chevron beside a row expands it; clicking the row itself selects its UML graph and never opens the editor. Expanding a file lists its definitions underneath it: each row shows the qualified name, the declaration kind, and the type as written in the source. Constants, free functions, types, fields, methods, and named namespace or module members are all listed; function-local declarations and parameters are not. Clicking the file again collapses the list. Types come from source annotations and callable signatures, never from compiler inference, so an unannotated value shows `—`.
+- Double-click a file, a definition, a diagram box, or a search result to open its source in the read-only editor; `Ctrl`+`Enter` does the same from the keyboard. Files with no indexed declarations, including non-source files, expand to `No definitions`.
 - The editor shows the Prettier-formatted source produced during preprocessing (Rust is served exactly as written), syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
 - Class, interface, enum, type, and method names are underlined in the editor. Click one to jump straight to its declaration; the target comes from a definition index written at the start of every preprocessing generation, so the jump never waits on UML extraction of the target file.
-- Search matches file contents and definition names. Selecting a definition result opens the declaration in the editor or highlights it in the UML diagram.
+- Search matches file contents and definition names. Selecting a definition result roots the UML graph at that declaration; double-clicking it opens the source.
 - The graph supports wheel zoom, pointer-drag panning, and reset-to-fit controls.
 - The browser receives filesystem changes over WebSocket and refreshes the tree and current diagram without polling.
 
@@ -120,10 +121,13 @@ The server exposes these local endpoints:
 - `GET /api/packages`
 - `GET /api/search?q=<literal>&caseInsensitive=<true|false>`
 - `GET /api/diagram?kind=packages&path=`
-- `GET /api/diagram?kind=uml&path=<relative-scope>`
+- `GET /api/diagram?kind=uml&target=definition&path=<relative-file>&definition=<definition-key>`
+- `GET /api/diagram?kind=uml&target=file&path=<relative-file>`
+- `GET /api/diagram?kind=uml&target=directory&path=<relative-directory>` (empty path is the project root)
 - `GET /api/file?path=<relative-path>` with optional `line` and `column` to place the cursor
 - `GET /api/goto-definition?path=<relative-path>&line=<line>&column=<column>` resolves the definition under a source position, including its UML scope
 - `GET /api/definition?path=<relative-path>&name=<name>&qualifiedName=<qualified-name>` resolves a declaration's source position from the definition index
+- `GET /api/file-definitions?path=<relative-file>` lists every declaration the file contributes to the tree outline, in source order, each with the stable key the UML routes address it by
 - `POST /api/preprocess` with `{ "action": "prioritize", "resource" }` or `{ "action": "poll", "requestId" }`
 - `GET /ws` for filesystem change notifications
 

@@ -1,6 +1,7 @@
 import type {
-  DiagramKind,
   DiagramPayload,
+  DiagramRequest,
+  FileDefinition,
   FileResponse,
   GotoDefinition,
   PackageInfo,
@@ -22,7 +23,6 @@ export type PreprocessErrorCode = keyof typeof PREPROCESS_ERROR_CODES;
 
 export type PreprocessCause = "startup" | "watch";
 
-
 export type PreprocessScope = {
   path: string;
   kind: "package" | "directory" | "file";
@@ -32,6 +32,14 @@ export type SourceLocation = {
   line: number;
   column: number;
 };
+
+/**
+ * A SQL-only diagram read. `pending` names the file graphs the parent must schedule before the
+ * selection can be published; the worker never enqueues work itself.
+ */
+export type DiagramReadResult =
+  | { state: "complete"; diagram: DiagramPayload }
+  | { state: "pending"; files: string[] };
 
 export type PreprocessRequest =
   | {
@@ -55,7 +63,6 @@ export type PreprocessRequest =
     generationId: number;
     cause: PreprocessCause;
     scope: PreprocessScope;
-    packages: PackageInfo[];
   }
   | { id: number; type: "read-tree"; generationId: number }
   | { id: number; type: "read-packages"; generationId: number }
@@ -63,8 +70,7 @@ export type PreprocessRequest =
     id: number;
     type: "read-diagram";
     generationId: number;
-    kind: DiagramKind;
-    scopePath: string;
+    request: DiagramRequest;
   }
   | {
     id: number;
@@ -80,6 +86,12 @@ export type PreprocessRequest =
     path: string;
     line: number;
     column: number;
+  }
+  | {
+    id: number;
+    type: "read-file-definitions";
+    generationId: number;
+    path: string;
   }
   | {
     id: number;
@@ -112,9 +124,10 @@ export type PreprocessResultMap = {
   "preprocess-scope": { children: PreprocessScope[] };
   "read-tree": TreeNode;
   "read-packages": PackageInfo[];
-  "read-diagram": DiagramPayload;
+  "read-diagram": DiagramReadResult;
   "read-file": FileResponse;
   "read-definition": GotoDefinition | null;
+  "read-file-definitions": FileDefinition[];
   "lookup-definition": UmlSourceLocation | null;
   search: Omit<SearchResponse, "version">;
   "promote-generation": null;

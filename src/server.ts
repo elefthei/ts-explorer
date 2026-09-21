@@ -3,7 +3,12 @@ import type { Server, ServerWebSocket } from "bun";
 import { ExplorerStore, InputError } from "./store.ts";
 import { PathError } from "./paths.ts";
 import { isRecord, type PreprocessProgressEvent } from "./preprocess-protocol.ts";
-import type { PreprocessControlRequest, WatchEventName, WatchMessage } from "./types.ts";
+import type {
+  DiagramRequest,
+  PreprocessControlRequest,
+  WatchEventName,
+  WatchMessage,
+} from "./types.ts";
 
 type ServerOptions = {
   sourceDir: string;
@@ -175,14 +180,9 @@ export class ExplorerServer {
         );
       }
       if (url.pathname === "/api/diagram") {
-        const kind = url.searchParams.get("kind");
-        if (kind !== "packages" && kind !== "uml") {
-          throw new InputError("kind must be packages or uml");
-        }
         return Response.json(
           await this.store.getDiagram(
-            kind,
-            url.searchParams.get("path") ?? "",
+            ExplorerServer.parseDiagramRequest(url.searchParams),
           ),
         );
       }
@@ -214,6 +214,11 @@ export class ExplorerServer {
         }
         return Response.json(
           await this.store.lookupDefinition(path, name, qualifiedName),
+        );
+      }
+      if (url.pathname === "/api/file-definitions" && request.method === "GET") {
+        return Response.json(
+          await this.store.getFileDefinitions(url.searchParams.get("path") ?? ""),
         );
       }
       if (url.pathname === "/api/file" && request.method === "GET") {
@@ -265,6 +270,29 @@ export class ExplorerServer {
       { error: error instanceof Error ? error.message : String(error) },
       { status },
     );
+  }
+
+  /** `?kind=packages` or `?kind=uml&target=definition|file|directory&path=…&definition=…`. */
+  private static parseDiagramRequest(searchParams: URLSearchParams): DiagramRequest {
+    const kind = searchParams.get("kind");
+    if (kind !== "packages" && kind !== "uml") {
+      throw new InputError("kind must be packages or uml");
+    }
+    if (kind === "packages") return { kind: "packages", scopePath: "" };
+    const target = searchParams.get("target");
+    if (target !== "definition" && target !== "file" && target !== "directory") {
+      throw new InputError("target must be definition, file, or directory");
+    }
+    const path = searchParams.get("path") ?? "";
+    const definition = searchParams.get("definition");
+    if (target !== "definition" && definition !== null) {
+      throw new InputError("definition is only valid for a definition target");
+    }
+    if (target === "directory") return { kind, target: { kind: "directory", path } };
+    if (!path) throw new InputError("path is required");
+    if (target === "file") return { kind, target: { kind: "file", path } };
+    if (definition === null || definition === "") throw new InputError("definition is required");
+    return { kind, target: { kind: "definition", path, definitionKey: definition } };
   }
 
   private static parseFileLocation(

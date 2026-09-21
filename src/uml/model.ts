@@ -1,6 +1,6 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
-import type { HeritageClause, UmlDependency, UmlDiagramGraph } from "../diagram-graph.ts";
-import type { UmlExternalUser, UmlLocalUser } from "../types.ts";
+import type { UmlCategoryKind } from "../diagram-graph.ts";
+import type { FileDefinition, FileDefinitionKind, TreeNode } from "../types.ts";
 
 export type SourceUnit = { path: string; root: Node };
 
@@ -38,95 +38,38 @@ export function orderUmlModifiers(modifiers: Iterable<UmlModifier>): UmlModifier
 }
 
 export type PropertyDetails = {
+  /** The exact outline declaration this compartment row renders. */
+  definitionKey: string;
   modifiers: UmlModifier[];
   name: string;
   type?: string;
-  typeIds: string[];
   optional: boolean;
 };
 
 export type MethodDetails = {
+  definitionKey: string;
   modifiers: UmlModifier[];
   name: string;
   returnType?: string;
-  returnTypeIds?: string[];
 };
 
-/** The parse-time shapes are the persisted row shapes; one declaration serves both. */
-export type { HeritageClause, UmlDependency };
-
-/** A member annotation whose type references resolve once the whole project is parsed. */
-type PendingMemberTypes = {
-  kind: "member";
-  file: string;
-  annotation: Node;
-  assign: (typeIds: string[]) => void;
+export type EnumItemDetails = {
+  definitionKey: string;
+  value: string;
 };
 
-/** A heritage base name whose target entity resolves once the whole project is parsed. */
-type PendingHeritage = {
-  kind: "heritage";
-  file: string;
-  base: Node;
-  clause: HeritageClause;
-};
-
-export type PendingTypeReference = PendingMemberTypes | PendingHeritage;
-
-type AssociationEnd = {
-  typeId: string;
-  name: string;
-  multiplicity?: "0..*";
-};
-
-export type MemberAssociation = {
-  a: AssociationEnd;
-  b: AssociationEnd;
-  associationType: 0;
-  inherited: boolean;
-};
-
+/**
+ * One nominal box. `id` is the canonical `DefinitionIndex.definition_key` of the declaring
+ * definition; `kind` is the native outline kind, never normalized across languages.
+ */
 export type UmlEntityModel = {
-  name: string;
   id: string;
+  name: string;
+  kind: FileDefinitionKind;
   properties: PropertyDetails[];
   methods: MethodDetails[];
-  heritageClauses: HeritageClause[];
-  items: string[];
+  items: EnumItemDetails[];
 };
-
-export type FileDeclaration = {
-  fileName: string;
-  classes: UmlEntityModel[];
-  interfaces: UmlEntityModel[];
-  enums: UmlEntityModel[];
-  types: UmlEntityModel[];
-  heritageClauses: HeritageClause[][];
-  memberAssociations?: MemberAssociation[];
-};
-
-export type UmlReference = {
-  id: string;
-  name: string;
-};
-
-export type ExternalUserNode = {
-  navigation: UmlExternalUser;
-  targets: UmlReference[];
-};
-
-export type LocalUserNode = {
-  navigation: UmlLocalUser;
-  ownerEntityId?: string;
-  targets: UmlReference[];
-};
-
-type UmlCategory = {
-  category: UmlDiagramGraph["categories"][number]["category"];
-  test: boolean;
-};
-
-export type CategoryMap = Map<string, UmlCategory>;
 
 /** Global UML detail switches; every flag on reproduces the maximal diagram. */
 export type UmlVisibility = {
@@ -141,4 +84,72 @@ export const FULL_UML_VISIBILITY: UmlVisibility = {
   methods: true,
   types: true,
   tests: true,
+};
+
+export type { UmlCategoryKind };
+
+/** A catalogue definition plus the body flag overload and module resolution need. */
+export type IndexedFileDefinition = FileDefinition & { hasBody: boolean };
+
+export type DefinitionBindingTarget =
+  | { kind: "definition"; key: string }
+  | { kind: "module"; path: string };
+
+export type DefinitionBindingSpace = "type" | "value";
+
+export type DefinitionBindingKind = "local" | "import" | "export";
+
+export type DefinitionBinding = {
+  sourcePath: string;
+  /** `""` for file scope, otherwise an indexed namespace/module definition key. */
+  scopeKey: string;
+  name: string;
+  space: DefinitionBindingSpace;
+  bindingKind: DefinitionBindingKind;
+  /** Distinguishes genuine overload/merged-declaration targets, never alternative guesses. */
+  ordinal: number;
+  target: DefinitionBindingTarget;
+};
+
+export type DefinitionContributionKind = "declaration" | "implementation" | "module";
+
+export type DefinitionContributor = {
+  definitionKey: string;
+  sourcePath: string;
+  kind: DefinitionContributionKind;
+};
+
+export type FileImportEdge = {
+  sourcePath: string;
+  targetPath: string;
+};
+
+/** Everything one generation's catalogue transaction publishes atomically. */
+export type DefinitionIndexSnapshot = {
+  entries: readonly TreeNode[];
+  definitions: readonly IndexedFileDefinition[];
+  bindings: readonly DefinitionBinding[];
+  contributors: readonly DefinitionContributor[];
+  imports: readonly FileImportEdge[];
+};
+
+/**
+ * The read side of the catalogue, backed by prepared generation-bound queries. Lexical
+ * shadowing is resolved by the AST visitor before this interface is consulted.
+ */
+export type DefinitionResolutionIndex = {
+  definition(key: string): IndexedFileDefinition | undefined;
+  definitions(path: string): readonly IndexedFileDefinition[];
+  members(parentKey: string): readonly IndexedFileDefinition[];
+  /**
+   * `exported=false` returns local bindings when present, otherwise imports; `exported=true`
+   * returns only the scope's public exports.
+   */
+  bindings(
+    path: string,
+    scopeKey: string,
+    name: string,
+    space: DefinitionBindingSpace,
+    exported: boolean,
+  ): readonly DefinitionBindingTarget[];
 };

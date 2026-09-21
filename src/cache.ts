@@ -4,47 +4,68 @@ import { Database, type Statement } from "bun:sqlite";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type DiagramGraph,
+  type DiagramNodeKind,
+  type DiagramRelationKind,
   type PackageDiagramGraph,
-  type RenderedDiagram,
+  type RenderedPackageDiagram,
+  type UmlCategoryKind,
   type UmlDiagramGraph,
+  type UmlFileOutcome,
+  type UmlRelationKind,
 } from "./diagram-graph.ts";
 import type { LanguageId } from "./lang/registry.ts";
-import type { UmlModifier } from "./uml/model.ts";
-import { normalizeRelativePath } from "./paths.ts";
+import { normalizeRelativePath, PathError } from "./paths.ts";
 import { validatePackageDiagramGraph } from "./packages.ts";
 import { buildSearchScopes } from "./search.ts";
-import type {
-  DiagramKind,
-  DiagramPayload,
-  EditorGotoDefinition,
-  GotoDefinition,
-  GotoDefinitionKind,
-  PackageInfo,
-  SearchResponse,
-  TreeNode,
-  UmlSourceLocation,
+import { isSourcePath } from "./source.ts";
+import {
+  FILE_DEFINITION_KINDS,
+  type DiagramKind,
+  type EditorGotoDefinition,
+  type FileDefinition,
+  type FileDefinitionKind,
+  type GotoDefinition,
+  type GotoDefinitionKind,
+  type PackageDiagramPayload,
+  type PackageInfo,
+  type SearchResponse,
+  type TreeNode,
+  type UmlDiagramPayload,
+  type UmlSourceLocation,
+  type UmlTarget,
 } from "./types.ts";
-import { validateUmlDiagramGraph } from "./uml/render.ts";
+import { isTestPath } from "./uml/keys.ts";
+import type {
+  DefinitionBindingSpace,
+  DefinitionBindingTarget,
+  DefinitionIndexSnapshot,
+  DefinitionResolutionIndex,
+  IndexedFileDefinition,
+  UmlEntityModel,
+} from "./uml/model.ts";
+import { type HydratedFileNominalModel, hydrateUmlNominalModel } from "./uml/render.ts";
+import { validateUmlDiagramGraph } from "./uml/graph.ts";
+import type {
+  UmlDefinitionEdge,
+  UmlDefinitionNode,
+  UmlViewModel,
+} from "./uml/view.ts";
 
-const CACHE_SCHEMA_VERSION = 7;
+const CACHE_SCHEMA_VERSION = 9;
 
 type DiagramErrorOutcome = { status: "error"; error: string };
 
-export type CacheDiagramInput =
+export type CachePackageDiagramInput =
   | {
-    graph: DiagramGraph;
+    graph: PackageDiagramGraph;
     outcome: { status: "ready" } | DiagramErrorOutcome;
   }
   | {
-    fallbackSource: {
-      sourceGenerationId: number;
-      kind: DiagramKind;
-      scopePath: string;
-    };
+    fallbackSource: { sourceGenerationId: number };
     outcome: DiagramErrorOutcome;
   };
 
-type DiagramRenderer = (graph: DiagramGraph) => RenderedDiagram;
+type PackageDiagramRenderer = (graph: PackageDiagramGraph) => RenderedPackageDiagram;
 
 export class DiagramMaterializationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -62,23 +83,16 @@ export type CacheFileWrite = {
   language: LanguageId | null;
 };
 
-export type DefinitionIndexWrite = {
-  path: string;
-  name: string;
-  qualifiedName: string;
-  kind: GotoDefinitionKind;
-  line: number;
-  column: number;
-};
-
-
-type CacheScopeWrite = {
-  entries: readonly TreeNode[];
-  diagram: CacheDiagramInput;
+export type CacheScopeWrite = {
+  /** Present only for source-file scopes; directories never manufacture a UML completion row. */
+  diagram?: { graph: UmlDiagramGraph; outcome: UmlFileOutcome };
   file?: CacheFileWrite;
   definitions: readonly EditorGotoDefinition[];
 };
 
+export type UmlDiagramRead =
+  | { state: "pending"; files: string[] }
+  | { state: "complete"; diagram: UmlDiagramPayload };
 
 type ActiveGenerationRow = { id: number; source_fingerprint: string };
 type PackageRow = { packages_json: string };
@@ -114,10 +128,26 @@ type GotoDefinitionRow = {
   uml_member_occurrence: number | null;
 };
 type DefinitionIndexRow = {
+  definition_key: string;
+  parent_key: string | null;
+  is_top_level: number;
+  has_body: number;
+  name: string;
+  qualified_name: string;
+  kind: FileDefinitionKind;
+  type_text: string | null;
   source_path: string;
   source_line: number;
   source_column: number;
 };
+type DefinitionLocationRow = {
+  source_path: string;
+  source_line: number;
+  source_column: number;
+};
+type BindingRow = { target_key: string | null; target_module_path: string | null };
+type ContributorRow = { source_path: string; contribution_kind: "declaration" | "implementation" | "module" };
+type RelationRow = { target_node_id: string; relation_kind: UmlRelationKind };
 type SchemaObjectRow = { name: string };
 type GraphIdentity = [generationId: number, kind: DiagramKind, scopePath: string];
 type GraphHeaderRow = {
@@ -127,77 +157,6 @@ type GraphHeaderRow = {
   renderMode: "normal" | "bare";
 };
 type SqlBooleanRow<Row, Key extends keyof Row> = Omit<Row, Key> & Record<Key, number>;
-type CacheStatements = {
-  selectActiveGeneration: Statement<ActiveGenerationRow, []>;
-  deleteActivePointer: Statement<never, []>;
-  deleteGenerationsExcept: Statement<never, [number]>;
-  deleteAllGenerations: Statement<never, []>;
-  insertGeneration: Statement<never, ["startup" | "watch", number, string]>;
-  upsertPackages: Statement<never, [number, string]>;
-  upsertTreeEntry: Statement<
-    never,
-    [number, string, string, string, "directory" | "file", number]
-  >;
-  upsertDiagram: Statement<
-    never,
-    [number, DiagramKind, string, string]
-  >;
-  upsertFile: Statement<
-    never,
-    [
-      number,
-      string,
-      string | null,
-      string | null,
-      string | null,
-      string | null,
-      LanguageId | null,
-    ]
-  >;
-  deleteScopeGotoDefs: Statement<never, [number, string]>;
-  insertGotoDefinition: Statement<
-    never,
-    [
-      number,
-      string,
-      GotoDefinitionKind,
-      string,
-      string,
-      string,
-      number,
-      number,
-      number,
-      number,
-      string,
-      string,
-      string | null,
-      number | null,
-    ]
-  >;
-  selectTreeEntries: Statement<TreeRow, [number]>;
-  selectPackages: Statement<PackageRow, [number]>;
-  selectDiagram: Statement<DiagramRow, [number, DiagramKind, string]>;
-  selectFailedDiagram: Statement<{ scope_path: string }, [number]>;
-  selectFile: Statement<FileRow, [number, string]>;
-  selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
-  selectDefinitions: Statement<GotoDefinitionRow, [number, string]>;
-  selectIndexedSearchCandidates: Statement<SearchCandidateRow, [number, string]>;
-  selectScanSearchCandidates: Statement<SearchCandidateRow, [number]>;
-  selectIndexedDefinitionCandidates: Statement<GotoDefinitionRow, [number, string, string]>;
-  selectScanDefinitionCandidates: Statement<GotoDefinitionRow, [number]>;
-  markGenerationActive: Statement<never, [number, number]>;
-  upsertActivePointer: Statement<never, [string]>;
-  deleteInactiveGeneration: Statement<never, [number]>;
-  markGenerationFailed: Statement<never, [number, number]>;
-  optimizeSearch: Statement<never, []>;
-  optimizeGotoDefinitionSearch: Statement<never, []>;
-  deleteGenerationDefinitionIndex: Statement<never, [number]>;
-  insertDefinitionIndex: Statement<
-    never,
-    [number, string, string, string, GotoDefinitionKind, number, number]
-  >;
-  selectDefinitionIndexEntry: Statement<DefinitionIndexRow, [string, string, string]>;
-};
 
 type ImmediateTransaction<Args extends unknown[], Result = void> = {
   immediate(...args: Args): Result;
@@ -205,7 +164,7 @@ type ImmediateTransaction<Args extends unknown[], Result = void> = {
 
 type CacheSchemaObject = {
   readonly name: string;
-  readonly kind: "table" | "trigger";
+  readonly kind: "table" | "trigger" | "index";
   readonly createSql: string;
 };
 
@@ -252,13 +211,19 @@ const CACHE_SCHEMA_OBJECTS = [
     )`,
   },
   {
+    name: "tree_entries_by_parent",
+    kind: "index",
+    createSql: `CREATE INDEX tree_entries_by_parent
+      ON tree_entries(generation_id, parent_path, path)`,
+  },
+  {
     name: "diagram_graphs",
     kind: "table",
     createSql: `CREATE TABLE diagram_graphs (
       generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
       kind TEXT NOT NULL CHECK (kind IN ('packages', 'uml')),
       scope_path TEXT NOT NULL,
-      format_version INTEGER NOT NULL CHECK (format_version = 1),
+      format_version INTEGER NOT NULL CHECK (format_version = 2),
       render_mode TEXT NOT NULL CHECK (render_mode IN ('normal', 'bare')),
       PRIMARY KEY (generation_id, kind, scope_path),
       CHECK ((kind = 'packages' AND scope_path = '') OR kind = 'uml')
@@ -274,36 +239,13 @@ const CACHE_SCHEMA_OBJECTS = [
       node_id TEXT NOT NULL,
       node_ordinal INTEGER NOT NULL CHECK (node_ordinal >= 0),
       node_kind TEXT NOT NULL CHECK (
-        node_kind IN ('package', 'placeholder', 'entity', 'boundary', 'local-user', 'external-user')
+        node_kind IN ('package', 'placeholder', 'entity', 'definition', 'boundary')
       ),
       name TEXT NOT NULL,
-      community INTEGER CHECK (community >= 0),
       PRIMARY KEY (generation_id, kind, scope_path, node_id),
       UNIQUE (generation_id, kind, scope_path, node_ordinal),
       FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE,
-      CHECK (
-        (node_kind IN ('package', 'placeholder') AND community IS NULL)
-        OR
-        (node_kind IN ('entity', 'boundary', 'local-user', 'external-user')
-          AND community IS NOT NULL)
-      )
-    )`,
-  },
-  {
-    name: "diagram_node_aliases",
-    kind: "table",
-    createSql: `CREATE TABLE diagram_node_aliases (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL,
-      scope_path TEXT NOT NULL,
-      node_id TEXT NOT NULL,
-      alias_ordinal INTEGER NOT NULL CHECK (alias_ordinal >= 0),
-      alias TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, node_id, alias_ordinal),
-      UNIQUE (generation_id, kind, scope_path, alias),
-      FOREIGN KEY (generation_id, kind, scope_path, node_id)
-        REFERENCES diagram_nodes(generation_id, kind, scope_path, node_id) ON DELETE CASCADE
+        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
     )`,
   },
   {
@@ -346,15 +288,7 @@ const CACHE_SCHEMA_OBJECTS = [
       edge_ordinal INTEGER NOT NULL CHECK (edge_ordinal >= 0),
       relation_ordinal INTEGER NOT NULL CHECK (relation_ordinal >= 0),
       relation_kind TEXT NOT NULL CHECK (
-        relation_kind IN (
-          'package-dependency',
-          'heritage',
-          'member-association',
-          'method-return',
-          'usage',
-          'local-user',
-          'external-user'
-        )
+        relation_kind IN ('package-dependency', 'extends', 'implements', 'references')
       ),
       source_node_id TEXT NOT NULL,
       target_node_id TEXT NOT NULL,
@@ -375,6 +309,14 @@ const CACHE_SCHEMA_OBJECTS = [
     )`,
   },
   {
+    name: "diagram_relations_by_source",
+    kind: "index",
+    createSql: `CREATE INDEX diagram_relations_by_source
+      ON diagram_edge_relations(
+        generation_id, source_node_id, scope_path, target_node_id, relation_kind
+      )`,
+  },
+  {
     name: "package_graph_nodes",
     kind: "table",
     createSql: `CREATE TABLE package_graph_nodes (
@@ -389,47 +331,21 @@ const CACHE_SCHEMA_OBJECTS = [
     )`,
   },
   {
-    name: "uml_declarations",
-    kind: "table",
-    createSql: `CREATE TABLE uml_declarations (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      file_name TEXT NOT NULL,
-      language TEXT NOT NULL CHECK (
-        language IN ('typescript', 'tsx', 'javascript', 'rust')
-      ),
-      member_associations_present INTEGER NOT NULL CHECK (member_associations_present IN (0, 1)),
-      PRIMARY KEY (generation_id, kind, scope_path, declaration_ordinal),
-      UNIQUE (generation_id, kind, scope_path, file_name),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
-    )`,
-  },
-  {
     name: "uml_entities",
     kind: "table",
     createSql: `CREATE TABLE uml_entities (
       generation_id INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
-      node_id TEXT NOT NULL,
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ),
-      FOREIGN KEY (generation_id, kind, scope_path, declaration_ordinal)
-        REFERENCES uml_declarations(generation_id, kind, scope_path, declaration_ordinal)
-        ON DELETE CASCADE,
-      FOREIGN KEY (generation_id, kind, scope_path, node_id)
+      definition_key TEXT NOT NULL,
+      entity_kind TEXT NOT NULL CHECK (entity_kind IN (${
+      FILE_DEFINITION_KINDS.map((kind) => `'${kind}'`).join(",")
+    })),
+      name TEXT NOT NULL,
+      PRIMARY KEY (generation_id, kind, scope_path, entity_ordinal),
+      UNIQUE (generation_id, kind, scope_path, definition_key),
+      FOREIGN KEY (generation_id, kind, scope_path, definition_key)
         REFERENCES diagram_nodes(generation_id, kind, scope_path, node_id) ON DELETE CASCADE
     )`,
   },
@@ -440,79 +356,15 @@ const CACHE_SCHEMA_OBJECTS = [
       generation_id INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       property_ordinal INTEGER NOT NULL CHECK (property_ordinal >= 0),
+      definition_key TEXT NOT NULL,
       name TEXT NOT NULL,
       type TEXT,
       optional INTEGER NOT NULL CHECK (optional IN (0, 1)),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        property_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_property_type_ids",
-    kind: "table",
-    createSql: `CREATE TABLE uml_property_type_ids (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
-      entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
-      property_ordinal INTEGER NOT NULL CHECK (property_ordinal >= 0),
-      type_id_ordinal INTEGER NOT NULL CHECK (type_id_ordinal >= 0),
-      type_id TEXT NOT NULL,
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        property_ordinal,
-        type_id_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        property_ordinal
-      ) REFERENCES uml_properties(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        property_ordinal
-      ) ON DELETE CASCADE
+      PRIMARY KEY (generation_id, kind, scope_path, entity_ordinal, property_ordinal),
+      FOREIGN KEY (generation_id, kind, scope_path, entity_ordinal)
+        REFERENCES uml_entities(generation_id, kind, scope_path, entity_ordinal) ON DELETE CASCADE
     )`,
   },
   {
@@ -522,79 +374,14 @@ const CACHE_SCHEMA_OBJECTS = [
       generation_id INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       method_ordinal INTEGER NOT NULL CHECK (method_ordinal >= 0),
+      definition_key TEXT NOT NULL,
       name TEXT NOT NULL,
       return_type TEXT,
-      return_type_ids_present INTEGER NOT NULL CHECK (return_type_ids_present IN (0, 1)),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        method_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_method_return_type_ids",
-    kind: "table",
-    createSql: `CREATE TABLE uml_method_return_type_ids (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
-      entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
-      method_ordinal INTEGER NOT NULL CHECK (method_ordinal >= 0),
-      type_id_ordinal INTEGER NOT NULL CHECK (type_id_ordinal >= 0),
-      type_id TEXT NOT NULL,
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        method_ordinal,
-        type_id_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        method_ordinal
-      ) REFERENCES uml_methods(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        method_ordinal
-      ) ON DELETE CASCADE
+      PRIMARY KEY (generation_id, kind, scope_path, entity_ordinal, method_ordinal),
+      FOREIGN KEY (generation_id, kind, scope_path, entity_ordinal)
+        REFERENCES uml_entities(generation_id, kind, scope_path, entity_ordinal) ON DELETE CASCADE
     )`,
   },
   {
@@ -604,8 +391,6 @@ const CACHE_SCHEMA_OBJECTS = [
       generation_id INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'enum', 'type')),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       member_kind TEXT NOT NULL CHECK (member_kind IN ('property', 'method')),
       member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
@@ -617,31 +402,11 @@ const CACHE_SCHEMA_OBJECTS = [
         )
       ),
       PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        member_kind,
-        member_ordinal,
-        modifier_ordinal
+        generation_id, kind, scope_path, entity_ordinal,
+        member_kind, member_ordinal, modifier_ordinal
       ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
+      FOREIGN KEY (generation_id, kind, scope_path, entity_ordinal)
+        REFERENCES uml_entities(generation_id, kind, scope_path, entity_ordinal) ON DELETE CASCADE
     )`,
   },
   {
@@ -651,187 +416,13 @@ const CACHE_SCHEMA_OBJECTS = [
       generation_id INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind = 'enum'),
       entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
       item_ordinal INTEGER NOT NULL CHECK (item_ordinal >= 0),
+      definition_key TEXT NOT NULL,
       value TEXT NOT NULL,
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        item_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_entity_heritage_clauses",
-    kind: "table",
-    createSql: `CREATE TABLE uml_entity_heritage_clauses (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'type')),
-      entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
-      clause_ordinal INTEGER NOT NULL CHECK (clause_ordinal >= 0),
-      clause TEXT NOT NULL,
-      clause_type_id TEXT NOT NULL,
-      class_name TEXT NOT NULL,
-      class_type_id TEXT NOT NULL,
-      relation TEXT NOT NULL CHECK (relation IN ('extends', 'implements')),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal,
-        clause_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_declaration_heritage_groups",
-    kind: "table",
-    createSql: `CREATE TABLE uml_declaration_heritage_groups (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      group_ordinal INTEGER NOT NULL CHECK (group_ordinal >= 0),
-      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('class', 'interface', 'type')),
-      entity_ordinal INTEGER NOT NULL CHECK (entity_ordinal >= 0),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        group_ordinal
-      ),
-      UNIQUE (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) REFERENCES uml_entities(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        entity_kind,
-        entity_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_declaration_heritage_clauses",
-    kind: "table",
-    createSql: `CREATE TABLE uml_declaration_heritage_clauses (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      group_ordinal INTEGER NOT NULL CHECK (group_ordinal >= 0),
-      clause_ordinal INTEGER NOT NULL CHECK (clause_ordinal >= 0),
-      clause TEXT NOT NULL,
-      clause_type_id TEXT NOT NULL,
-      class_name TEXT NOT NULL,
-      class_type_id TEXT NOT NULL,
-      relation TEXT NOT NULL CHECK (relation IN ('extends', 'implements')),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        group_ordinal,
-        clause_ordinal
-      ),
-      FOREIGN KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        group_ordinal
-      ) REFERENCES uml_declaration_heritage_groups(
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        group_ordinal
-      ) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_member_associations",
-    kind: "table",
-    createSql: `CREATE TABLE uml_member_associations (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      declaration_ordinal INTEGER NOT NULL CHECK (declaration_ordinal >= 0),
-      association_ordinal INTEGER NOT NULL CHECK (association_ordinal >= 0),
-      a_type_id TEXT NOT NULL,
-      a_name TEXT NOT NULL,
-      a_multiplicity TEXT CHECK (a_multiplicity = '0..*'),
-      b_type_id TEXT NOT NULL,
-      b_name TEXT NOT NULL,
-      b_multiplicity TEXT CHECK (b_multiplicity = '0..*'),
-      association_type INTEGER NOT NULL CHECK (association_type = 0),
-      inherited INTEGER NOT NULL CHECK (inherited IN (0, 1)),
-      PRIMARY KEY (
-        generation_id,
-        kind,
-        scope_path,
-        declaration_ordinal,
-        association_ordinal
-      ),
-      FOREIGN KEY (generation_id, kind, scope_path, declaration_ordinal)
-        REFERENCES uml_declarations(generation_id, kind, scope_path, declaration_ordinal)
-        ON DELETE CASCADE
+      PRIMARY KEY (generation_id, kind, scope_path, entity_ordinal, item_ordinal),
+      FOREIGN KEY (generation_id, kind, scope_path, entity_ordinal)
+        REFERENCES uml_entities(generation_id, kind, scope_path, entity_ordinal) ON DELETE CASCADE
     )`,
   },
   {
@@ -842,167 +433,15 @@ const CACHE_SCHEMA_OBJECTS = [
       kind TEXT NOT NULL CHECK (kind = 'uml'),
       scope_path TEXT NOT NULL,
       category_ordinal INTEGER NOT NULL CHECK (category_ordinal >= 0),
-      entity_name TEXT NOT NULL,
+      definition_key TEXT NOT NULL,
       category TEXT NOT NULL CHECK (
         category IN ('interface', 'type', 'enum', 'abstract', 'concrete')
       ),
       is_test INTEGER NOT NULL CHECK (is_test IN (0, 1)),
       PRIMARY KEY (generation_id, kind, scope_path, category_ordinal),
-      UNIQUE (generation_id, kind, scope_path, entity_name),
+      UNIQUE (generation_id, kind, scope_path, definition_key),
       FOREIGN KEY (generation_id, kind, scope_path)
         REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_method_return_dependencies",
-    kind: "table",
-    createSql: `CREATE TABLE uml_method_return_dependencies (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      dependency_ordinal INTEGER NOT NULL CHECK (dependency_ordinal >= 0),
-      source_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      target_name TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, dependency_ordinal),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_usage_edges",
-    kind: "table",
-    createSql: `CREATE TABLE uml_usage_edges (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      dependency_ordinal INTEGER NOT NULL CHECK (dependency_ordinal >= 0),
-      source_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      target_name TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, dependency_ordinal),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_local_users",
-    kind: "table",
-    createSql: `CREATE TABLE uml_local_users (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      user_ordinal INTEGER NOT NULL CHECK (user_ordinal >= 0),
-      node_id TEXT NOT NULL,
-      navigation_node_id TEXT NOT NULL,
-      label TEXT NOT NULL,
-      path TEXT NOT NULL,
-      line INTEGER NOT NULL CHECK (line > 0),
-      column INTEGER NOT NULL CHECK (column > 0),
-      user_kind TEXT NOT NULL CHECK (
-        user_kind IN ('method', 'constructor', 'property', 'class', 'function', 'variable', 'type', 'export')
-      ),
-      owner_entity_id TEXT,
-      PRIMARY KEY (generation_id, kind, scope_path, user_ordinal),
-      UNIQUE (generation_id, kind, scope_path, node_id),
-      UNIQUE (generation_id, kind, scope_path, navigation_node_id),
-      FOREIGN KEY (generation_id, kind, scope_path, node_id)
-        REFERENCES diagram_nodes(generation_id, kind, scope_path, node_id) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_external_users",
-    kind: "table",
-    createSql: `CREATE TABLE uml_external_users (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      user_ordinal INTEGER NOT NULL CHECK (user_ordinal >= 0),
-      node_id TEXT NOT NULL,
-      navigation_node_id TEXT NOT NULL,
-      label TEXT NOT NULL,
-      user_scope_path TEXT NOT NULL,
-      user_kind TEXT NOT NULL CHECK (
-        user_kind IN ('method', 'constructor', 'property', 'class', 'function', 'variable', 'type', 'export')
-      ),
-      PRIMARY KEY (generation_id, kind, scope_path, user_ordinal),
-      UNIQUE (generation_id, kind, scope_path, node_id),
-      UNIQUE (generation_id, kind, scope_path, navigation_node_id),
-      FOREIGN KEY (generation_id, kind, scope_path, node_id)
-        REFERENCES diagram_nodes(generation_id, kind, scope_path, node_id) ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_local_user_targets",
-    kind: "table",
-    createSql: `CREATE TABLE uml_local_user_targets (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      user_ordinal INTEGER NOT NULL CHECK (user_ordinal >= 0),
-      target_ordinal INTEGER NOT NULL CHECK (target_ordinal >= 0),
-      target_id TEXT NOT NULL,
-      target_name TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, user_ordinal, target_ordinal),
-      FOREIGN KEY (generation_id, kind, scope_path, user_ordinal)
-        REFERENCES uml_local_users(generation_id, kind, scope_path, user_ordinal)
-        ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_external_user_targets",
-    kind: "table",
-    createSql: `CREATE TABLE uml_external_user_targets (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      user_ordinal INTEGER NOT NULL CHECK (user_ordinal >= 0),
-      target_ordinal INTEGER NOT NULL CHECK (target_ordinal >= 0),
-      target_id TEXT NOT NULL,
-      target_name TEXT NOT NULL,
-      PRIMARY KEY (generation_id, kind, scope_path, user_ordinal, target_ordinal),
-      FOREIGN KEY (generation_id, kind, scope_path, user_ordinal)
-        REFERENCES uml_external_users(generation_id, kind, scope_path, user_ordinal)
-        ON DELETE CASCADE
-    )`,
-  },
-  {
-    name: "uml_definitions",
-    kind: "table",
-    createSql: `CREATE TABLE uml_definitions (
-      generation_id INTEGER NOT NULL,
-      kind TEXT NOT NULL CHECK (kind = 'uml'),
-      scope_path TEXT NOT NULL,
-      definition_ordinal INTEGER NOT NULL CHECK (definition_ordinal >= 0),
-      definition_key TEXT NOT NULL,
-      definition_kind TEXT NOT NULL CHECK (
-        definition_kind IN ('class', 'interface', 'enum', 'type', 'method')
-      ),
-      name TEXT NOT NULL,
-      qualified_name TEXT NOT NULL,
-      source_path TEXT NOT NULL,
-      source_line INTEGER NOT NULL CHECK (source_line > 0),
-      source_column INTEGER NOT NULL CHECK (source_column > 0),
-      uml_scope_path TEXT NOT NULL,
-      uml_entity_name TEXT NOT NULL,
-      uml_member_name TEXT,
-      uml_member_occurrence INTEGER,
-      PRIMARY KEY (generation_id, kind, scope_path, definition_ordinal),
-      UNIQUE (generation_id, kind, scope_path, source_path, definition_key),
-      FOREIGN KEY (generation_id, kind, scope_path)
-        REFERENCES diagram_graphs(generation_id, kind, scope_path) ON DELETE CASCADE,
-      CHECK (
-        (definition_kind = 'method'
-          AND uml_member_name IS NOT NULL
-          AND uml_member_occurrence IS NOT NULL
-          AND uml_member_occurrence >= 0)
-        OR
-        (definition_kind <> 'method'
-          AND uml_member_name IS NULL
-          AND uml_member_occurrence IS NULL)
-      )
     )`,
   },
   {
@@ -1163,16 +602,106 @@ const CACHE_SCHEMA_OBJECTS = [
     kind: "table",
     createSql: `CREATE TABLE DefinitionIndex (
       generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+      definition_key TEXT NOT NULL,
+      parent_key TEXT,
+      is_top_level INTEGER NOT NULL CHECK (is_top_level IN (0, 1)),
+      has_body INTEGER NOT NULL CHECK (has_body IN (0, 1)),
       source_path TEXT NOT NULL,
       name TEXT NOT NULL,
       qualified_name TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('class','interface','enum','type','method')),
+      kind TEXT NOT NULL CHECK (kind IN (${
+      FILE_DEFINITION_KINDS.map((kind) => `'${kind}'`).join(",")
+    })),
+      type_text TEXT,
       source_line INTEGER NOT NULL CHECK (source_line > 0),
       source_column INTEGER NOT NULL CHECK (source_column > 0),
-      PRIMARY KEY (generation_id, source_path, name, source_line, source_column)
+      PRIMARY KEY (generation_id, definition_key),
+      FOREIGN KEY (generation_id, parent_key)
+        REFERENCES DefinitionIndex(generation_id, definition_key)
+        DEFERRABLE INITIALLY DEFERRED
+    )`,
+  },
+  {
+    name: "definition_index_by_source",
+    kind: "index",
+    createSql: `CREATE INDEX definition_index_by_source
+      ON DefinitionIndex(generation_id, source_path, source_line, source_column)`,
+  },
+  {
+    name: "definition_index_by_parent",
+    kind: "index",
+    createSql: `CREATE INDEX definition_index_by_parent
+      ON DefinitionIndex(generation_id, parent_key)`,
+  },
+  {
+    name: "definition_bindings",
+    kind: "table",
+    createSql: `CREATE TABLE definition_bindings (
+      generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+      source_path TEXT NOT NULL,
+      scope_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      space TEXT NOT NULL CHECK (space IN ('type', 'value')),
+      binding_kind TEXT NOT NULL CHECK (binding_kind IN ('local', 'import', 'export')),
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      target_key TEXT,
+      target_module_path TEXT,
+      PRIMARY KEY (generation_id, source_path, scope_key, name, space, binding_kind, ordinal),
+      CHECK (
+        (target_key IS NOT NULL AND target_module_path IS NULL)
+        OR (target_key IS NULL AND target_module_path IS NOT NULL)
+      ),
+      FOREIGN KEY (generation_id, target_key)
+        REFERENCES DefinitionIndex(generation_id, definition_key)
+        DEFERRABLE INITIALLY DEFERRED
+    )`,
+  },
+  {
+    name: "file_imports",
+    kind: "table",
+    createSql: `CREATE TABLE file_imports (
+      generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+      source_path TEXT NOT NULL,
+      target_path TEXT NOT NULL,
+      PRIMARY KEY (generation_id, source_path, target_path)
+    )`,
+  },
+  {
+    name: "definition_contributors",
+    kind: "table",
+    createSql: `CREATE TABLE definition_contributors (
+      generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+      definition_key TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      contribution_kind TEXT NOT NULL CHECK (
+        contribution_kind IN ('declaration', 'implementation', 'module')
+      ),
+      PRIMARY KEY (generation_id, definition_key, source_path, contribution_kind),
+      FOREIGN KEY (generation_id, definition_key)
+        REFERENCES DefinitionIndex(generation_id, definition_key)
+        DEFERRABLE INITIALLY DEFERRED
     )`,
   },
 ] as const satisfies readonly CacheSchemaObject[];
+
+/** Version-8 tables the rooted redesign removed; dropped child-before-parent on schema reset. */
+const REMOVED_CACHE_TABLES: readonly string[] = [
+  "uml_local_user_targets",
+  "uml_external_user_targets",
+  "uml_local_users",
+  "uml_external_users",
+  "uml_declaration_heritage_clauses",
+  "uml_declaration_heritage_groups",
+  "uml_entity_heritage_clauses",
+  "uml_property_type_ids",
+  "uml_method_return_type_ids",
+  "uml_member_associations",
+  "uml_method_return_dependencies",
+  "uml_usage_edges",
+  "uml_definitions",
+  "uml_declarations",
+  "diagram_node_aliases",
+];
 
 type CacheSchemaObjectDefinition = (typeof CACHE_SCHEMA_OBJECTS)[number];
 type CacheSchemaObjectName = CacheSchemaObjectDefinition["name"];
@@ -1181,10 +710,7 @@ type CacheTableName = Extract<
   { readonly kind: "table" }
 >["name"];
 
-const CACHE_SCHEMA_BY_NAME = new Map<
-  CacheSchemaObjectName,
-  CacheSchemaObjectDefinition
->(
+const CACHE_SCHEMA_BY_NAME = new Map<CacheSchemaObjectName, CacheSchemaObjectDefinition>(
   CACHE_SCHEMA_OBJECTS.map((definition) => [definition.name, definition] as const),
 );
 
@@ -1206,9 +732,14 @@ const CACHE_TABLE_RECOVERY_GROUPS = {
     "goto_def_bu",
     "goto_def_au",
   ],
-} as const satisfies Partial<
-  Record<CacheTableName, readonly CacheSchemaObjectName[]>
->;
+  tree_entries: ["tree_entries", "tree_entries_by_parent"],
+  diagram_edge_relations: ["diagram_edge_relations", "diagram_relations_by_source"],
+  DefinitionIndex: [
+    "DefinitionIndex",
+    "definition_index_by_source",
+    "definition_index_by_parent",
+  ],
+} as const satisfies Partial<Record<CacheTableName, readonly CacheSchemaObjectName[]>>;
 
 function cacheTableFromSchemaError(error: unknown): CacheTableName | null {
   const visited = new Set<unknown>();
@@ -1285,6 +816,42 @@ function toGotoDefinition(row: GotoDefinitionRow): GotoDefinition {
   };
 }
 
+function toIndexedDefinition(row: DefinitionIndexRow): IndexedFileDefinition {
+  return {
+    key: row.definition_key,
+    parentKey: row.parent_key,
+    isTopLevel: row.is_top_level !== 0,
+    hasBody: row.has_body !== 0,
+    name: row.name,
+    qualifiedName: row.qualified_name,
+    kind: row.kind,
+    type: row.type_text,
+    source: {
+      path: row.source_path,
+      line: row.source_line,
+      column: row.source_column,
+    },
+  };
+}
+
+function invalidMaterialization(message: string, cause?: unknown): DiagramMaterializationError {
+  return new DiagramMaterializationError(message, cause === undefined ? undefined : { cause });
+}
+
+function sqliteBoolean(value: unknown, description: string): number {
+  if (typeof value !== "boolean") throw invalidMaterialization(`invalid ${description}`);
+  return value ? 1 : 0;
+}
+
+const NOMINAL_DEFINITION_KINDS: Record<string, true> = {
+  class: true,
+  interface: true,
+  trait: true,
+  struct: true,
+  union: true,
+  enum: true,
+  type: true,
+};
 
 type PreparedGraphStore = {
   statements: Array<{ finalize(): void }>;
@@ -1292,13 +859,6 @@ type PreparedGraphStore = {
   insertGraph(generationId: number, graph: DiagramGraph): void;
   readGraph(generationId: number, kind: DiagramKind, scopePath: string): DiagramGraph | null;
 };
-
-function sqliteBoolean(value: unknown, description: string): number {
-  if (typeof value !== "boolean") {
-    throw invalidMaterialization(`invalid ${description}`);
-  }
-  return value ? 1 : 0;
-}
 
 function prepareGraphStore(db: Database): PreparedGraphStore {
   const deleteGraphHeader = db.query<never, GraphIdentity>(`
@@ -1315,28 +875,11 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   `);
   const insertNode = db.query<
     never,
-    [
-      number,
-      DiagramKind,
-      string,
-      string,
-      number,
-      DiagramGraph["nodes"][number]["nodeKind"],
-      string,
-      number | null,
-    ]
+    [number, DiagramKind, string, string, number, DiagramNodeKind, string]
   >(`
     INSERT INTO diagram_nodes(
-      generation_id, kind, scope_path, node_id, node_ordinal, node_kind, name, community
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertAlias = db.query<
-    never,
-    [number, DiagramKind, string, string, number, string]
-  >(`
-    INSERT INTO diagram_node_aliases(
-      generation_id, kind, scope_path, node_id, alias_ordinal, alias
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      generation_id, kind, scope_path, node_id, node_ordinal, node_kind, name
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const insertEdge = db.query<
     never,
@@ -1359,134 +902,43 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   `);
   const insertRelation = db.query<
     never,
-    [
-      number,
-      DiagramKind,
-      string,
-      number,
-      number,
-      DiagramGraph["relations"][number]["relationKind"],
-      string,
-      string,
-    ]
+    [number, DiagramKind, string, number, number, DiagramRelationKind, string, string]
   >(`
     INSERT INTO diagram_edge_relations(
       generation_id, kind, scope_path, edge_ordinal, relation_ordinal,
       relation_kind, source_node_id, target_node_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const insertPackageNode = db.query<
-    never,
-    [number, "packages", string, string, string | null]
-  >(`
+  const insertPackageNode = db.query<never, [number, "packages", string, string, string | null]>(`
     INSERT INTO package_graph_nodes(
       generation_id, kind, scope_path, node_id, package_path
     ) VALUES (?, ?, ?, ?, ?)
   `);
-  const insertUmlDeclaration = db.query<
-    never,
-    [number, "uml", string, number, string, LanguageId, number]
-  >(`
-    INSERT INTO uml_declarations(
-      generation_id, kind, scope_path, declaration_ordinal, file_name, language,
-      member_associations_present
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
   const insertUmlEntity = db.query<
     never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["entities"][number]["entityKind"],
-      number,
-      string,
-    ]
+    [number, "uml", string, number, string, FileDefinitionKind, string]
   >(`
     INSERT INTO uml_entities(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, node_id
+      generation_id, kind, scope_path, entity_ordinal, definition_key, entity_kind, name
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlProperty = db.query<
     never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["properties"][number]["entityKind"],
-      number,
-      number,
-      string,
-      string | null,
-      number,
-    ]
+    [number, "uml", string, number, number, string, string, string | null, number]
   >(`
     INSERT INTO uml_properties(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, property_ordinal, name, type, optional
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlPropertyTypeId = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["propertyTypeIds"][number]["entityKind"],
-      number,
-      number,
-      number,
-      string,
-    ]
-  >(`
-    INSERT INTO uml_property_type_ids(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, property_ordinal, type_id_ordinal, type_id
+      generation_id, kind, scope_path, entity_ordinal, property_ordinal,
+      definition_key, name, type, optional
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlMethod = db.query<
     never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["methods"][number]["entityKind"],
-      number,
-      number,
-      string,
-      string | null,
-      number,
-    ]
+    [number, "uml", string, number, number, string, string, string | null]
   >(`
     INSERT INTO uml_methods(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, method_ordinal, name, return_type,
-      return_type_ids_present
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlMethodReturnTypeId = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["methodReturnTypeIds"][number]["entityKind"],
-      number,
-      number,
-      number,
-      string,
-    ]
-  >(`
-    INSERT INTO uml_method_return_type_ids(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, method_ordinal, type_id_ordinal, type_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      generation_id, kind, scope_path, entity_ordinal, method_ordinal,
+      definition_key, name, return_type
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlMemberModifier = db.query<
     never,
@@ -1495,239 +947,32 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       "uml",
       string,
       number,
-      UmlDiagramGraph["memberModifiers"][number]["entityKind"],
-      number,
       UmlDiagramGraph["memberModifiers"][number]["memberKind"],
       number,
       number,
-      UmlModifier,
+      UmlDiagramGraph["memberModifiers"][number]["modifier"],
     ]
   >(`
     INSERT INTO uml_member_modifiers(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, member_kind, member_ordinal, modifier_ordinal, modifier
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      generation_id, kind, scope_path, entity_ordinal, member_kind,
+      member_ordinal, modifier_ordinal, modifier
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlEnumItem = db.query<
     never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["enumItems"][number]["entityKind"],
-      number,
-      number,
-      string,
-    ]
+    [number, "uml", string, number, number, string, string]
   >(`
     INSERT INTO uml_enum_items(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, item_ordinal, value
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlEntityHeritage = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      UmlDiagramGraph["entityHeritageClauses"][number]["entityKind"],
-      number,
-      number,
-      string,
-      string,
-      string,
-      string,
-      UmlDiagramGraph["entityHeritageClauses"][number]["relation"],
-    ]
-  >(`
-    INSERT INTO uml_entity_heritage_clauses(
-      generation_id, kind, scope_path, declaration_ordinal, entity_kind,
-      entity_ordinal, clause_ordinal, clause, clause_type_id, class_name,
-      class_type_id, relation
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlDeclarationHeritageGroup = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      number,
-      UmlDiagramGraph["declarationHeritageGroups"][number]["entityKind"],
-      number,
-    ]
-  >(`
-    INSERT INTO uml_declaration_heritage_groups(
-      generation_id, kind, scope_path, declaration_ordinal, group_ordinal,
-      entity_kind, entity_ordinal
+      generation_id, kind, scope_path, entity_ordinal, item_ordinal, definition_key, value
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlDeclarationHeritageClause = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      number,
-      number,
-      string,
-      string,
-      string,
-      string,
-      UmlDiagramGraph["declarationHeritageClauses"][number]["relation"],
-    ]
-  >(`
-    INSERT INTO uml_declaration_heritage_clauses(
-      generation_id, kind, scope_path, declaration_ordinal, group_ordinal,
-      clause_ordinal, clause, clause_type_id, class_name, class_type_id, relation
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlMemberAssociation = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      number,
-      string,
-      string,
-      "0..*" | null,
-      string,
-      string,
-      "0..*" | null,
-      number,
-      number,
-    ]
-  >(`
-    INSERT INTO uml_member_associations(
-      generation_id, kind, scope_path, declaration_ordinal, association_ordinal,
-      a_type_id, a_name, a_multiplicity, b_type_id, b_name, b_multiplicity,
-      association_type, inherited
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUmlCategory = db.query<
     never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      string,
-      UmlDiagramGraph["categories"][number]["category"],
-      number,
-    ]
+    [number, "uml", string, number, string, UmlCategoryKind, number]
   >(`
     INSERT INTO uml_categories(
-      generation_id, kind, scope_path, category_ordinal, entity_name, category, is_test
+      generation_id, kind, scope_path, category_ordinal, definition_key, category, is_test
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlMethodReturnDependency = db.query<
-    never,
-    [number, "uml", string, number, string, string, string, string]
-  >(`
-    INSERT INTO uml_method_return_dependencies(
-      generation_id, kind, scope_path, dependency_ordinal, source_id,
-      source_name, target_id, target_name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlUsageEdge = db.query<
-    never,
-    [number, "uml", string, number, string, string, string, string]
-  >(`
-    INSERT INTO uml_usage_edges(
-      generation_id, kind, scope_path, dependency_ordinal, source_id,
-      source_name, target_id, target_name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlLocalUser = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      string,
-      string,
-      string,
-      string,
-      number,
-      number,
-      UmlDiagramGraph["localUsers"][number]["userKind"],
-      string | null,
-    ]
-  >(`
-    INSERT INTO uml_local_users(
-      generation_id, kind, scope_path, user_ordinal, node_id, navigation_node_id,
-      label, path, line, column, user_kind, owner_entity_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlExternalUser = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      string,
-      string,
-      string,
-      string,
-      UmlDiagramGraph["externalUsers"][number]["userKind"],
-    ]
-  >(`
-    INSERT INTO uml_external_users(
-      generation_id, kind, scope_path, user_ordinal, node_id, navigation_node_id,
-      label, user_scope_path, user_kind
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlLocalUserTarget = db.query<
-    never,
-    [number, "uml", string, number, number, string, string]
-  >(`
-    INSERT INTO uml_local_user_targets(
-      generation_id, kind, scope_path, user_ordinal, target_ordinal, target_id, target_name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlExternalUserTarget = db.query<
-    never,
-    [number, "uml", string, number, number, string, string]
-  >(`
-    INSERT INTO uml_external_user_targets(
-      generation_id, kind, scope_path, user_ordinal, target_ordinal, target_id, target_name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertUmlDefinition = db.query<
-    never,
-    [
-      number,
-      "uml",
-      string,
-      number,
-      string,
-      GotoDefinitionKind,
-      string,
-      string,
-      string,
-      number,
-      number,
-      string,
-      string,
-      string | null,
-      number | null,
-    ]
-  >(`
-    INSERT INTO uml_definitions(
-      generation_id, kind, scope_path, definition_ordinal, definition_key,
-      definition_kind, name, qualified_name, source_path, source_line,
-      source_column, uml_scope_path, uml_entity_name, uml_member_name,
-      uml_member_occurrence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const selectGraphHeader = db.query<GraphHeaderRow, GraphIdentity>(`
@@ -1740,29 +985,10 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
   `);
   const selectNodes = db.query<DiagramGraph["nodes"][number], GraphIdentity>(`
-    SELECT
-      node_id AS nodeId,
-      node_ordinal AS nodeOrdinal,
-      node_kind AS nodeKind,
-      name,
-      community
+    SELECT node_id AS nodeId, node_ordinal AS nodeOrdinal, node_kind AS nodeKind, name
     FROM diagram_nodes
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY node_ordinal
-  `);
-  const selectAliases = db.query<DiagramGraph["aliases"][number], GraphIdentity>(`
-    SELECT
-      aliases.node_id AS nodeId,
-      aliases.alias_ordinal AS aliasOrdinal,
-      aliases.alias
-    FROM diagram_node_aliases AS aliases
-    JOIN diagram_nodes AS nodes
-      ON nodes.generation_id = aliases.generation_id
-      AND nodes.kind = aliases.kind
-      AND nodes.scope_path = aliases.scope_path
-      AND nodes.node_id = aliases.node_id
-    WHERE aliases.generation_id = ? AND aliases.kind = ? AND aliases.scope_path = ?
-    ORDER BY nodes.node_ordinal, aliases.alias_ordinal
   `);
   const selectEdges = db.query<
     SqlBooleanRow<DiagramGraph["edges"][number], "directed">,
@@ -1804,124 +1030,47 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     WHERE packages.generation_id = ? AND packages.kind = ? AND packages.scope_path = ?
     ORDER BY nodes.node_ordinal
   `);
-  const selectUmlDeclarations = db.query<
-    SqlBooleanRow<UmlDiagramGraph["declarations"][number], "memberAssociationsPresent">,
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      file_name AS fileName,
-      language,
-      member_associations_present AS memberAssociationsPresent
-    FROM uml_declarations
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal
-  `);
   const selectUmlEntities = db.query<UmlDiagramGraph["entities"][number], GraphIdentity>(`
     SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
-      node_id AS nodeId
+      definition_key AS definitionKey,
+      entity_kind AS entityKind,
+      name
     FROM uml_entities
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal
+    ORDER BY entity_ordinal
   `);
   const selectUmlProperties = db.query<
     SqlBooleanRow<UmlDiagramGraph["properties"][number], "optional">,
     GraphIdentity
   >(`
     SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       property_ordinal AS propertyOrdinal,
+      definition_key AS definitionKey,
       name,
       type,
       optional
     FROM uml_properties
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal,
-      property_ordinal
+    ORDER BY entity_ordinal, property_ordinal
   `);
-  const selectUmlPropertyTypeIds = db.query<
-    UmlDiagramGraph["propertyTypeIds"][number],
-    GraphIdentity
-  >(`
+  const selectUmlMethods = db.query<UmlDiagramGraph["methods"][number], GraphIdentity>(`
     SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
-      entity_ordinal AS entityOrdinal,
-      property_ordinal AS propertyOrdinal,
-      type_id_ordinal AS typeIdOrdinal,
-      type_id AS typeId
-    FROM uml_property_type_ids
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal,
-      property_ordinal,
-      type_id_ordinal
-  `);
-  const selectUmlMethods = db.query<
-    SqlBooleanRow<UmlDiagramGraph["methods"][number], "returnTypeIdsPresent">,
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       method_ordinal AS methodOrdinal,
+      definition_key AS definitionKey,
       name,
-      return_type AS returnType,
-      return_type_ids_present AS returnTypeIdsPresent
+      return_type AS returnType
     FROM uml_methods
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal,
-      method_ordinal
-  `);
-  const selectUmlMethodReturnTypeIds = db.query<
-    UmlDiagramGraph["methodReturnTypeIds"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
-      entity_ordinal AS entityOrdinal,
-      method_ordinal AS methodOrdinal,
-      type_id_ordinal AS typeIdOrdinal,
-      type_id AS typeId
-    FROM uml_method_return_type_ids
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal,
-      method_ordinal,
-      type_id_ordinal
+    ORDER BY entity_ordinal, method_ordinal
   `);
   const selectUmlMemberModifiers = db.query<
     UmlDiagramGraph["memberModifiers"][number],
     GraphIdentity
   >(`
     SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       member_kind AS memberKind,
       member_ordinal AS memberOrdinal,
@@ -1929,95 +1078,20 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       modifier
     FROM uml_member_modifiers
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind
-        WHEN 'class' THEN 0 WHEN 'interface' THEN 1 WHEN 'enum' THEN 2 ELSE 3
-      END,
-      entity_ordinal,
+    ORDER BY entity_ordinal,
       CASE member_kind WHEN 'property' THEN 0 ELSE 1 END,
       member_ordinal,
       modifier_ordinal
   `);
   const selectUmlEnumItems = db.query<UmlDiagramGraph["enumItems"][number], GraphIdentity>(`
     SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
       entity_ordinal AS entityOrdinal,
       item_ordinal AS itemOrdinal,
+      definition_key AS definitionKey,
       value
     FROM uml_enum_items
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal, entity_ordinal, item_ordinal
-  `);
-  const selectUmlEntityHeritage = db.query<
-    UmlDiagramGraph["entityHeritageClauses"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      entity_kind AS entityKind,
-      entity_ordinal AS entityOrdinal,
-      clause_ordinal AS clauseOrdinal,
-      clause,
-      clause_type_id AS clauseTypeId,
-      class_name AS className,
-      class_type_id AS classTypeId,
-      relation
-    FROM uml_entity_heritage_clauses
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal,
-      CASE entity_kind WHEN 'class' THEN 0 WHEN 'interface' THEN 1 ELSE 2 END,
-      entity_ordinal,
-      clause_ordinal
-  `);
-  const selectUmlDeclarationHeritageGroups = db.query<
-    UmlDiagramGraph["declarationHeritageGroups"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      group_ordinal AS groupOrdinal,
-      entity_kind AS entityKind,
-      entity_ordinal AS entityOrdinal
-    FROM uml_declaration_heritage_groups
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal, group_ordinal
-  `);
-  const selectUmlDeclarationHeritageClauses = db.query<
-    UmlDiagramGraph["declarationHeritageClauses"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      group_ordinal AS groupOrdinal,
-      clause_ordinal AS clauseOrdinal,
-      clause,
-      clause_type_id AS clauseTypeId,
-      class_name AS className,
-      class_type_id AS classTypeId,
-      relation
-    FROM uml_declaration_heritage_clauses
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal, group_ordinal, clause_ordinal
-  `);
-  const selectUmlMemberAssociations = db.query<
-    SqlBooleanRow<UmlDiagramGraph["memberAssociations"][number], "inherited">,
-    GraphIdentity
-  >(`
-    SELECT
-      declaration_ordinal AS declarationOrdinal,
-      association_ordinal AS associationOrdinal,
-      a_type_id AS aTypeId,
-      a_name AS aName,
-      a_multiplicity AS aMultiplicity,
-      b_type_id AS bTypeId,
-      b_name AS bName,
-      b_multiplicity AS bMultiplicity,
-      association_type AS associationType,
-      inherited
-    FROM uml_member_associations
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY declaration_ordinal, association_ordinal
+    ORDER BY entity_ordinal, item_ordinal
   `);
   const selectUmlCategories = db.query<
     SqlBooleanRow<UmlDiagramGraph["categories"][number], "isTest">,
@@ -2025,151 +1099,31 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
   >(`
     SELECT
       category_ordinal AS categoryOrdinal,
-      entity_name AS entityName,
+      definition_key AS definitionKey,
       category,
       is_test AS isTest
     FROM uml_categories
     WHERE generation_id = ? AND kind = ? AND scope_path = ?
     ORDER BY category_ordinal
   `);
-  const selectUmlMethodReturnDependencies = db.query<
-    UmlDiagramGraph["methodReturnDependencies"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      dependency_ordinal AS dependencyOrdinal,
-      source_id AS sourceId,
-      source_name AS sourceName,
-      target_id AS targetId,
-      target_name AS targetName
-    FROM uml_method_return_dependencies
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY dependency_ordinal
-  `);
-  const selectUmlUsageEdges = db.query<
-    UmlDiagramGraph["usageEdges"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      dependency_ordinal AS dependencyOrdinal,
-      source_id AS sourceId,
-      source_name AS sourceName,
-      target_id AS targetId,
-      target_name AS targetName
-    FROM uml_usage_edges
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY dependency_ordinal
-  `);
-  const selectUmlLocalUsers = db.query<
-    UmlDiagramGraph["localUsers"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      user_ordinal AS userOrdinal,
-      node_id AS nodeId,
-      navigation_node_id AS navigationNodeId,
-      label,
-      path,
-      line,
-      column,
-      user_kind AS userKind,
-      owner_entity_id AS ownerEntityId
-    FROM uml_local_users
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY user_ordinal
-  `);
-  const selectUmlExternalUsers = db.query<
-    UmlDiagramGraph["externalUsers"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      user_ordinal AS userOrdinal,
-      node_id AS nodeId,
-      navigation_node_id AS navigationNodeId,
-      label,
-      user_scope_path AS scopePath,
-      user_kind AS userKind
-    FROM uml_external_users
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY user_ordinal
-  `);
-  const selectUmlLocalUserTargets = db.query<
-    UmlDiagramGraph["localUserTargets"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      user_ordinal AS userOrdinal,
-      target_ordinal AS targetOrdinal,
-      target_id AS targetId,
-      target_name AS targetName
-    FROM uml_local_user_targets
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY user_ordinal, target_ordinal
-  `);
-  const selectUmlExternalUserTargets = db.query<
-    UmlDiagramGraph["externalUserTargets"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      user_ordinal AS userOrdinal,
-      target_ordinal AS targetOrdinal,
-      target_id AS targetId,
-      target_name AS targetName
-    FROM uml_external_user_targets
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY user_ordinal, target_ordinal
-  `);
-  const selectUmlDefinitions = db.query<
-    UmlDiagramGraph["definitions"][number],
-    GraphIdentity
-  >(`
-    SELECT
-      definition_ordinal AS definitionOrdinal,
-      definition_key AS definitionKey,
-      definition_kind AS definitionKind,
-      name,
-      qualified_name AS qualifiedName,
-      source_path AS sourcePath,
-      source_line AS sourceLine,
-      source_column AS sourceColumn,
-      uml_scope_path AS umlScopePath,
-      uml_entity_name AS umlEntityName,
-      uml_member_name AS umlMemberName,
-      uml_member_occurrence AS umlMemberOccurrence
-    FROM uml_definitions
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-    ORDER BY definition_ordinal
-  `);
   const selectPackageRowsPresent = db.query<{ present: number }, GraphIdentity>(`
     WITH identity(generation_id, kind, scope_path) AS (VALUES (?, ?, ?))
     SELECT EXISTS(
-      SELECT 1
-      FROM package_graph_nodes AS rows
-      JOIN identity
+      SELECT 1 FROM package_graph_nodes AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind
-        AND identity.scope_path = rows.scope_path
+        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path
     ) AS present
   `);
   const selectUmlRowsPresent = db.query<{ present: number }, GraphIdentity>(`
     WITH identity(generation_id, kind, scope_path) AS (VALUES (?, ?, ?))
     SELECT (
-      EXISTS(SELECT 1 FROM uml_declarations AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_entities AS rows JOIN identity
+      EXISTS(SELECT 1 FROM uml_entities AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_properties AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_property_type_ids AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_methods AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_method_return_type_ids AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_member_modifiers AS rows JOIN identity
@@ -2178,40 +1132,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       OR EXISTS(SELECT 1 FROM uml_enum_items AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_entity_heritage_clauses AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_declaration_heritage_groups AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_declaration_heritage_clauses AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_member_associations AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
       OR EXISTS(SELECT 1 FROM uml_categories AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_method_return_dependencies AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_usage_edges AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_local_users AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_external_users AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_local_user_targets AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_external_user_targets AS rows JOIN identity
-        ON identity.generation_id = rows.generation_id
-        AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
-      OR EXISTS(SELECT 1 FROM uml_definitions AS rows JOIN identity
         ON identity.generation_id = rows.generation_id
         AND identity.kind = rows.kind AND identity.scope_path = rows.scope_path)
     ) AS present
@@ -2221,56 +1142,26 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
     deleteGraphHeader,
     insertGraphHeader,
     insertNode,
-    insertAlias,
     insertEdge,
     insertRelation,
     insertPackageNode,
-    insertUmlDeclaration,
     insertUmlEntity,
     insertUmlProperty,
-    insertUmlPropertyTypeId,
     insertUmlMethod,
-    insertUmlMethodReturnTypeId,
     insertUmlMemberModifier,
     insertUmlEnumItem,
-    insertUmlEntityHeritage,
-    insertUmlDeclarationHeritageGroup,
-    insertUmlDeclarationHeritageClause,
-    insertUmlMemberAssociation,
     insertUmlCategory,
-    insertUmlMethodReturnDependency,
-    insertUmlUsageEdge,
-    insertUmlLocalUser,
-    insertUmlExternalUser,
-    insertUmlLocalUserTarget,
-    insertUmlExternalUserTarget,
-    insertUmlDefinition,
     selectGraphHeader,
     selectNodes,
-    selectAliases,
     selectEdges,
     selectRelations,
     selectPackageNodes,
-    selectUmlDeclarations,
     selectUmlEntities,
     selectUmlProperties,
-    selectUmlPropertyTypeIds,
     selectUmlMethods,
-    selectUmlMethodReturnTypeIds,
     selectUmlMemberModifiers,
     selectUmlEnumItems,
-    selectUmlEntityHeritage,
-    selectUmlDeclarationHeritageGroups,
-    selectUmlDeclarationHeritageClauses,
-    selectUmlMemberAssociations,
     selectUmlCategories,
-    selectUmlMethodReturnDependencies,
-    selectUmlUsageEdges,
-    selectUmlLocalUsers,
-    selectUmlExternalUsers,
-    selectUmlLocalUserTargets,
-    selectUmlExternalUserTargets,
-    selectUmlDefinitions,
     selectPackageRowsPresent,
     selectUmlRowsPresent,
   ];
@@ -2284,17 +1175,7 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       const identity = [generationId, graph.kind, graph.scopePath] as const;
       insertGraphHeader.run(...identity, graph.formatVersion, graph.renderMode);
       for (const node of graph.nodes) {
-        insertNode.run(
-          ...identity,
-          node.nodeId,
-          node.nodeOrdinal,
-          node.nodeKind,
-          node.name,
-          node.community,
-        );
-      }
-      for (const alias of graph.aliases) {
-        insertAlias.run(...identity, alias.nodeId, alias.aliasOrdinal, alias.alias);
+        insertNode.run(...identity, node.nodeId, node.nodeOrdinal, node.nodeKind, node.name);
       }
       for (const edge of graph.edges) {
         insertEdge.run(
@@ -2330,78 +1211,39 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
         return;
       }
       const umlIdentity = [generationId, graph.kind, graph.scopePath] as const;
-      for (const declaration of graph.declarations) {
-        insertUmlDeclaration.run(
-          ...umlIdentity,
-          declaration.declarationOrdinal,
-          declaration.fileName,
-          declaration.language,
-          sqliteBoolean(
-            declaration.memberAssociationsPresent,
-            "UML member-associations presence flag",
-          ),
-        );
-      }
       for (const entity of graph.entities) {
         insertUmlEntity.run(
           ...umlIdentity,
-          entity.declarationOrdinal,
-          entity.entityKind,
           entity.entityOrdinal,
-          entity.nodeId,
+          entity.definitionKey,
+          entity.entityKind,
+          entity.name,
         );
       }
       for (const property of graph.properties) {
         insertUmlProperty.run(
           ...umlIdentity,
-          property.declarationOrdinal,
-          property.entityKind,
           property.entityOrdinal,
           property.propertyOrdinal,
+          property.definitionKey,
           property.name,
           property.type,
           sqliteBoolean(property.optional, "UML property optional flag"),
         );
       }
-      for (const typeId of graph.propertyTypeIds) {
-        insertUmlPropertyTypeId.run(
-          ...umlIdentity,
-          typeId.declarationOrdinal,
-          typeId.entityKind,
-          typeId.entityOrdinal,
-          typeId.propertyOrdinal,
-          typeId.typeIdOrdinal,
-          typeId.typeId,
-        );
-      }
       for (const method of graph.methods) {
         insertUmlMethod.run(
           ...umlIdentity,
-          method.declarationOrdinal,
-          method.entityKind,
           method.entityOrdinal,
           method.methodOrdinal,
+          method.definitionKey,
           method.name,
           method.returnType,
-          sqliteBoolean(method.returnTypeIdsPresent, "UML return-type-IDs presence flag"),
-        );
-      }
-      for (const typeId of graph.methodReturnTypeIds) {
-        insertUmlMethodReturnTypeId.run(
-          ...umlIdentity,
-          typeId.declarationOrdinal,
-          typeId.entityKind,
-          typeId.entityOrdinal,
-          typeId.methodOrdinal,
-          typeId.typeIdOrdinal,
-          typeId.typeId,
         );
       }
       for (const modifier of graph.memberModifiers) {
         insertUmlMemberModifier.run(
           ...umlIdentity,
-          modifier.declarationOrdinal,
-          modifier.entityKind,
           modifier.entityOrdinal,
           modifier.memberKind,
           modifier.memberOrdinal,
@@ -2412,151 +1254,19 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       for (const item of graph.enumItems) {
         insertUmlEnumItem.run(
           ...umlIdentity,
-          item.declarationOrdinal,
-          item.entityKind,
           item.entityOrdinal,
           item.itemOrdinal,
+          item.definitionKey,
           item.value,
-        );
-      }
-      for (const clause of graph.entityHeritageClauses) {
-        insertUmlEntityHeritage.run(
-          ...umlIdentity,
-          clause.declarationOrdinal,
-          clause.entityKind,
-          clause.entityOrdinal,
-          clause.clauseOrdinal,
-          clause.clause,
-          clause.clauseTypeId,
-          clause.className,
-          clause.classTypeId,
-          clause.relation,
-        );
-      }
-      for (const group of graph.declarationHeritageGroups) {
-        insertUmlDeclarationHeritageGroup.run(
-          ...umlIdentity,
-          group.declarationOrdinal,
-          group.groupOrdinal,
-          group.entityKind,
-          group.entityOrdinal,
-        );
-      }
-      for (const clause of graph.declarationHeritageClauses) {
-        insertUmlDeclarationHeritageClause.run(
-          ...umlIdentity,
-          clause.declarationOrdinal,
-          clause.groupOrdinal,
-          clause.clauseOrdinal,
-          clause.clause,
-          clause.clauseTypeId,
-          clause.className,
-          clause.classTypeId,
-          clause.relation,
-        );
-      }
-      for (const association of graph.memberAssociations) {
-        insertUmlMemberAssociation.run(
-          ...umlIdentity,
-          association.declarationOrdinal,
-          association.associationOrdinal,
-          association.aTypeId,
-          association.aName,
-          association.aMultiplicity,
-          association.bTypeId,
-          association.bName,
-          association.bMultiplicity,
-          association.associationType,
-          sqliteBoolean(association.inherited, "UML association inherited flag"),
         );
       }
       for (const category of graph.categories) {
         insertUmlCategory.run(
           ...umlIdentity,
           category.categoryOrdinal,
-          category.entityName,
+          category.definitionKey,
           category.category,
           sqliteBoolean(category.isTest, "UML category test flag"),
-        );
-      }
-      for (const dependency of graph.methodReturnDependencies) {
-        insertUmlMethodReturnDependency.run(
-          ...umlIdentity,
-          dependency.dependencyOrdinal,
-          dependency.sourceId,
-          dependency.sourceName,
-          dependency.targetId,
-          dependency.targetName,
-        );
-      }
-      for (const edge of graph.usageEdges) {
-        insertUmlUsageEdge.run(
-          ...umlIdentity,
-          edge.dependencyOrdinal,
-          edge.sourceId,
-          edge.sourceName,
-          edge.targetId,
-          edge.targetName,
-        );
-      }
-      for (const user of graph.localUsers) {
-        insertUmlLocalUser.run(
-          ...umlIdentity,
-          user.userOrdinal,
-          user.nodeId,
-          user.navigationNodeId,
-          user.label,
-          user.path,
-          user.line,
-          user.column,
-          user.userKind,
-          user.ownerEntityId,
-        );
-      }
-      for (const user of graph.externalUsers) {
-        insertUmlExternalUser.run(
-          ...umlIdentity,
-          user.userOrdinal,
-          user.nodeId,
-          user.navigationNodeId,
-          user.label,
-          user.scopePath,
-          user.userKind,
-        );
-      }
-      for (const target of graph.localUserTargets) {
-        insertUmlLocalUserTarget.run(
-          ...umlIdentity,
-          target.userOrdinal,
-          target.targetOrdinal,
-          target.targetId,
-          target.targetName,
-        );
-      }
-      for (const target of graph.externalUserTargets) {
-        insertUmlExternalUserTarget.run(
-          ...umlIdentity,
-          target.userOrdinal,
-          target.targetOrdinal,
-          target.targetId,
-          target.targetName,
-        );
-      }
-      for (const definition of graph.definitions) {
-        insertUmlDefinition.run(
-          ...umlIdentity,
-          definition.definitionOrdinal,
-          definition.definitionKey,
-          definition.definitionKind,
-          definition.name,
-          definition.qualifiedName,
-          definition.sourcePath,
-          definition.sourceLine,
-          definition.sourceColumn,
-          definition.umlScopePath,
-          definition.umlEntityName,
-          definition.umlMemberName,
-          definition.umlMemberOccurrence,
         );
       }
     },
@@ -2571,661 +1281,396 @@ function prepareGraphStore(db: Database): PreparedGraphStore {
       ) {
         throw invalidMaterialization("diagram graph contains cross-kind model rows");
       }
-      const nodes = selectNodes.all(...identity);
-      const aliases = selectAliases.all(...identity);
-      const edges = selectEdges.all(...identity).map((edge) => ({
-        ...edge,
-        directed: edge.directed !== 0,
-      }));
-      const relations = selectRelations.all(...identity);
       const base = {
         scopePath: header.scopePath,
         renderMode: header.renderMode,
-        nodes,
-        aliases,
-        edges,
-        relations,
+        formatVersion: header.formatVersion as typeof DIAGRAM_GRAPH_FORMAT_VERSION,
+        nodes: selectNodes.all(...identity),
+        edges: selectEdges.all(...identity).map((edge) => ({
+          ...edge,
+          directed: edge.directed !== 0,
+        })),
+        relations: selectRelations.all(...identity),
       };
       if (header.kind === "packages") {
-        return {
-          ...base,
-          kind: "packages",
-          formatVersion: header.formatVersion as typeof DIAGRAM_GRAPH_FORMAT_VERSION,
-          packageNodes: selectPackageNodes.all(...identity),
-        };
+        return { ...base, kind: "packages", packageNodes: selectPackageNodes.all(...identity) };
       }
       return {
         ...base,
         kind: "uml",
-        formatVersion: header.formatVersion as typeof DIAGRAM_GRAPH_FORMAT_VERSION,
-        declarations: selectUmlDeclarations.all(...identity).map((row) => ({
-          ...row,
-          memberAssociationsPresent: row.memberAssociationsPresent !== 0,
-        })),
         entities: selectUmlEntities.all(...identity),
         properties: selectUmlProperties.all(...identity).map((row) => ({
           ...row,
           optional: row.optional !== 0,
         })),
-        propertyTypeIds: selectUmlPropertyTypeIds.all(...identity),
-        methods: selectUmlMethods.all(...identity).map((row) => ({
-          ...row,
-          returnTypeIdsPresent: row.returnTypeIdsPresent !== 0,
-        })),
-        methodReturnTypeIds: selectUmlMethodReturnTypeIds.all(...identity),
+        methods: selectUmlMethods.all(...identity),
         memberModifiers: selectUmlMemberModifiers.all(...identity),
         enumItems: selectUmlEnumItems.all(...identity),
-        entityHeritageClauses: selectUmlEntityHeritage.all(...identity),
-        declarationHeritageGroups: selectUmlDeclarationHeritageGroups.all(...identity),
-        declarationHeritageClauses: selectUmlDeclarationHeritageClauses.all(...identity),
-        memberAssociations: selectUmlMemberAssociations.all(...identity).map((row) => ({
-          ...row,
-          inherited: row.inherited !== 0,
-        })),
         categories: selectUmlCategories.all(...identity).map((row) => ({
           ...row,
           isTest: row.isTest !== 0,
         })),
-        methodReturnDependencies: selectUmlMethodReturnDependencies.all(...identity),
-        usageEdges: selectUmlUsageEdges.all(...identity),
-        localUsers: selectUmlLocalUsers.all(...identity),
-        externalUsers: selectUmlExternalUsers.all(...identity),
-        localUserTargets: selectUmlLocalUserTargets.all(...identity),
-        externalUserTargets: selectUmlExternalUserTargets.all(...identity),
-        definitions: selectUmlDefinitions.all(...identity),
       };
     },
   };
 }
 
-function invalidMaterialization(message: string, cause?: unknown): DiagramMaterializationError {
-  return new DiagramMaterializationError(message, cause === undefined ? undefined : { cause });
+function assertPackageGraphIdentity(graph: PackageDiagramGraph): void {
+  if (
+    graph.kind !== "packages"
+    || graph.scopePath !== ""
+    || graph.formatVersion !== DIAGRAM_GRAPH_FORMAT_VERSION
+    || (graph.renderMode !== "normal" && graph.renderMode !== "bare")
+    || !Array.isArray(graph.nodes)
+    || !Array.isArray(graph.edges)
+    || !Array.isArray(graph.relations)
+    || !Array.isArray(graph.packageNodes)
+  ) {
+    throw invalidMaterialization("invalid package diagram graph identity");
+  }
 }
 
-function assertGraphIdentity(
-  graph: DiagramGraph,
-  kind: DiagramKind,
-  scopePath: string,
-): void {
+function assertUmlGraphIdentity(graph: UmlDiagramGraph, scopePath: string): void {
   if (
-    (graph.kind !== "packages" && graph.kind !== "uml")
-    || graph.kind !== kind
+    graph.kind !== "uml"
     || typeof graph.scopePath !== "string"
     || graph.scopePath !== scopePath
     || normalizeRelativePath(graph.scopePath) !== graph.scopePath
     || graph.formatVersion !== DIAGRAM_GRAPH_FORMAT_VERSION
-    || (graph.renderMode !== "normal" && graph.renderMode !== "bare")
   ) {
-    throw invalidMaterialization("invalid diagram graph identity");
-  }
-  if (kind === "packages" && scopePath !== "") {
-    throw invalidMaterialization("package diagram graph scope must be empty");
-  }
-  const candidate = graph as unknown as Record<string, unknown>;
-  const arrayFields = graph.kind === "packages"
-    ? ["nodes", "aliases", "edges", "relations", "packageNodes"]
-    : [
-      "nodes",
-      "aliases",
-      "edges",
-      "relations",
-      "declarations",
-      "entities",
-      "properties",
-      "propertyTypeIds",
-      "methods",
-      "methodReturnTypeIds",
-      "memberModifiers",
-      "enumItems",
-      "entityHeritageClauses",
-      "declarationHeritageGroups",
-      "declarationHeritageClauses",
-      "memberAssociations",
-      "categories",
-      "methodReturnDependencies",
-      "usageEdges",
-      "localUsers",
-      "externalUsers",
-      "localUserTargets",
-      "externalUserTargets",
-      "definitions",
-    ];
-  if (
-    (graph.kind === "packages" && (
-      "declarations" in candidate
-      || "entities" in candidate
-      || "properties" in candidate
-      || "propertyTypeIds" in candidate
-      || "methods" in candidate
-      || "methodReturnTypeIds" in candidate
-      || "memberModifiers" in candidate
-      || "enumItems" in candidate
-      || "entityHeritageClauses" in candidate
-      || "declarationHeritageGroups" in candidate
-      || "declarationHeritageClauses" in candidate
-      || "memberAssociations" in candidate
-      || "categories" in candidate
-      || "methodReturnDependencies" in candidate
-      || "usageEdges" in candidate
-      || "localUsers" in candidate
-      || "externalUsers" in candidate
-      || "localUserTargets" in candidate
-      || "externalUserTargets" in candidate
-      || "definitions" in candidate
-    ))
-    || (graph.kind === "uml" && "packageNodes" in candidate)
-  ) {
-    throw invalidMaterialization("diagram graph contains cross-kind model rows");
-  }
-  if (arrayFields.some((field) => !Array.isArray(candidate[field]))) {
-    throw invalidMaterialization("invalid diagram graph row collections");
+    throw invalidMaterialization("invalid UML diagram graph identity");
   }
 }
 
-
-function validateUmlGraph(graph: UmlDiagramGraph): void {
-  validateUmlDiagramGraph(graph);
-
-  const navigationIds = new Set(graph.localUsers.map(({ navigationNodeId }) => navigationNodeId));
-  for (const user of graph.externalUsers) {
-    if (navigationIds.has(user.navigationNodeId)) {
-      throw new Error(`Invalid UML external user: ${user.nodeId}`);
-    }
-    navigationIds.add(user.navigationNodeId);
-    if (normalizeRelativePath(user.scopePath) !== user.scopePath) {
-      throw new Error(`UML external user scope is not normalized: ${user.scopePath}`);
-    }
-  }
-}
-
-function validateLoadedGraph(graph: DiagramGraph): void {
-  assertGraphIdentity(graph, graph.kind, graph.scopePath);
-  if (graph.kind === "packages") validatePackageDiagramGraph(graph);
-  else validateUmlGraph(graph);
-}
-
-function validateRenderedDiagram(value: RenderedDiagram): RenderedDiagram {
+function validateRenderedPackageDiagram(value: RenderedPackageDiagram): RenderedPackageDiagram {
   if (
     !value
     || typeof value !== "object"
+    || value.kind !== "packages"
+    || typeof value.dsl !== "string"
+    || !Array.isArray(value.dsls)
+    || value.dsls.some((dsl) => typeof dsl !== "string")
     || !Array.isArray(value.packageNodes)
-    || !Array.isArray(value.definitions)
-    || !Array.isArray(value.externalUsers)
-    || !Array.isArray(value.localUsers)
-  ) {
-    throw new Error("renderer returned an invalid diagram");
-  }
-  if (value.kind === "packages") {
-    if (
-      typeof value.dsl !== "string"
-      || !Array.isArray(value.dsls)
-      || value.dsls.some((dsl) => typeof dsl !== "string")
-    ) {
-      throw new Error("renderer returned an invalid diagram");
-    }
-    return value;
-  }
-  if (value.kind !== "uml") throw new Error("renderer returned an invalid diagram");
-  const view = value.view as Record<string, unknown> | null | undefined;
-  if (
-    !view
-    || typeof view !== "object"
-    || !Array.isArray(view.declarations)
-    || !Array.isArray(view.frames)
-    || !Array.isArray(view.testEntityIds)
-    || !Array.isArray(view.categories)
-    || !Array.isArray(view.methodReturnDependencies)
-    || !Array.isArray(view.usageEdges)
-    || !Array.isArray(view.localUsers)
-    || !Array.isArray(view.externalUsers)
   ) {
     throw new Error("renderer returned an invalid diagram");
   }
   return value;
 }
 
+/** Literal directory-membership predicate; percent, underscore and glob characters are inert. */
+function directoryRange(path: string): { from: string; to: string } | null {
+  if (!path) return null;
+  return { from: `${path}/`, to: `${path}0` };
+}
 
 export class Cache {
-private static createSchema(
-  db: Database,
-  selectedObjects?: ReadonlySet<CacheSchemaObjectName>,
-): void {
-  for (const definition of CACHE_SCHEMA_OBJECTS) {
-    if (!selectedObjects || selectedObjects.has(definition.name)) db.run(definition.createSql);
+  private static createSchema(
+    db: Database,
+    selectedObjects?: ReadonlySet<CacheSchemaObjectName>,
+  ): void {
+    for (const definition of CACHE_SCHEMA_OBJECTS) {
+      if (!selectedObjects || selectedObjects.has(definition.name)) db.run(definition.createSql);
+    }
   }
-}
 
-private static recreateSchema(db: Database): void {
-  for (let index = CACHE_SCHEMA_OBJECTS.length - 1; index >= 0; index -= 1) {
-    const definition = CACHE_SCHEMA_OBJECTS[index];
-    const objectKind = definition.kind === "trigger" ? "TRIGGER" : "TABLE";
-    db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
+  private static recreateSchema(db: Database): void {
+    // Descriptors no longer list the version-8 UML tables, so they are dropped by name first.
+    for (const name of REMOVED_CACHE_TABLES) db.run(`DROP TABLE IF EXISTS "${name}"`);
+    for (let index = CACHE_SCHEMA_OBJECTS.length - 1; index >= 0; index -= 1) {
+      const definition = CACHE_SCHEMA_OBJECTS[index];
+      if (!definition) continue;
+      const objectKind = definition.kind === "trigger"
+        ? "TRIGGER"
+        : definition.kind === "index"
+          ? "INDEX"
+          : "TABLE";
+      db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
+    }
+    Cache.createSchema(db);
+    db.run(`PRAGMA user_version=${CACHE_SCHEMA_VERSION}`);
   }
-  Cache.createSchema(db);
-  db.run(`PRAGMA user_version=${CACHE_SCHEMA_VERSION}`);
-}
 
+  private readonly db!: Database;
+  private readonly graphStore!: PreparedGraphStore;
+  private readonly statements!: Array<{ finalize(): void }>;
+  private readonly query!: CacheQueries;
+  private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
+  private readonly discoveryTransaction!: ImmediateTransaction<
+    [number, readonly PackageInfo[], CachePackageDiagramInput, PackageDiagramRenderer],
+    PackageDiagramPayload
+  >;
+  private readonly scopeTransaction!: ImmediateTransaction<[number, CacheScopeWrite]>;
+  private readonly definitionIndexTransaction!: ImmediateTransaction<
+    [number, DefinitionIndexSnapshot]
+  >;
+  private readonly sourceSnapshotTransaction!: ImmediateTransaction<
+    [number, readonly CacheFileWrite[]]
+  >;
+  private readonly promotionTransaction!: ImmediateTransaction<[number]>;
+  private closed = false;
 
-private readonly db!: Database;
-private readonly graphStore!: PreparedGraphStore;
-private readonly cacheStatements!: CacheStatements;
-private readonly statements!: Array<{ finalize(): void }>;
-private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
-private readonly discoveryTransaction!: ImmediateTransaction<
-  [number, readonly PackageInfo[], CacheDiagramInput, DiagramRenderer],
-  DiagramPayload
->;
-private readonly scopeTransaction!: ImmediateTransaction<
-  [number, CacheScopeWrite, DiagramRenderer],
-  DiagramPayload
->;
-private readonly definitionIndexTransaction!: ImmediateTransaction<
-  [number, readonly DefinitionIndexWrite[]]
->;
-private readonly promotionTransaction!: ImmediateTransaction<[number]>;
-private closed = false;
+  constructor(dbPath: string) {
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new Database(dbPath, { create: true, strict: true });
+    this.db = db;
 
-constructor(dbPath: string) {
-  mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath, { create: true, strict: true });
-  this.db = db;
-
-  try {
-    const journalStatement = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=WAL");
     try {
-      journalStatement.get();
-    } finally {
-      journalStatement.finalize();
+      const journalStatement = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=WAL");
+      try {
+        journalStatement.get();
+      } finally {
+        journalStatement.finalize();
+      }
+      db.run("PRAGMA synchronous=NORMAL");
+      db.run("PRAGMA foreign_keys=ON");
+      db.run("PRAGMA busy_timeout=5000");
+
+      const versionStatement = db.query<{ user_version: number }, []>("PRAGMA user_version");
+      let version: number | undefined;
+      try {
+        version = versionStatement.get()?.user_version;
+      } finally {
+        versionStatement.finalize();
+      }
+      if (version !== CACHE_SCHEMA_VERSION) {
+        db.transaction(() => Cache.recreateSchema(db)).immediate();
+      }
+
+      const schemaStatement = db.query<SchemaObjectRow, []>(`
+        SELECT name FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+      `);
+      let schemaObjects: SchemaObjectRow[];
+      try {
+        schemaObjects = schemaStatement.all();
+      } finally {
+        schemaStatement.finalize();
+      }
+      const presentObjects = new Set(schemaObjects.map(({ name }) => name));
+      const missingObjects = CACHE_SCHEMA_OBJECTS
+        .map(({ name }) => name)
+        .filter((name) => !presentObjects.has(name));
+      if (missingObjects.length) {
+        throw new Error(`cache schema is incomplete: missing ${missingObjects.join(", ")}`);
+      }
+
+      this.query = prepareQueries(db);
+      this.graphStore = prepareGraphStore(db);
+      this.statements = [...Object.values(this.query), ...this.graphStore.statements];
+
+      this.recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
+        if (activeGenerationId === null) {
+          this.query.deleteActivePointer.run();
+          this.query.deleteAllGenerations.run();
+          return;
+        }
+        this.query.deleteGenerationsExcept.run(activeGenerationId);
+      });
+
+      this.discoveryTransaction = db.transaction((
+        generationId: number,
+        packages: readonly PackageInfo[],
+        diagram: CachePackageDiagramInput,
+        renderer: PackageDiagramRenderer,
+      ) => {
+        const response = this.materializePackageDiagram(generationId, diagram, renderer);
+        this.query.upsertPackages.run(generationId, JSON.stringify(packages));
+        return response;
+      });
+
+      this.scopeTransaction = db.transaction((generationId: number, scope: CacheScopeWrite) => {
+        if (scope.file) {
+          this.writeFileRow(generationId, scope.file);
+          this.query.deleteScopeGotoDefs.run(generationId, scope.file.path);
+          for (const definition of scope.definitions) {
+            this.query.insertGotoDefinition.run(
+              generationId,
+              definition.key,
+              definition.kind,
+              definition.name,
+              definition.qualifiedName,
+              definition.source.path,
+              definition.source.line,
+              definition.source.column,
+              definition.displayFrom,
+              definition.displayTo,
+              definition.uml.scopePath,
+              definition.uml.entityName,
+              definition.uml.memberName ?? null,
+              definition.uml.memberOccurrence ?? null,
+            );
+          }
+        }
+        if (!scope.diagram) return;
+        const { graph, outcome } = scope.diagram;
+        assertUmlGraphIdentity(graph, graph.scopePath);
+        if (outcome.status === "error" && graph.renderMode !== "bare") {
+          throw invalidMaterialization("an error outcome requires a bare direct graph");
+        }
+        validateUmlDiagramGraph(graph);
+        this.assertCatalogueIdentity(generationId, graph);
+        this.graphStore.deleteGraph(generationId, "uml", graph.scopePath);
+        this.graphStore.insertGraph(generationId, graph);
+        const reloaded = this.graphStore.readGraph(generationId, "uml", graph.scopePath);
+        if (reloaded?.kind !== "uml") {
+          throw invalidMaterialization("persisted diagram graph header was not found");
+        }
+        try {
+          validateUmlDiagramGraph(reloaded);
+        } catch (error) {
+          throw invalidMaterialization("invalid hydrated diagram graph", error);
+        }
+        this.query.upsertDiagram.run(
+          generationId,
+          "uml",
+          graph.scopePath,
+          JSON.stringify(outcome),
+        );
+      });
+
+      this.definitionIndexTransaction = db.transaction((
+        generationId: number,
+        snapshot: DefinitionIndexSnapshot,
+      ) => {
+        this.query.deleteGenerationContributors.run(generationId);
+        this.query.deleteGenerationBindings.run(generationId);
+        this.query.deleteGenerationImports.run(generationId);
+        this.query.deleteGenerationDefinitionIndex.run(generationId);
+        for (const entry of snapshot.entries) {
+          this.query.upsertTreeEntry.run(
+            generationId,
+            entry.path,
+            parentPath(entry.path),
+            entry.name,
+            entry.kind,
+            entry.viewable === true ? 1 : 0,
+          );
+        }
+        for (const definition of snapshot.definitions) {
+          this.query.insertDefinitionIndex.run(
+            generationId,
+            definition.key,
+            definition.parentKey,
+            definition.isTopLevel ? 1 : 0,
+            definition.hasBody ? 1 : 0,
+            definition.source.path,
+            definition.name,
+            definition.qualifiedName,
+            definition.kind,
+            definition.type,
+            definition.source.line,
+            definition.source.column,
+          );
+        }
+        for (const binding of snapshot.bindings) {
+          this.query.insertDefinitionBinding.run(
+            generationId,
+            binding.sourcePath,
+            binding.scopeKey,
+            binding.name,
+            binding.space,
+            binding.bindingKind,
+            binding.ordinal,
+            binding.target.kind === "definition" ? binding.target.key : null,
+            binding.target.kind === "module" ? binding.target.path : null,
+          );
+        }
+        for (const contributor of snapshot.contributors) {
+          this.query.insertDefinitionContributor.run(
+            generationId,
+            contributor.definitionKey,
+            contributor.sourcePath,
+            contributor.kind,
+          );
+        }
+        for (const edge of snapshot.imports) {
+          this.query.insertFileImport.run(generationId, edge.sourcePath, edge.targetPath);
+        }
+      });
+
+      this.sourceSnapshotTransaction = db.transaction((
+        generationId: number,
+        files: readonly CacheFileWrite[],
+      ) => {
+        for (const file of files) this.writeFileRow(generationId, file);
+      });
+
+      this.promotionTransaction = db.transaction((generationId: number) => {
+        const result = this.query.markGenerationActive.run(Date.now(), generationId);
+        if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
+        this.query.upsertActivePointer.run(String(generationId));
+      });
+    } catch (error) {
+      try {
+        db.close(true);
+      } catch {
+        db.close();
+      }
+      throw error;
     }
-    db.run("PRAGMA synchronous=NORMAL");
-    db.run("PRAGMA foreign_keys=ON");
-    db.run("PRAGMA busy_timeout=5000");
+  }
 
-    const versionStatement = db.query<{ user_version: number }, []>("PRAGMA user_version");
-    let version: number | undefined;
-    try {
-      version = versionStatement.get()?.user_version;
-    } finally {
-      versionStatement.finalize();
-    }
-    if (version !== CACHE_SCHEMA_VERSION) db.transaction(() => Cache.recreateSchema(db)).immediate();
-
-    const schemaStatement = db.query<SchemaObjectRow, []>(`
-      SELECT name FROM sqlite_schema
-      WHERE name NOT LIKE 'sqlite_%'
-    `);
-    let schemaObjects: SchemaObjectRow[];
-    try {
-      schemaObjects = schemaStatement.all();
-    } finally {
-      schemaStatement.finalize();
-    }
-    const presentObjects = new Set(schemaObjects.map(({ name }) => name));
-    const missingObjects = CACHE_SCHEMA_OBJECTS
-      .map(({ name }) => name)
-      .filter((name) => !presentObjects.has(name));
-    if (missingObjects.length) {
-      throw new Error(`cache schema is incomplete: missing ${missingObjects.join(", ")}`);
-    }
-
-  const selectActiveGeneration = db.query<ActiveGenerationRow, []>(`
-    SELECT generations.id AS id, generations.source_fingerprint AS source_fingerprint
-    FROM cache_meta
-    JOIN generations
-      ON generations.id = CAST(cache_meta.value AS INTEGER)
-      AND generations.state = 'active'
-    WHERE cache_meta.key = 'active_generation'
-  `);
-  const deleteActivePointer = db.query<never, []>(`
-    DELETE FROM cache_meta WHERE key = 'active_generation'
-  `);
-  const deleteGenerationsExcept = db.query<never, [number]>(`
-    DELETE FROM generations WHERE id <> ?
-  `);
-  const deleteAllGenerations = db.query<never, []>("DELETE FROM generations");
-  const insertGeneration = db.query<never, ["startup" | "watch", number, string]>(`
-    INSERT INTO generations(state, cause, started_at, source_fingerprint)
-    VALUES ('building', ?, ?, ?)
-  `);
-  const upsertPackages = db.query<never, [number, string]>(`
-    INSERT INTO package_snapshots(generation_id, packages_json)
-    VALUES (?, ?)
-    ON CONFLICT(generation_id) DO UPDATE SET packages_json = excluded.packages_json
-  `);
-  const upsertTreeEntry = db.query<never, [number, string, string, string, "directory" | "file", number]>(`
-    INSERT INTO tree_entries(generation_id, path, parent_path, name, kind, viewable)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(generation_id, path) DO UPDATE SET
-      parent_path = excluded.parent_path,
-      name = excluded.name,
-      kind = excluded.kind,
-      viewable = excluded.viewable
-  `);
-  const upsertDiagram = db.query<never, [number, DiagramKind, string, string]>(`
-    INSERT INTO diagrams(generation_id, kind, scope_path, response_json)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(generation_id, kind, scope_path) DO UPDATE SET
-      response_json = excluded.response_json
-  `);
-  const upsertFile = db.query<
-    never,
-    [
-      number,
-      string,
-      string | null,
-      string | null,
-      string | null,
-      string | null,
-      LanguageId | null,
-    ]
-  >(`
-    INSERT INTO files(
-      generation_id,
-      path,
-      raw_content,
-      display_content,
-      source_error,
-      format_error,
-      language
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(generation_id, path) DO UPDATE SET
-      raw_content = excluded.raw_content,
-      display_content = excluded.display_content,
-      source_error = excluded.source_error,
-      format_error = excluded.format_error,
-      language = excluded.language
-  `);
-  const deleteScopeGotoDefs = db.query<never, [number, string]>(`
-    DELETE FROM GotoDef WHERE generation_id = ? AND source_path = ?
-  `);
-  const insertGotoDefinition = db.query<never, [
-    number,
-    string,
-    GotoDefinitionKind,
-    string,
-    string,
-    string,
-    number,
-    number,
-    number,
-    number,
-    string,
-    string,
-    string | null,
-    number | null,
-  ]>(`
-    INSERT INTO GotoDef(
-      generation_id,
-      definition_key,
-      kind,
-      name,
-      qualified_name,
-      source_path,
-      source_line,
-      source_column,
-      display_from,
-      display_to,
-      uml_scope_path,
-      uml_entity_name,
-      uml_member_name,
-      uml_member_occurrence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const deleteGenerationDefinitionIndex = db.query<never, [number]>(`
-    DELETE FROM DefinitionIndex WHERE generation_id = ?
-  `);
-  const insertDefinitionIndex = db.query<never, [
-    number,
-    string,
-    string,
-    string,
-    GotoDefinitionKind,
-    number,
-    number,
-  ]>(`
-    INSERT INTO DefinitionIndex(
-      generation_id,
-      source_path,
-      name,
-      qualified_name,
-      kind,
-      source_line,
-      source_column
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const selectDefinitionIndexEntry = db.query<DefinitionIndexRow, [string, string, string]>(`
-    SELECT source_path, source_line, source_column
-    FROM DefinitionIndex
-    WHERE generation_id = (SELECT MAX(generation_id) FROM DefinitionIndex)
-      AND source_path = ?
-      AND name = ?
-      AND qualified_name = ?
-    ORDER BY source_line, source_column
-    LIMIT 1
-  `);
-  const selectTreeEntries = db.query<TreeRow, [number]>(`
-    SELECT path, name, kind, viewable
-    FROM tree_entries
-    WHERE generation_id = ?
-    ORDER BY path
-  `);
-  const selectPackages = db.query<PackageRow, [number]>(`
-    SELECT packages_json
-    FROM package_snapshots
-    WHERE generation_id = ?
-  `);
-  const selectDiagram = db.query<DiagramRow, [number, DiagramKind, string]>(`
-    SELECT response_json
-    FROM diagrams
-    WHERE generation_id = ? AND kind = ? AND scope_path = ?
-  `);
-  const selectFailedDiagram = db.query<{ scope_path: string }, [number]>(`
-    SELECT scope_path
-    FROM diagrams
-    WHERE generation_id = ?
-      AND json_extract(response_json, '$.status') = 'error'
-    LIMIT 1
-  `);
-  const selectFile = db.query<FileRow, [number, string]>(`
-    SELECT path, raw_content, display_content, source_error, format_error, language
-    FROM files
-    WHERE generation_id = ? AND path = ?
-  `);
-  const selectDefinition = db.query<GotoDefinitionRow, [number, string, number, number]>(`
-    SELECT
-      definition_key,
-      kind,
-      name,
-      qualified_name,
-      source_path,
-      source_line,
-      source_column,
-      display_from,
-      display_to,
-      uml_scope_path,
-      uml_entity_name,
-      uml_member_name,
-      uml_member_occurrence
-    FROM GotoDef
-    WHERE generation_id = ?
-      AND source_path = ?
-      AND source_line = ?
-      AND source_column = ?
-    ORDER BY definition_key
-    LIMIT 1
-  `);
-  const selectDefinitions = db.query<GotoDefinitionRow, [number, string]>(`
-    SELECT
-      definition_key,
-      kind,
-      name,
-      qualified_name,
-      source_path,
-      source_line,
-      source_column,
-      display_from,
-      display_to,
-      uml_scope_path,
-      uml_entity_name,
-      uml_member_name,
-      uml_member_occurrence
-    FROM GotoDef
-    WHERE generation_id = ? AND source_path = ?
-    ORDER BY source_line, source_column, definition_key
-  `);
-  const selectIndexedSearchCandidates = db.query<SearchCandidateRow, [number, string]>(`
-    SELECT files.path AS path, files.raw_content AS raw_content
-    FROM file_search
-    JOIN files ON file_search.rowid = files.id
-    WHERE files.generation_id = ? AND file_search.raw_content LIKE ?
-  `);
-  const selectScanSearchCandidates = db.query<SearchCandidateRow, [number]>(`
-    SELECT path, raw_content
-    FROM files
-    WHERE generation_id = ? AND raw_content IS NOT NULL
-  `);
-  const selectIndexedDefinitionCandidates = db.query<GotoDefinitionRow, [number, string, string]>(`
-    SELECT
-      GotoDef.definition_key,
-      GotoDef.kind,
-      GotoDef.name,
-      GotoDef.qualified_name,
-      GotoDef.source_path,
-      GotoDef.source_line,
-      GotoDef.source_column,
-      GotoDef.display_from,
-      GotoDef.display_to,
-      GotoDef.uml_scope_path,
-      GotoDef.uml_entity_name,
-      GotoDef.uml_member_name,
-      GotoDef.uml_member_occurrence
-    FROM goto_def_search
-    JOIN GotoDef ON goto_def_search.rowid = GotoDef.id
-    WHERE GotoDef.generation_id = ?
-      AND (
-        goto_def_search.name LIKE ?
-        OR goto_def_search.qualified_name LIKE ?
-      )
-  `);
-  const selectScanDefinitionCandidates = db.query<GotoDefinitionRow, [number]>(`
-    SELECT
-      definition_key,
-      kind,
-      name,
-      qualified_name,
-      source_path,
-      source_line,
-      source_column,
-      display_from,
-      display_to,
-      uml_scope_path,
-      uml_entity_name,
-      uml_member_name,
-      uml_member_occurrence
-    FROM GotoDef
-    WHERE generation_id = ?
-  `);
-  const markGenerationActive = db.query<never, [number, number]>(`
-    UPDATE generations
-    SET state = 'active', completed_at = ?
-    WHERE id = ? AND state IN ('building', 'active')
-  `);
-  const upsertActivePointer = db.query<never, [string]>(`
-    INSERT INTO cache_meta(key, value)
-    VALUES ('active_generation', ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `);
-  const deleteInactiveGeneration = db.query<never, [number]>(`
-    DELETE FROM generations WHERE id = ? AND state <> 'active'
-  `);
-  const markGenerationFailed = db.query<never, [number, number]>(`
-    UPDATE generations
-    SET state = 'failed', completed_at = ?
-    WHERE id = ? AND state = 'building'
-  `);
-  const optimizeSearch = db.query<never, []>(`
-    INSERT INTO file_search(file_search) VALUES ('optimize')
-  `);
-  const optimizeGotoDefinitionSearch = db.query<never, []>(`
-    INSERT INTO goto_def_search(goto_def_search) VALUES ('optimize')
-  `);
-  const graphStore = prepareGraphStore(db);
-
-  this.cacheStatements = {
-    selectActiveGeneration,
-    deleteActivePointer,
-    deleteGenerationsExcept,
-    deleteAllGenerations,
-    insertGeneration,
-    upsertPackages,
-    upsertTreeEntry,
-    upsertDiagram,
-    upsertFile,
-    deleteScopeGotoDefs,
-    insertGotoDefinition,
-    selectTreeEntries,
-    selectPackages,
-    selectDiagram,
-    selectFailedDiagram,
-    selectFile,
-    selectDefinition,
-    selectDefinitions,
-    selectIndexedSearchCandidates,
-    selectScanSearchCandidates,
-    selectIndexedDefinitionCandidates,
-    selectScanDefinitionCandidates,
-    markGenerationActive,
-    upsertActivePointer,
-    deleteInactiveGeneration,
-    markGenerationFailed,
-    optimizeSearch,
-    optimizeGotoDefinitionSearch,
-    deleteGenerationDefinitionIndex,
-    insertDefinitionIndex,
-    selectDefinitionIndexEntry,
-  };
-  this.graphStore = graphStore;
-  this.statements = Object.values(this.cacheStatements);
-  this.statements.push(...graphStore.statements);
-
-
-  this.recoveryTransaction = db.transaction((activeGenerationId: number | null) => {
-    if (activeGenerationId === null) {
-      this.cacheStatements.deleteActivePointer.run();
-      this.cacheStatements.deleteAllGenerations.run();
+  /** Writes raw source without rebuilding the FTS entry when the bytes did not change. */
+  private writeFileRow(generationId: number, file: CacheFileWrite): void {
+    const existing = this.query.selectFileRaw.get(generationId, file.path);
+    if (existing && existing.raw_content === file.rawContent) {
+      this.query.updateFileDisplay.run(
+        file.displayContent,
+        file.sourceError,
+        file.formatError,
+        file.language,
+        generationId,
+        file.path,
+      );
       return;
     }
-    this.cacheStatements.deleteGenerationsExcept.run(activeGenerationId);
-  });
-  const materializeDiagram = (
+    this.query.upsertFile.run(
+      generationId,
+      file.path,
+      file.rawContent,
+      file.displayContent,
+      file.sourceError,
+      file.formatError,
+      file.language,
+    );
+  }
+
+  /** Every UML node ID must name a catalogue definition of this generation. */
+  private assertCatalogueIdentity(generationId: number, graph: UmlDiagramGraph): void {
+    for (const node of graph.nodes) {
+      if (!this.query.selectDefinitionByKey.get(generationId, node.nodeId)) {
+        throw invalidMaterialization(`UML node is not an indexed definition: ${node.nodeId}`);
+      }
+    }
+    if (graph.renderMode === "bare") return;
+    const contributed = new Set(
+      this.query.selectContributedKeys.all(generationId, graph.scopePath).map((row) => row.definition_key),
+    );
+    for (const entity of graph.entities) {
+      if (!contributed.has(entity.definitionKey)) {
+        throw invalidMaterialization(
+          `UML entity has no contribution in ${graph.scopePath}: ${entity.definitionKey}`,
+        );
+      }
+    }
+  }
+
+  private materializePackageDiagram(
     generationId: number,
-    input: CacheDiagramInput,
-    renderer: DiagramRenderer,
-    expectedKind?: DiagramKind,
-    expectedScopePath?: string,
-  ): DiagramPayload => {
-    let graph: DiagramGraph | null = null;
-    let kind: DiagramKind;
-    let scopePath: string;
-    let fallbackSource:
-      | Extract<CacheDiagramInput, { fallbackSource: unknown }>["fallbackSource"]
-      | null = null;
-    let fallbackRendered: RenderedDiagram | null = null;
+    input: CachePackageDiagramInput,
+    renderer: PackageDiagramRenderer,
+  ): PackageDiagramPayload {
+    let graph: PackageDiagramGraph | null = null;
+    let fallbackRendered: RenderedPackageDiagram | null = null;
     try {
       if (!input || typeof input !== "object" || !("outcome" in input)) {
         throw new Error("missing diagram input");
       }
       if (
-        (input.outcome.status === "ready"
-          && "error" in input.outcome
+        (input.outcome.status === "ready" && "error" in input.outcome
           && input.outcome.error !== undefined)
-        || (
-          input.outcome.status !== "ready"
-          && (
-            input.outcome.status !== "error"
-            || typeof input.outcome.error !== "string"
-          )
-        )
+        || (input.outcome.status !== "ready"
+          && (input.outcome.status !== "error" || typeof input.outcome.error !== "string"))
       ) {
         throw new Error("invalid diagram outcome");
       }
@@ -3235,477 +1680,1248 @@ constructor(dbPath: string) {
       if ("graph" in input) {
         graph = input.graph;
         if (!graph || typeof graph !== "object") throw new Error("missing direct graph");
-        kind = graph.kind;
-        scopePath = graph.scopePath;
-        assertGraphIdentity(graph, kind, scopePath);
+        assertPackageGraphIdentity(graph);
         if (input.outcome.status === "error" && graph.renderMode !== "bare") {
           throw new Error("an error outcome requires a bare direct graph");
         }
-      } else if ("fallbackSource" in input) {
-        const source = input.fallbackSource;
-        if (
-          input.outcome.status !== "error"
-          || !source
-          || !Number.isInteger(source.sourceGenerationId)
-          || source.sourceGenerationId <= 0
-          || source.sourceGenerationId === generationId
-          || (source.kind !== "packages" && source.kind !== "uml")
-          || typeof source.scopePath !== "string"
-          || normalizeRelativePath(source.scopePath) !== source.scopePath
-          || (source.kind === "packages" && source.scopePath !== "")
-        ) {
-          throw new Error("invalid fallback source");
-        }
-        fallbackSource = source;
-        kind = source.kind;
-        scopePath = source.scopePath;
-      } else {
+      } else if (!("fallbackSource" in input)) {
         throw new Error("invalid diagram input");
-      }
-      if (
-        (expectedKind !== undefined && kind !== expectedKind)
-        || (expectedScopePath !== undefined && scopePath !== expectedScopePath)
-      ) {
-        throw new Error("diagram input does not match the target identity");
       }
     } catch (error) {
       if (error instanceof DiagramMaterializationError) throw error;
       throw invalidMaterialization("invalid diagram materialization input", error);
     }
 
-    if (fallbackSource) {
-      const sourceGraph = graphStore.readGraph(
-        fallbackSource.sourceGenerationId,
-        fallbackSource.kind,
-        fallbackSource.scopePath,
+    if (!("graph" in input)) {
+      const source = input.fallbackSource;
+      if (
+        !source
+        || !Number.isInteger(source.sourceGenerationId)
+        || source.sourceGenerationId <= 0
+        || source.sourceGenerationId === generationId
+      ) {
+        throw invalidMaterialization("invalid fallback source");
+      }
+      const sourceGraph = this.graphStore.readGraph(source.sourceGenerationId, "packages", "");
+      const sourceResponseRow = this.query.selectDiagram.get(
+        source.sourceGenerationId,
+        "packages",
+        "",
       );
-      if (!sourceGraph) {
+      if (sourceGraph?.kind !== "packages") {
         throw invalidMaterialization("fallback source graph not found");
       }
-      const sourceResponseRow = this.cacheStatements.selectDiagram.get(
-        fallbackSource.sourceGenerationId,
-        fallbackSource.kind,
-        fallbackSource.scopePath,
-      );
-      if (!sourceResponseRow) {
-        throw invalidMaterialization("fallback source response not found");
-      }
+      if (!sourceResponseRow) throw invalidMaterialization("fallback source response not found");
       try {
-        validateLoadedGraph(sourceGraph);
-        const sourceResponse = parseJson<DiagramPayload>(
+        validatePackageDiagramGraph(sourceGraph);
+        const sourceResponse = parseJson<PackageDiagramPayload>(
           sourceResponseRow.response_json,
           "fallback diagram",
         );
-        if (
-          sourceResponse.kind !== fallbackSource.kind
-          || sourceResponse.scopePath !== fallbackSource.scopePath
-          || (sourceResponse.status !== "ready" && sourceResponse.status !== "error")
-          || (sourceResponse.status === "error" && typeof sourceResponse.error !== "string")
-          || (sourceResponse.status === "ready" && sourceResponse.error !== undefined)
-        ) {
+        if (sourceResponse.kind !== "packages" || sourceResponse.scopePath !== "") {
           throw new Error("fallback source graph and response identity disagree");
         }
-        fallbackRendered = validateRenderedDiagram(sourceResponse);
+        fallbackRendered = validateRenderedPackageDiagram(sourceResponse);
       } catch (error) {
         throw invalidMaterialization("invalid fallback source", error);
       }
       graph = sourceGraph;
     }
-    if (!graph) {
-      throw invalidMaterialization("diagram graph was not resolved");
-    }
+    if (!graph) throw invalidMaterialization("diagram graph was not resolved");
 
-    graphStore.deleteGraph(generationId, kind, scopePath);
-    graphStore.insertGraph(generationId, graph);
-    const reloaded = graphStore.readGraph(generationId, kind, scopePath);
-    if (!reloaded) {
+    this.graphStore.deleteGraph(generationId, "packages", "");
+    this.graphStore.insertGraph(generationId, graph);
+    const reloaded = this.graphStore.readGraph(generationId, "packages", "");
+    if (reloaded?.kind !== "packages") {
       throw invalidMaterialization("persisted diagram graph header was not found");
     }
     try {
-      validateLoadedGraph(reloaded);
+      validatePackageDiagramGraph(reloaded);
     } catch (error) {
       throw invalidMaterialization("invalid hydrated diagram graph", error);
     }
 
-    let rendered: RenderedDiagram;
+    let rendered: RenderedPackageDiagram;
     try {
-      rendered = validateRenderedDiagram(renderer(reloaded));
+      rendered = validateRenderedPackageDiagram(renderer(reloaded));
     } catch (error) {
-      if (fallbackSource === null || fallbackRendered === null) {
-        throw invalidMaterialization("diagram rendering failed", error);
-      }
+      if (!fallbackRendered) throw invalidMaterialization("diagram rendering failed", error);
       rendered = fallbackRendered;
     }
-    if (rendered.kind !== kind) throw invalidMaterialization("diagram renderer kind mismatch");
-    let response: DiagramPayload;
-    let responseJson: string;
-    try {
-      response = {
-        ...(rendered.kind === "packages"
-          ? { kind: "packages" as const, dsl: rendered.dsl, dsls: rendered.dsls }
-          : { kind: "uml" as const, view: rendered.view }),
-        scopePath,
-        status: input.outcome.status,
-        packageNodes: rendered.packageNodes,
-        definitions: rendered.definitions,
-        externalUsers: rendered.externalUsers,
-        localUsers: rendered.localUsers,
-        ...(input.outcome.status === "error" ? { error: input.outcome.error } : {}),
-      };
-      const serialized = JSON.stringify(response);
-      if (serialized === undefined) throw new Error("diagram response is not serializable");
-      responseJson = serialized;
-    } catch (error) {
-      throw invalidMaterialization("diagram response materialization failed", error);
-    }
-    this.cacheStatements.upsertDiagram.run(generationId, kind, scopePath, responseJson);
+    const response: PackageDiagramPayload = {
+      kind: "packages",
+      scopePath: "",
+      status: input.outcome.status,
+      dsl: rendered.dsl,
+      dsls: rendered.dsls,
+      packageNodes: rendered.packageNodes,
+      definitions: [],
+      externalUsers: [],
+      localUsers: [],
+      ...(input.outcome.status === "error" ? { error: input.outcome.error } : {}),
+    };
+    this.query.upsertDiagram.run(generationId, "packages", "", JSON.stringify(response));
     return response;
-  };
+  }
 
-  this.discoveryTransaction = db.transaction((
+  recover(sourceFingerprint: string): number | null {
+    const active = this.query.selectActiveGeneration.get() ?? null;
+    const activeGenerationId =
+      active !== null && active.source_fingerprint === sourceFingerprint ? active.id : null;
+    this.recoveryTransaction.immediate(activeGenerationId);
+    return activeGenerationId;
+  }
+
+  getActiveGenerationId(): number | null {
+    return this.query.selectActiveGeneration.get()?.id ?? null;
+  }
+
+  hasFailedDiagrams(generationId: number): boolean {
+    return this.query.selectFailedDiagram.get(generationId) !== null;
+  }
+
+  repairTableForSchemaError(error: unknown): CacheTableName | null {
+    const tableName = cacheTableFromSchemaError(error);
+    if (!tableName) return null;
+    const tableDefinition = CACHE_SCHEMA_BY_NAME.get(tableName);
+    if (tableDefinition?.kind !== "table") return null;
+    const group: Partial<Record<string, readonly CacheSchemaObjectName[]>> =
+      CACHE_TABLE_RECOVERY_GROUPS;
+    const schemaObjects = group[tableName] ?? [tableName];
+    const definitions = schemaObjects.map((name) => {
+      const definition = CACHE_SCHEMA_BY_NAME.get(name);
+      if (!definition) throw new Error(`cache schema descriptor not found: ${name}`);
+      return definition;
+    });
+    const selectedObjects = new Set(schemaObjects);
+    this.db.transaction(() => {
+      for (let index = definitions.length - 1; index >= 0; index -= 1) {
+        const definition = definitions[index];
+        if (!definition) continue;
+        const objectKind = definition.kind === "trigger"
+          ? "TRIGGER"
+          : definition.kind === "index"
+            ? "INDEX"
+            : "TABLE";
+        this.db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
+      }
+      Cache.createSchema(this.db, selectedObjects);
+    }).immediate();
+    return tableName;
+  }
+
+  beginGeneration(cause: "startup" | "watch", sourceFingerprint: string): number {
+    return Number(
+      this.query.insertGeneration.run(cause, Date.now(), sourceFingerprint).lastInsertRowid,
+    );
+  }
+
+  writeDiscovery(
     generationId: number,
     packages: readonly PackageInfo[],
-    diagram: CacheDiagramInput,
-    renderer: DiagramRenderer,
-  ) => {
-    const response = materializeDiagram(
-      generationId,
-      diagram,
-      renderer,
-      "packages",
-      "",
-    );
-    this.cacheStatements.upsertPackages.run(generationId, JSON.stringify(packages));
-    return response;
-  });
-  this.scopeTransaction = db.transaction((
-    generationId: number,
-    scope: CacheScopeWrite,
-    renderer: DiagramRenderer,
-  ) => {
-    const response = materializeDiagram(generationId, scope.diagram, renderer);
-    for (const entry of scope.entries) {
-      const viewable = (entry as TreeNode & { viewable?: boolean }).viewable === true ? 1 : 0;
-      this.cacheStatements.upsertTreeEntry.run(
-        generationId,
-        entry.path,
-        parentPath(entry.path),
-        entry.name,
-        entry.kind,
-        viewable,
-      );
-    }
-    if (scope.file) {
-      const file = scope.file;
-      this.cacheStatements.deleteScopeGotoDefs.run(generationId, file.path);
-      this.cacheStatements.upsertFile.run(
-        generationId,
-        file.path,
-        file.rawContent,
-        file.displayContent,
-        file.sourceError,
-        file.formatError,
-        file.language,
-      );
-      for (const definition of scope.definitions) {
-        this.cacheStatements.insertGotoDefinition.run(
-          generationId,
-          definition.key,
-          definition.kind,
-          definition.name,
-          definition.qualifiedName,
-          definition.source.path,
-          definition.source.line,
-          definition.source.column,
-          definition.displayFrom,
-          definition.displayTo,
-          definition.uml.scopePath,
-          definition.uml.entityName,
-          definition.uml.memberName ?? null,
-          definition.uml.memberOccurrence ?? null,
-        );
-      }
-    }
-    return response;
-  });
-  this.definitionIndexTransaction = db.transaction((
-    generationId: number,
-    definitions: readonly DefinitionIndexWrite[],
-  ) => {
-    this.cacheStatements.deleteGenerationDefinitionIndex.run(generationId);
-    for (const definition of definitions) {
-      this.cacheStatements.insertDefinitionIndex.run(
-        generationId,
-        definition.path,
-        definition.name,
-        definition.qualifiedName,
-        definition.kind,
-        definition.line,
-        definition.column,
-      );
-    }
-  });
-  this.promotionTransaction = db.transaction((generationId: number) => {
-    const result = this.cacheStatements.markGenerationActive.run(Date.now(), generationId);
-    if (result.changes !== 1) throw new Error(`cannot promote generation ${generationId}`);
-    this.cacheStatements.upsertActivePointer.run(String(generationId));
-  });
-
-  } catch (error) {
-    try {
-      db.close(true);
-    } catch {
-      db.close();
-    }
-    throw error;
+    diagram: CachePackageDiagramInput,
+    render: PackageDiagramRenderer,
+  ): PackageDiagramPayload {
+    return this.discoveryTransaction.immediate(generationId, packages, diagram, render);
   }
-}
 
-recover(sourceFingerprint: string): number | null {
-  const active = this.cacheStatements.selectActiveGeneration.get() ?? null;
-  const activeGenerationId =
-    active !== null && active.source_fingerprint === sourceFingerprint ? active.id : null;
-  this.recoveryTransaction.immediate(activeGenerationId);
-  return activeGenerationId;
-}
+  /** Raw snapshots of an unpublished building generation; readers wait for index completion. */
+  writeSourceSnapshots(generationId: number, files: readonly CacheFileWrite[]): void {
+    this.sourceSnapshotTransaction.immediate(generationId, files);
+  }
 
-getActiveGenerationId(): number | null {
-  return this.cacheStatements.selectActiveGeneration.get()?.id ?? null;
-}
+  writeScope(generationId: number, scope: CacheScopeWrite): void {
+    this.scopeTransaction.immediate(generationId, scope);
+  }
 
-hasFailedDiagrams(generationId: number): boolean {
-  return this.cacheStatements.selectFailedDiagram.get(generationId) !== null;
-}
+  writeDefinitionIndex(generationId: number, snapshot: DefinitionIndexSnapshot): void {
+    this.definitionIndexTransaction.immediate(generationId, snapshot);
+  }
 
-repairTableForSchemaError(error: unknown): CacheTableName | null {
-  const tableName = cacheTableFromSchemaError(error);
-  if (!tableName) return null;
-  const tableDefinition = CACHE_SCHEMA_BY_NAME.get(tableName);
-  if (tableDefinition?.kind !== "table") return null;
-  const table = tableDefinition.name;
-  const schemaObjects: readonly CacheSchemaObjectName[] =
-    table === "files" || table === "GotoDef"
-      ? CACHE_TABLE_RECOVERY_GROUPS[table]
-      : [table];
-  const definitions = schemaObjects.map((name) => {
-    const definition = CACHE_SCHEMA_BY_NAME.get(name);
-    if (!definition) throw new Error(`cache schema descriptor not found: ${name}`);
-    return definition;
-  });
-  const selectedObjects = new Set(schemaObjects);
-  this.db.transaction(() => {
-    for (let index = definitions.length - 1; index >= 0; index -= 1) {
-      const definition = definitions[index];
-      const objectKind = definition.kind === "trigger" ? "TRIGGER" : "TABLE";
-      this.db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
+  readTreeEntries(generationId: number): TreeNode[] {
+    return this.query.selectTreeEntries.all(generationId).map((row) => this.toTreeNode(row));
+  }
+
+  readTreeChildren(generationId: number, path: string): TreeNode[] {
+    const normalized = normalizeRelativePath(path);
+    return this.query.selectTreeChildren
+      .all(generationId, normalized, normalized)
+      .map((row) => this.toTreeNode(row));
+  }
+
+  private toTreeNode(row: TreeRow): TreeNode {
+    return row.kind === "file"
+      ? { name: row.name, path: row.path, kind: "file", viewable: row.viewable !== 0 }
+      : { name: row.name, path: row.path, kind: "directory" };
+  }
+
+  readPackages(generationId: number): PackageInfo[] {
+    const row = this.query.selectPackages.get(generationId);
+    if (!row) throw new Error(`cache package snapshot not found for generation ${generationId}`);
+    return parseJson<PackageInfo[]>(row.packages_json, "package snapshot");
+  }
+
+  readDiagramGraph(
+    generationId: number,
+    kind: DiagramKind,
+    scopePath: string,
+  ): DiagramGraph | null {
+    const graph = this.graphStore.readGraph(generationId, kind, scopePath);
+    if (!graph) return null;
+    try {
+      if (graph.kind === "packages") validatePackageDiagramGraph(graph);
+      else validateUmlDiagramGraph(graph);
+      return graph;
+    } catch (error) {
+      throw invalidMaterialization("invalid hydrated diagram graph", error);
     }
-    Cache.createSchema(this.db, selectedObjects);
-  }).immediate();
-  return table;
-}
+  }
 
-beginGeneration(cause: "startup" | "watch", sourceFingerprint: string): number {
-  return Number(this.cacheStatements.insertGeneration.run(cause, Date.now(), sourceFingerprint).lastInsertRowid);
-}
+  readPackageDiagram(generationId: number): PackageDiagramPayload | null {
+    const row = this.query.selectDiagram.get(generationId, "packages", "");
+    return row ? parseJson<PackageDiagramPayload>(row.response_json, "diagram") : null;
+  }
 
-writeDiscovery(
-  generationId: number,
-  packages: readonly PackageInfo[],
-  diagram: CacheDiagramInput,
-  render: DiagramRenderer,
-): DiagramPayload {
-  return this.discoveryTransaction.immediate(generationId, packages, diagram, render);
-}
+  readFile(generationId: number, path: string): CacheFileWrite | null {
+    const row = this.query.selectFile.get(generationId, path);
+    if (!row) return null;
+    return {
+      path: row.path,
+      rawContent: row.raw_content,
+      displayContent: row.display_content,
+      sourceError: row.source_error,
+      formatError: row.format_error,
+      language: row.language,
+    };
+  }
 
-writeScope(
-  generationId: number,
-  scope: CacheScopeWrite,
-  render: DiagramRenderer,
-): DiagramPayload {
-  return this.scopeTransaction.immediate(generationId, scope, render);
-}
+  readDefinition(
+    generationId: number,
+    path: string,
+    line: number,
+    column: number,
+  ): GotoDefinition | null {
+    const row = this.query.selectDefinition.get(
+      generationId,
+      normalizeRelativePath(path),
+      line,
+      column,
+    );
+    return row ? toGotoDefinition(row) : null;
+  }
 
-readTreeEntries(generationId: number): TreeNode[] {
-  return this.cacheStatements.selectTreeEntries.all(generationId).map((row): TreeNode => {
-    if (row.kind === "file") {
+  readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
+    return this.query.selectDefinitions
+      .all(generationId, normalizeRelativePath(path))
+      .map((row) => ({
+        ...toGotoDefinition(row),
+        displayFrom: row.display_from,
+        displayTo: row.display_to,
+      }));
+  }
+
+  readFileDefinitions(generationId: number, path: string): FileDefinition[] {
+    return this.query.selectFileDefinitions
+      .all(generationId, normalizeRelativePath(path))
+      .map((row) => {
+        const { hasBody: _hasBody, ...definition } = toIndexedDefinition(row);
+        return definition;
+      });
+  }
+
+  lookupDefinition(path: string, name: string, qualifiedName: string): UmlSourceLocation | null {
+    const row = this.query.selectDefinitionIndexEntry.get(
+      normalizeRelativePath(path),
+      name,
+      qualifiedName,
+    );
+    return row
+      ? { path: row.source_path, line: row.source_line, column: row.source_column }
+      : null;
+  }
+
+  /** Prepared, generation-bound catalogue reads with per-job memoization. */
+  createDefinitionResolutionIndex(generationId: number): DefinitionResolutionIndex {
+    const definitionCache = new Map<string, IndexedFileDefinition | undefined>();
+    const fileCache = new Map<string, IndexedFileDefinition[]>();
+    const memberCache = new Map<string, IndexedFileDefinition[]>();
+    const bindingCache = new Map<string, DefinitionBindingTarget[]>();
+    const definition = (key: string): IndexedFileDefinition | undefined => {
+      if (definitionCache.has(key)) return definitionCache.get(key);
+      const row = this.query.selectDefinitionByKey.get(generationId, key);
+      const value = row ? toIndexedDefinition(row) : undefined;
+      definitionCache.set(key, value);
+      return value;
+    };
+    return {
+      definition,
+      definitions: (path) => {
+        const cached = fileCache.get(path);
+        if (cached) return cached;
+        const rows = this.query.selectFileDefinitions.all(generationId, path).map(toIndexedDefinition);
+        fileCache.set(path, rows);
+        return rows;
+      },
+      members: (parentKey) => {
+        const cached = memberCache.get(parentKey);
+        if (cached) return cached;
+        const rows = this.query.selectDefinitionChildren
+          .all(generationId, parentKey)
+          .map(toIndexedDefinition);
+        for (const contributor of this.query.selectContributors.all(generationId, parentKey)) {
+          if (contributor.contribution_kind !== "module") continue;
+          rows.push(
+            ...this.query.selectFileDefinitions
+              .all(generationId, contributor.source_path)
+              .map(toIndexedDefinition)
+              .filter((entry) => entry.isTopLevel),
+          );
+        }
+        memberCache.set(parentKey, rows);
+        return rows;
+      },
+      bindings: (path, scopeKey, name, space, exported) => {
+        const cacheKey = JSON.stringify([path, scopeKey, name, space, exported]);
+        const cached = bindingCache.get(cacheKey);
+        if (cached) return cached;
+        const rows = exported
+          ? this.query.selectExportBindings.all(generationId, path, scopeKey, name, space)
+          : this.query.selectLocalBindings.all(generationId, path, scopeKey, name, space);
+        let targets = toBindingTargets(rows);
+        if (!exported && !targets.length) {
+          targets = toBindingTargets(
+            this.query.selectImportBindings.all(generationId, path, scopeKey, name, space),
+          );
+        }
+        bindingCache.set(cacheKey, targets);
+        return targets;
+      },
+    };
+  }
+
+  /** The rooted UML selection, or the set of file graphs that must be preprocessed first. */
+  readUmlDiagram(generationId: number, target: UmlTarget): UmlDiagramRead {
+    const path = normalizeRelativePath(target.path);
+    if (target.kind === "directory") {
+      return { state: "complete", diagram: this.readDirectoryDiagram(generationId, target, path) };
+    }
+    return this.readDefinitionDiagram(generationId, target, path);
+  }
+
+  private assertTreeKind(
+    generationId: number,
+    path: string,
+    kind: "directory" | "file",
+  ): void {
+    if (path === "") {
+      if (kind !== "directory") {
+        throw new PathError("BAD_REQUEST", "diagram target kind does not match path");
+      }
+      return;
+    }
+    const entry = this.query.selectTreeEntry.get(generationId, path);
+    if (!entry) throw new PathError("NOT_FOUND", `path not found: ${path}`);
+    if (entry.kind !== kind) {
+      throw new PathError("BAD_REQUEST", "diagram target kind does not match path");
+    }
+  }
+
+  private readDirectoryDiagram(
+    generationId: number,
+    target: UmlTarget,
+    path: string,
+  ): UmlDiagramPayload {
+    this.assertTreeKind(generationId, path, "directory");
+    const range = directoryRange(path);
+    const inside = range
+      ? this.query.selectDirectoryFiles.all(generationId, range.from, range.to)
+      : this.query.selectAllFiles.all(generationId);
+    const insidePaths = new Set(inside.map((row) => row.path));
+    const edges = (range
+      ? this.query.selectDirectoryImports.all(generationId, range.from, range.to)
+      : this.query.selectAllImports.all(generationId))
+      .map((row) => ({ sourcePath: row.source_path, targetPath: row.target_path }));
+    const nodePaths = new Map<string, boolean>();
+    for (const row of inside) nodePaths.set(row.path, false);
+    for (const edge of edges) {
+      if (!nodePaths.has(edge.targetPath)) nodePaths.set(edge.targetPath, true);
+    }
+    for (const filePath of insidePaths) {
+      // Only source files feed the catalogue; a binary asset's decode failure is not a graph error.
+      if (!isSourcePath(filePath)) continue;
+      const record = this.query.selectFile.get(generationId, filePath);
+      if (!record?.source_error) continue;
       return {
-        name: row.name,
-        path: row.path,
-        kind: "file",
-        viewable: row.viewable !== 0,
+        kind: "uml",
+        scopePath: path,
+        target,
+        status: "error",
+        view: { kind: "files", nodes: [], edges: [] },
+        error: `${filePath}: ${record.source_error}`,
       };
     }
+    const nodes = [...nodePaths.entries()]
+      .map(([nodePath, boundary]) => ({
+        path: nodePath,
+        boundary,
+        test: isTestPath(nodePath),
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    edges.sort((left, right) =>
+      left.sourcePath.localeCompare(right.sourcePath)
+      || left.targetPath.localeCompare(right.targetPath)
+    );
     return {
-      name: row.name,
-      path: row.path,
-      kind: "directory",
+      kind: "uml",
+      scopePath: path,
+      target,
+      status: "ready",
+      view: { kind: "files", nodes, edges },
     };
-  });
-}
-
-readPackages(generationId: number): PackageInfo[] {
-  const row = this.cacheStatements.selectPackages.get(generationId);
-  if (!row) throw new Error(`cache package snapshot not found for generation ${generationId}`);
-  return parseJson<PackageInfo[]>(row.packages_json, "package snapshot");
-}
-
-readDiagramGraph(
-  generationId: number,
-  kind: DiagramKind,
-  scopePath: string,
-): DiagramGraph | null {
-  const graph = this.graphStore.readGraph(generationId, kind, scopePath);
-  if (!graph) return null;
-  try {
-    validateLoadedGraph(graph);
-    return graph;
-  } catch (error) {
-    throw invalidMaterialization("invalid hydrated diagram graph", error);
   }
-}
 
-readDiagram(
-  generationId: number,
-  kind: DiagramKind,
-  scopePath: string,
-): DiagramPayload | null {
-  const row = this.cacheStatements.selectDiagram.get(generationId, kind, scopePath);
-  return row ? parseJson<DiagramPayload>(row.response_json, "diagram") : null;
-}
-
-readFile(generationId: number, path: string): CacheFileWrite | null {
-  const row = this.cacheStatements.selectFile.get(generationId, path);
-  if (!row) return null;
-  return {
-    path: row.path,
-    rawContent: row.raw_content,
-    displayContent: row.display_content,
-    sourceError: row.source_error,
-    formatError: row.format_error,
-    language: row.language,
-  };
-}
-
-readDefinition(
-  generationId: number,
-  path: string,
-  line: number,
-  column: number,
-): GotoDefinition | null {
-  const row = this.cacheStatements.selectDefinition.get(
-    generationId,
-    normalizeRelativePath(path),
-    line,
-    column,
-  );
-  return row ? toGotoDefinition(row) : null;
-}
-
-readDefinitions(generationId: number, path: string): EditorGotoDefinition[] {
-  return this.cacheStatements.selectDefinitions
-    .all(generationId, normalizeRelativePath(path))
-    .map((row) => ({
-      ...toGotoDefinition(row),
-      displayFrom: row.display_from,
-      displayTo: row.display_to,
-    }));
-}
-
-writeDefinitionIndex(
-  generationId: number,
-  definitions: readonly DefinitionIndexWrite[],
-): void {
-  this.definitionIndexTransaction.immediate(generationId, definitions);
-}
-
-lookupDefinition(
-  path: string,
-  name: string,
-  qualifiedName: string,
-): UmlSourceLocation | null {
-  const row = this.cacheStatements.selectDefinitionIndexEntry.get(
-    normalizeRelativePath(path),
-    name,
-    qualifiedName,
-  );
-  return row
-    ? { path: row.source_path, line: row.source_line, column: row.source_column }
-    : null;
-}
-
-searchFiles(
-  generationId: number,
-  query: string,
-  caseInsensitive: boolean,
-): Omit<SearchResponse, "version"> {
-  const indexed = !caseInsensitive
-    && hasAtLeastThreeCodePoints(query)
-    && !query.includes("%")
-    && !query.includes("_");
-  const likeQuery = `%${query}%`;
-  const fileCandidates = indexed
-    ? this.cacheStatements.selectIndexedSearchCandidates.all(generationId, likeQuery)
-    : this.cacheStatements.selectScanSearchCandidates.all(generationId);
-  const definitionCandidates = indexed
-    ? this.cacheStatements.selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
-    : this.cacheStatements.selectScanDefinitionCandidates.all(generationId);
-  const comparisonQuery = caseInsensitive ? query.toLowerCase() : query;
-  const paths = new Set<string>();
-  for (const candidate of fileCandidates) {
-    if (includesSearch(candidate.raw_content, comparisonQuery, caseInsensitive)) {
-      paths.add(candidate.path);
+  private readDefinitionDiagram(
+    generationId: number,
+    target: UmlTarget,
+    path: string,
+  ): UmlDiagramRead {
+    this.assertTreeKind(generationId, path, "file");
+    const record = this.query.selectFile.get(generationId, path);
+    if (record?.source_error) {
+      return {
+        state: "complete",
+        diagram: {
+          kind: "uml",
+          scopePath: path,
+          target,
+          status: "error",
+          view: { kind: "definitions", nodes: [], edges: [], frames: [] },
+          error: record.source_error,
+        },
+      };
     }
-  }
-  const retainedDefinitions = new Map<string, GotoDefinitionRow>();
-  for (const candidate of definitionCandidates) {
-    if (
-      !includesSearch(candidate.name, comparisonQuery, caseInsensitive)
-      && !includesSearch(candidate.qualified_name, comparisonQuery, caseInsensitive)
-    ) {
-      continue;
+    let roots: IndexedFileDefinition[];
+    if (target.kind === "definition") {
+      const row = this.query.selectDefinitionByKey.get(generationId, target.definitionKey);
+      if (!row || row.source_path !== path) {
+        throw new PathError("NOT_FOUND", "Definition not found");
+      }
+      roots = [toIndexedDefinition(row)];
+    } else {
+      roots = this.query.selectTopLevelDefinitions.all(generationId, path).map(toIndexedDefinition);
     }
-    retainedDefinitions.set(`${candidate.source_path}\0${candidate.definition_key}`, candidate);
-    paths.add(candidate.source_path);
+
+    const reader = new UmlSelectionReader(this.query, this.graphStore, generationId);
+    const frames: { rootKey: string; nodeKeys: string[] }[] = [];
+    const visibleKeys = new Set<string>();
+    const edges = new Map<string, UmlDefinitionEdge>();
+    for (const root of roots) {
+      const frame = reader.closure(root.key);
+      if (reader.missing.size || reader.error) break;
+      frames.push({ rootKey: root.key, nodeKeys: [...frame.keys].sort() });
+      for (const key of frame.keys) visibleKeys.add(key);
+      for (const edge of frame.edges) edges.set(`${edge.sourceKey}\u0000${edge.targetKey}\u0000${edge.kind}`, edge);
+    }
+    if (reader.missing.size) return { state: "pending", files: [...reader.missing].sort() };
+    if (reader.error) {
+      return {
+        state: "complete",
+        diagram: {
+          kind: "uml",
+          scopePath: path,
+          target,
+          status: "error",
+          view: { kind: "definitions", nodes: [], edges: [], frames: [] },
+          error: reader.error,
+        },
+      };
+    }
+    const nodes = [...visibleKeys]
+      .map((key) => reader.node(key))
+      .filter((node): node is UmlDefinitionNode => node !== undefined)
+      .sort((left, right) =>
+        left.definition.source.path.localeCompare(right.definition.source.path)
+        || left.definition.source.line - right.definition.source.line
+        || left.definition.source.column - right.definition.source.column
+        || left.definition.key.localeCompare(right.definition.key)
+      );
+    const view: UmlViewModel = {
+      kind: "definitions",
+      nodes,
+      edges: [...edges.values()].sort((left, right) =>
+        left.sourceKey.localeCompare(right.sourceKey)
+        || left.targetKey.localeCompare(right.targetKey)
+        || left.kind.localeCompare(right.kind)
+      ),
+      frames,
+    };
+    return {
+      state: "complete",
+      diagram: { kind: "uml", scopePath: path, target, status: "ready", view },
+    };
   }
-  const definitionRows = [...retainedDefinitions.values()].sort((left, right) =>
-    left.source_path.localeCompare(right.source_path)
-    || left.source_line - right.source_line
-    || left.source_column - right.source_column
-    || left.definition_key.localeCompare(right.definition_key)
+
+  searchFiles(
+    generationId: number,
+    query: string,
+    caseInsensitive: boolean,
+  ): Omit<SearchResponse, "version"> {
+    const indexed = !caseInsensitive
+      && hasAtLeastThreeCodePoints(query)
+      && !query.includes("%")
+      && !query.includes("_");
+    const likeQuery = `%${query}%`;
+    const fileCandidates = indexed
+      ? this.query.selectIndexedSearchCandidates.all(generationId, likeQuery)
+      : this.query.selectScanSearchCandidates.all(generationId);
+    const definitionCandidates = indexed
+      ? this.query.selectIndexedDefinitionCandidates.all(generationId, likeQuery, likeQuery)
+      : this.query.selectScanDefinitionCandidates.all(generationId);
+    const comparisonQuery = caseInsensitive ? query.toLowerCase() : query;
+    const paths = new Set<string>();
+    for (const candidate of fileCandidates) {
+      if (includesSearch(candidate.raw_content, comparisonQuery, caseInsensitive)) {
+        paths.add(candidate.path);
+      }
+    }
+    const retainedDefinitions = new Map<string, GotoDefinitionRow>();
+    for (const candidate of definitionCandidates) {
+      if (
+        !includesSearch(candidate.name, comparisonQuery, caseInsensitive)
+        && !includesSearch(candidate.qualified_name, comparisonQuery, caseInsensitive)
+      ) continue;
+      retainedDefinitions.set(`${candidate.source_path}\0${candidate.definition_key}`, candidate);
+      paths.add(candidate.source_path);
+    }
+    const definitionRows = [...retainedDefinitions.values()].sort((left, right) =>
+      left.source_path.localeCompare(right.source_path)
+      || left.source_line - right.source_line
+      || left.source_column - right.source_column
+      || left.definition_key.localeCompare(right.definition_key)
+    );
+    const files = [...paths].sort((left, right) => left.localeCompare(right));
+    return {
+      query,
+      caseInsensitive,
+      files,
+      definitions: definitionRows.map(toGotoDefinition),
+      ...buildSearchScopes(files, this.readPackages(generationId)),
+    };
+  }
+
+  promoteGeneration(generationId: number): void {
+    this.promotionTransaction.immediate(generationId);
+    this.query.deleteGenerationsExcept.run(generationId);
+    this.query.optimizeSearch.run();
+    this.query.optimizeGotoDefinitionSearch.run();
+  }
+
+  discardGeneration(generationId: number): void {
+    if (this.query.selectActiveGeneration.get()?.id === generationId) {
+      throw new Error(`cannot discard active generation ${generationId}`);
+    }
+    this.query.deleteInactiveGeneration.run(generationId);
+  }
+
+  failGeneration(generationId: number): void {
+    this.query.markGenerationFailed.run(Date.now(), generationId);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    for (const statement of this.statements) statement.finalize();
+    this.db.close(true);
+    this.closed = true;
+  }
+}
+
+function toBindingTargets(rows: readonly BindingRow[]): DefinitionBindingTarget[] {
+  return rows.map((row) =>
+    row.target_key !== null
+      ? { kind: "definition", key: row.target_key } as const
+      : { kind: "module", path: row.target_module_path ?? "" } as const
   );
-  const definitions = definitionRows.map(toGotoDefinition);
-  const files = [...paths].sort((left, right) => left.localeCompare(right));
-  return {
-    query,
-    caseInsensitive,
-    files,
-    definitions,
-    ...buildSearchScopes(files, this.readPackages(generationId)),
-  };
 }
 
-promoteGeneration(generationId: number): void {
-  this.promotionTransaction.immediate(generationId);
-  this.cacheStatements.deleteGenerationsExcept.run(generationId);
-  this.cacheStatements.optimizeSearch.run();
-  this.cacheStatements.optimizeGotoDefinitionSearch.run();
-}
+/**
+ * One selection read: breadth-first closures over effective adjacency, with per-read memoization
+ * of owner expansion, file graphs and assembled nodes.
+ */
+class UmlSelectionReader {
+  readonly missing = new Set<string>();
+  error: string | undefined;
+  private readonly adjacency = new Map<string, { targetKey: string; kind: UmlRelationKind }[]>();
+  private readonly hydrated = new Map<string, HydratedFileNominalModel | null>();
+  private readonly nodes = new Map<string, UmlDefinitionNode | undefined>();
+  private readonly definitions = new Map<string, IndexedFileDefinition | undefined>();
 
-discardGeneration(generationId: number): void {
-  if (this.cacheStatements.selectActiveGeneration.get()?.id === generationId) {
-    throw new Error(`cannot discard active generation ${generationId}`);
+  constructor(
+    private readonly query: CacheQueries,
+    private readonly graphStore: PreparedGraphStore,
+    private readonly generationId: number,
+  ) {}
+
+  private definition(key: string): IndexedFileDefinition | undefined {
+    if (this.definitions.has(key)) return this.definitions.get(key);
+    const row = this.query.selectDefinitionByKey.get(this.generationId, key);
+    const value = row ? toIndexedDefinition(row) : undefined;
+    this.definitions.set(key, value);
+    return value;
   }
-  this.cacheStatements.deleteInactiveGeneration.run(generationId);
+
+  private fileGraph(scopePath: string): HydratedFileNominalModel | null {
+    if (this.hydrated.has(scopePath)) return this.hydrated.get(scopePath) ?? null;
+    const outcomeRow = this.query.selectDiagram.get(this.generationId, "uml", scopePath);
+    if (!outcomeRow) {
+      this.missing.add(scopePath);
+      this.hydrated.set(scopePath, null);
+      return null;
+    }
+    const outcome = parseJson<UmlFileOutcome>(outcomeRow.response_json, "uml outcome");
+    if (outcome.status === "error") {
+      this.error ??= `${scopePath}: ${outcome.error}`;
+      this.hydrated.set(scopePath, null);
+      return null;
+    }
+    const graph = this.graphStore.readGraph(this.generationId, "uml", scopePath);
+    const model = graph && graph.kind === "uml" ? hydrateUmlNominalModel(graph) : null;
+    this.hydrated.set(scopePath, model);
+    return model;
+  }
+
+  /** Every definition whose references a visible node absorbs: itself, its descendants, modules. */
+  private owners(key: string): string[] {
+    const owners: string[] = [];
+    const seen = new Set<string>();
+    const queue = [key];
+    while (queue.length) {
+      const current = queue.shift();
+      if (current === undefined || seen.has(current)) continue;
+      seen.add(current);
+      owners.push(current);
+      for (const child of this.query.selectDefinitionChildren.all(this.generationId, current)) {
+        queue.push(child.definition_key);
+      }
+      for (const contributor of this.query.selectContributors.all(this.generationId, current)) {
+        if (contributor.contribution_kind !== "module") continue;
+        for (const row of this.query.selectFileDefinitions.all(this.generationId, contributor.source_path)) {
+          queue.push(row.definition_key);
+        }
+      }
+    }
+    return owners;
+  }
+
+  effectiveAdjacency(key: string): { targetKey: string; kind: UmlRelationKind }[] {
+    const cached = this.adjacency.get(key);
+    if (cached) return cached;
+    const seen = new Set<string>();
+    const out: { targetKey: string; kind: UmlRelationKind }[] = [];
+    for (const owner of this.owners(key)) {
+      const contributors = this.query.selectContributors.all(this.generationId, owner);
+      for (const contributor of contributors) this.fileGraph(contributor.source_path);
+      for (const relation of this.query.selectOutgoingRelations.all(this.generationId, owner)) {
+        const guard = `${relation.target_node_id}\u0000${relation.relation_kind}`;
+        if (seen.has(guard)) continue;
+        seen.add(guard);
+        out.push({ targetKey: relation.target_node_id, kind: relation.relation_kind });
+      }
+    }
+    this.adjacency.set(key, out);
+    return out;
+  }
+
+  private isDescendant(candidate: string, ancestor: string): boolean {
+    let key: string | null | undefined = candidate;
+    const guard = new Set<string>();
+    while (key) {
+      if (guard.has(key)) return false;
+      guard.add(key);
+      const definition = this.definition(key);
+      if (!definition) return false;
+      if (definition.parentKey === ancestor) return true;
+      key = definition.parentKey;
+    }
+    return false;
+  }
+
+  closure(rootKey: string): { keys: Set<string>; edges: UmlDefinitionEdge[] } {
+    const keys = new Set<string>();
+    const edges: UmlDefinitionEdge[] = [];
+    const queue = [rootKey];
+    while (queue.length) {
+      const key = queue.shift();
+      if (key === undefined || keys.has(key)) continue;
+      if (!this.definition(key)) continue;
+      keys.add(key);
+      const source = this.definition(key);
+      const nominal = source !== undefined && NOMINAL_DEFINITION_KINDS[source.kind] === true;
+      for (const edge of this.effectiveAdjacency(key)) {
+        if (this.missing.size || this.error) return { keys, edges };
+        // A nominal box absorbs references to its own members instead of drawing them.
+        if (nominal && this.isDescendant(edge.targetKey, key)) continue;
+        if (!this.definition(edge.targetKey)) continue;
+        // A recursive reference stays in SQL; the view never draws a self arrow.
+        if (edge.targetKey === key) continue;
+        edges.push({ sourceKey: key, targetKey: edge.targetKey, kind: edge.kind });
+        queue.push(edge.targetKey);
+      }
+    }
+    return { keys, edges: edges.filter((edge) => keys.has(edge.targetKey)) };
+  }
+
+  node(key: string): UmlDefinitionNode | undefined {
+    if (this.nodes.has(key)) return this.nodes.get(key);
+    const definition = this.definition(key);
+    if (!definition) {
+      this.nodes.set(key, undefined);
+      return undefined;
+    }
+    const contributors = this.query.selectContributors.all(this.generationId, key);
+    let detail: UmlEntityModel | null = null;
+    let category: UmlCategoryKind | null = null;
+    const memberKeys: string[] = [];
+    const seenMembers = new Set<string>();
+    for (const contributor of contributors) {
+      const model = this.fileGraph(contributor.source_path);
+      const entity = model?.entities.get(key);
+      if (!entity) continue;
+      if (!detail || contributor.source_path === definition.source.path) {
+        detail = detail
+          ? { ...entity, properties: detail.properties, methods: detail.methods, items: detail.items }
+          : { ...entity, properties: [], methods: [], items: [] };
+      }
+      for (const property of entity.properties) {
+        if (seenMembers.has(property.definitionKey)) continue;
+        seenMembers.add(property.definitionKey);
+        detail.properties.push(property);
+        memberKeys.push(property.definitionKey);
+      }
+      for (const method of entity.methods) {
+        if (seenMembers.has(method.definitionKey)) continue;
+        seenMembers.add(method.definitionKey);
+        detail.methods.push(method);
+        memberKeys.push(method.definitionKey);
+      }
+      for (const item of entity.items) {
+        if (seenMembers.has(item.definitionKey)) continue;
+        seenMembers.add(item.definitionKey);
+        detail.items.push(item);
+        memberKeys.push(item.definitionKey);
+      }
+      const hydratedCategory = model?.categories.get(key);
+      if (hydratedCategory && (category === null || contributor.source_path === definition.source.path)) {
+        category = hydratedCategory.category;
+      }
+    }
+    const memberDefinitions = memberKeys
+      .flatMap((memberKey) => {
+        const member = this.definition(memberKey);
+        if (!member) return [];
+        const { hasBody: _hasBody, ...value } = member;
+        return [value];
+      })
+      .sort((left, right) =>
+        left.source.path.localeCompare(right.source.path)
+        || left.source.line - right.source.line
+        || left.source.column - right.source.column
+      );
+    if (detail) {
+      const order = new Map(memberDefinitions.map((member, index) => [member.key, index]));
+      const byOrder = (left: { definitionKey: string }, right: { definitionKey: string }): number =>
+        (order.get(left.definitionKey) ?? 0) - (order.get(right.definitionKey) ?? 0);
+      detail.properties.sort(byOrder);
+      detail.methods.sort(byOrder);
+      detail.items.sort(byOrder);
+    }
+    const { hasBody: _hasBody, ...plain } = definition;
+    const node: UmlDefinitionNode = {
+      definition: plain,
+      detail,
+      category,
+      memberDefinitions,
+      test: isTestPath(definition.source.path),
+    };
+    this.nodes.set(key, node);
+    return node;
+  }
 }
 
-failGeneration(generationId: number): void {
-  this.cacheStatements.markGenerationFailed.run(Date.now(), generationId);
-}
+/** Every prepared statement the cache owns; finalized together on close. */
+type CacheQueries = {
+  selectActiveGeneration: Statement<ActiveGenerationRow, []>;
+  deleteActivePointer: Statement<never, []>;
+  deleteGenerationsExcept: Statement<never, [number]>;
+  deleteAllGenerations: Statement<never, []>;
+  insertGeneration: Statement<never, ["startup" | "watch", number, string]>;
+  upsertPackages: Statement<never, [number, string]>;
+  upsertTreeEntry: Statement<never, [number, string, string, string, "directory" | "file", number]>;
+  upsertDiagram: Statement<never, [number, DiagramKind, string, string]>;
+  upsertFile: Statement<
+    never,
+    [number, string, string | null, string | null, string | null, string | null, LanguageId | null]
+  >;
+  selectFileRaw: Statement<{ raw_content: string | null }, [number, string]>;
+  updateFileDisplay: Statement<
+    never,
+    [string | null, string | null, string | null, LanguageId | null, number, string]
+  >;
+  deleteScopeGotoDefs: Statement<never, [number, string]>;
+  insertGotoDefinition: Statement<
+    never,
+    [
+      number,
+      string,
+      GotoDefinitionKind,
+      string,
+      string,
+      string,
+      number,
+      number,
+      number,
+      number,
+      string,
+      string,
+      string | null,
+      number | null,
+    ]
+  >;
+  deleteGenerationDefinitionIndex: Statement<never, [number]>;
+  deleteGenerationBindings: Statement<never, [number]>;
+  deleteGenerationContributors: Statement<never, [number]>;
+  deleteGenerationImports: Statement<never, [number]>;
+  insertDefinitionIndex: Statement<
+    never,
+    [
+      number,
+      string,
+      string | null,
+      number,
+      number,
+      string,
+      string,
+      string,
+      FileDefinitionKind,
+      string | null,
+      number,
+      number,
+    ]
+  >;
+  insertDefinitionBinding: Statement<
+    never,
+    [
+      number,
+      string,
+      string,
+      string,
+      DefinitionBindingSpace,
+      "local" | "import" | "export",
+      number,
+      string | null,
+      string | null,
+    ]
+  >;
+  insertDefinitionContributor: Statement<
+    never,
+    [number, string, string, "declaration" | "implementation" | "module"]
+  >;
+  insertFileImport: Statement<never, [number, string, string]>;
+  selectDefinitionIndexEntry: Statement<DefinitionLocationRow, [string, string, string]>;
+  selectFileDefinitions: Statement<DefinitionIndexRow, [number, string]>;
+  selectTopLevelDefinitions: Statement<DefinitionIndexRow, [number, string]>;
+  selectDefinitionByKey: Statement<DefinitionIndexRow, [number, string]>;
+  selectDefinitionChildren: Statement<DefinitionIndexRow, [number, string]>;
+  selectContributors: Statement<ContributorRow, [number, string]>;
+  selectContributedKeys: Statement<{ definition_key: string }, [number, string]>;
+  selectOutgoingRelations: Statement<RelationRow, [number, string]>;
+  selectLocalBindings: Statement<
+    BindingRow,
+    [number, string, string, string, DefinitionBindingSpace]
+  >;
+  selectImportBindings: Statement<
+    BindingRow,
+    [number, string, string, string, DefinitionBindingSpace]
+  >;
+  selectExportBindings: Statement<
+    BindingRow,
+    [number, string, string, string, DefinitionBindingSpace]
+  >;
+  selectTreeEntries: Statement<TreeRow, [number]>;
+  selectTreeChildren: Statement<TreeRow, [number, string, string]>;
+  selectTreeEntry: Statement<TreeRow, [number, string]>;
+  selectDirectoryFiles: Statement<{ path: string }, [number, string, string]>;
+  selectAllFiles: Statement<{ path: string }, [number]>;
+  selectDirectoryImports: Statement<
+    { source_path: string; target_path: string },
+    [number, string, string]
+  >;
+  selectAllImports: Statement<{ source_path: string; target_path: string }, [number]>;
+  selectPackages: Statement<PackageRow, [number]>;
+  selectDiagram: Statement<DiagramRow, [number, DiagramKind, string]>;
+  selectFailedDiagram: Statement<{ scope_path: string }, [number]>;
+  selectFile: Statement<FileRow, [number, string]>;
+  selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
+  selectDefinitions: Statement<GotoDefinitionRow, [number, string]>;
+  selectIndexedSearchCandidates: Statement<SearchCandidateRow, [number, string]>;
+  selectScanSearchCandidates: Statement<SearchCandidateRow, [number]>;
+  selectIndexedDefinitionCandidates: Statement<GotoDefinitionRow, [number, string, string]>;
+  selectScanDefinitionCandidates: Statement<GotoDefinitionRow, [number]>;
+  markGenerationActive: Statement<never, [number, number]>;
+  upsertActivePointer: Statement<never, [string]>;
+  deleteInactiveGeneration: Statement<never, [number]>;
+  markGenerationFailed: Statement<never, [number, number]>;
+  optimizeSearch: Statement<never, []>;
+  optimizeGotoDefinitionSearch: Statement<never, []>;
+};
 
-close(): void {
-  if (this.closed) return;
-  for (const statement of this.statements) statement.finalize();
-  this.db.close(true);
-  this.closed = true;
-}
+function prepareQueries(db: Database): CacheQueries {
+  return {
+    selectActiveGeneration: db.query<ActiveGenerationRow, []>(`
+      SELECT generations.id AS id, generations.source_fingerprint AS source_fingerprint
+      FROM cache_meta
+      JOIN generations
+        ON generations.id = CAST(cache_meta.value AS INTEGER)
+        AND generations.state = 'active'
+      WHERE cache_meta.key = 'active_generation'
+    `),
+    deleteActivePointer: db.query<never, []>(
+      "DELETE FROM cache_meta WHERE key = 'active_generation'",
+    ),
+    deleteGenerationsExcept: db.query<never, [number]>("DELETE FROM generations WHERE id <> ?"),
+    deleteAllGenerations: db.query<never, []>("DELETE FROM generations"),
+    insertGeneration: db.query<never, ["startup" | "watch", number, string]>(`
+      INSERT INTO generations(state, cause, started_at, source_fingerprint)
+      VALUES ('building', ?, ?, ?)
+    `),
+    upsertPackages: db.query<never, [number, string]>(`
+      INSERT INTO package_snapshots(generation_id, packages_json)
+      VALUES (?, ?)
+      ON CONFLICT(generation_id) DO UPDATE SET packages_json = excluded.packages_json
+    `),
+    upsertTreeEntry: db.query<
+      never,
+      [number, string, string, string, "directory" | "file", number]
+    >(`
+      INSERT INTO tree_entries(generation_id, path, parent_path, name, kind, viewable)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, path) DO UPDATE SET
+        parent_path = excluded.parent_path,
+        name = excluded.name,
+        kind = excluded.kind,
+        viewable = excluded.viewable
+    `),
+    upsertDiagram: db.query<never, [number, DiagramKind, string, string]>(`
+      INSERT INTO diagrams(generation_id, kind, scope_path, response_json)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(generation_id, kind, scope_path) DO UPDATE SET
+        response_json = excluded.response_json
+    `),
+    upsertFile: db.query<
+      never,
+      [number, string, string | null, string | null, string | null, string | null, LanguageId | null]
+    >(`
+      INSERT INTO files(
+        generation_id, path, raw_content, display_content, source_error, format_error, language
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, path) DO UPDATE SET
+        raw_content = excluded.raw_content,
+        display_content = excluded.display_content,
+        source_error = excluded.source_error,
+        format_error = excluded.format_error,
+        language = excluded.language
+    `),
+    selectFileRaw: db.query<{ raw_content: string | null }, [number, string]>(
+      "SELECT raw_content FROM files WHERE generation_id = ? AND path = ?",
+    ),
+    updateFileDisplay: db.query<
+      never,
+      [string | null, string | null, string | null, LanguageId | null, number, string]
+    >(`
+      UPDATE files
+      SET display_content = ?, source_error = ?, format_error = ?, language = ?
+      WHERE generation_id = ? AND path = ?
+    `),
+    deleteScopeGotoDefs: db.query<never, [number, string]>(
+      "DELETE FROM GotoDef WHERE generation_id = ? AND source_path = ?",
+    ),
+    insertGotoDefinition: db.query<never, [
+      number,
+      string,
+      GotoDefinitionKind,
+      string,
+      string,
+      string,
+      number,
+      number,
+      number,
+      number,
+      string,
+      string,
+      string | null,
+      number | null,
+    ]>(`
+      INSERT INTO GotoDef(
+        generation_id, definition_key, kind, name, qualified_name, source_path,
+        source_line, source_column, display_from, display_to, uml_scope_path,
+        uml_entity_name, uml_member_name, uml_member_occurrence
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    deleteGenerationDefinitionIndex: db.query<never, [number]>(
+      "DELETE FROM DefinitionIndex WHERE generation_id = ?",
+    ),
+    deleteGenerationBindings: db.query<never, [number]>(
+      "DELETE FROM definition_bindings WHERE generation_id = ?",
+    ),
+    deleteGenerationContributors: db.query<never, [number]>(
+      "DELETE FROM definition_contributors WHERE generation_id = ?",
+    ),
+    deleteGenerationImports: db.query<never, [number]>(
+      "DELETE FROM file_imports WHERE generation_id = ?",
+    ),
+    insertDefinitionIndex: db.query<never, [
+      number,
+      string,
+      string | null,
+      number,
+      number,
+      string,
+      string,
+      string,
+      FileDefinitionKind,
+      string | null,
+      number,
+      number,
+    ]>(`
+      INSERT INTO DefinitionIndex(
+        generation_id, definition_key, parent_key, is_top_level, has_body,
+        source_path, name, qualified_name, kind, type_text, source_line, source_column
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    insertDefinitionBinding: db.query<never, [
+      number,
+      string,
+      string,
+      string,
+      DefinitionBindingSpace,
+      "local" | "import" | "export",
+      number,
+      string | null,
+      string | null,
+    ]>(`
+      INSERT INTO definition_bindings(
+        generation_id, source_path, scope_key, name, space, binding_kind,
+        ordinal, target_key, target_module_path
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    insertDefinitionContributor: db.query<
+      never,
+      [number, string, string, "declaration" | "implementation" | "module"]
+    >(`
+      INSERT INTO definition_contributors(
+        generation_id, definition_key, source_path, contribution_kind
+      ) VALUES (?, ?, ?, ?)
+    `),
+    insertFileImport: db.query<never, [number, string, string]>(`
+      INSERT INTO file_imports(generation_id, source_path, target_path) VALUES (?, ?, ?)
+    `),
+    selectDefinitionIndexEntry: db.query<DefinitionLocationRow, [string, string, string]>(`
+      SELECT source_path, source_line, source_column
+      FROM DefinitionIndex
+      WHERE generation_id = (SELECT MAX(generation_id) FROM DefinitionIndex)
+        AND source_path = ?
+        AND name = ?
+        AND qualified_name = ?
+      ORDER BY source_line, source_column
+      LIMIT 1
+    `),
+    selectFileDefinitions: db.query<DefinitionIndexRow, [number, string]>(`
+      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
+        kind, type_text, source_path, source_line, source_column
+      FROM DefinitionIndex
+      WHERE generation_id = ? AND source_path = ?
+      ORDER BY source_line, source_column, definition_key
+    `),
+    selectTopLevelDefinitions: db.query<DefinitionIndexRow, [number, string]>(`
+      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
+        kind, type_text, source_path, source_line, source_column
+      FROM DefinitionIndex
+      WHERE generation_id = ? AND source_path = ? AND is_top_level = 1
+      ORDER BY source_line, source_column, definition_key
+    `),
+    selectDefinitionByKey: db.query<DefinitionIndexRow, [number, string]>(`
+      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
+        kind, type_text, source_path, source_line, source_column
+      FROM DefinitionIndex
+      WHERE generation_id = ? AND definition_key = ?
+    `),
+    selectDefinitionChildren: db.query<DefinitionIndexRow, [number, string]>(`
+      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
+        kind, type_text, source_path, source_line, source_column
+      FROM DefinitionIndex
+      WHERE generation_id = ? AND parent_key = ?
+      ORDER BY source_path, source_line, source_column, definition_key
+    `),
+    selectContributors: db.query<ContributorRow, [number, string]>(`
+      SELECT source_path, contribution_kind
+      FROM definition_contributors
+      WHERE generation_id = ? AND definition_key = ?
+      ORDER BY source_path, contribution_kind
+    `),
+    selectContributedKeys: db.query<{ definition_key: string }, [number, string]>(`
+      SELECT definition_key
+      FROM definition_contributors
+      WHERE generation_id = ? AND source_path = ?
+    `),
+    selectOutgoingRelations: db.query<RelationRow, [number, string]>(`
+      SELECT DISTINCT target_node_id, relation_kind
+      FROM diagram_edge_relations
+      WHERE generation_id = ? AND source_node_id = ? AND kind = 'uml'
+      ORDER BY target_node_id, relation_kind
+    `),
+    selectLocalBindings: db.query<
+      BindingRow,
+      [number, string, string, string, DefinitionBindingSpace]
+    >(`
+      SELECT target_key, target_module_path
+      FROM definition_bindings
+      WHERE generation_id = ? AND source_path = ? AND scope_key = ?
+        AND name = ? AND space = ? AND binding_kind = 'local'
+      ORDER BY ordinal
+    `),
+    selectImportBindings: db.query<
+      BindingRow,
+      [number, string, string, string, DefinitionBindingSpace]
+    >(`
+      SELECT target_key, target_module_path
+      FROM definition_bindings
+      WHERE generation_id = ? AND source_path = ? AND scope_key = ?
+        AND name = ? AND space = ? AND binding_kind = 'import'
+      ORDER BY ordinal
+    `),
+    selectExportBindings: db.query<
+      BindingRow,
+      [number, string, string, string, DefinitionBindingSpace]
+    >(`
+      SELECT target_key, target_module_path
+      FROM definition_bindings
+      WHERE generation_id = ? AND source_path = ? AND scope_key = ?
+        AND name = ? AND space = ? AND binding_kind = 'export'
+      ORDER BY ordinal
+    `),
+    selectTreeEntries: db.query<TreeRow, [number]>(`
+      SELECT path, name, kind, viewable
+      FROM tree_entries
+      WHERE generation_id = ?
+      ORDER BY path
+    `),
+    selectTreeChildren: db.query<TreeRow, [number, string, string]>(`
+      SELECT path, name, kind, viewable
+      FROM tree_entries
+      WHERE generation_id = ? AND parent_path = ? AND path <> ?
+      ORDER BY path
+    `),
+    selectTreeEntry: db.query<TreeRow, [number, string]>(`
+      SELECT path, name, kind, viewable
+      FROM tree_entries
+      WHERE generation_id = ? AND path = ?
+    `),
+    selectDirectoryFiles: db.query<{ path: string }, [number, string, string]>(`
+      SELECT path FROM tree_entries
+      WHERE generation_id = ? AND kind = 'file' AND path >= ? AND path < ?
+      ORDER BY path
+    `),
+    selectAllFiles: db.query<{ path: string }, [number]>(`
+      SELECT path FROM tree_entries WHERE generation_id = ? AND kind = 'file' ORDER BY path
+    `),
+    selectDirectoryImports: db.query<
+      { source_path: string; target_path: string },
+      [number, string, string]
+    >(`
+      SELECT source_path, target_path FROM file_imports
+      WHERE generation_id = ? AND source_path >= ? AND source_path < ?
+    `),
+    selectAllImports: db.query<{ source_path: string; target_path: string }, [number]>(`
+      SELECT source_path, target_path FROM file_imports WHERE generation_id = ?
+    `),
+    selectPackages: db.query<PackageRow, [number]>(`
+      SELECT packages_json FROM package_snapshots WHERE generation_id = ?
+    `),
+    selectDiagram: db.query<DiagramRow, [number, DiagramKind, string]>(`
+      SELECT response_json FROM diagrams
+      WHERE generation_id = ? AND kind = ? AND scope_path = ?
+    `),
+    selectFailedDiagram: db.query<{ scope_path: string }, [number]>(`
+      SELECT scope_path FROM diagrams
+      WHERE generation_id = ? AND json_extract(response_json, '$.status') = 'error'
+      LIMIT 1
+    `),
+    selectFile: db.query<FileRow, [number, string]>(`
+      SELECT path, raw_content, display_content, source_error, format_error, language
+      FROM files WHERE generation_id = ? AND path = ?
+    `),
+    selectDefinition: db.query<GotoDefinitionRow, [number, string, number, number]>(`
+      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
+        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
+        uml_member_name, uml_member_occurrence
+      FROM GotoDef
+      WHERE generation_id = ? AND source_path = ? AND source_line = ? AND source_column = ?
+      ORDER BY definition_key
+      LIMIT 1
+    `),
+    selectDefinitions: db.query<GotoDefinitionRow, [number, string]>(`
+      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
+        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
+        uml_member_name, uml_member_occurrence
+      FROM GotoDef
+      WHERE generation_id = ? AND source_path = ?
+      ORDER BY source_line, source_column, definition_key
+    `),
+    selectIndexedSearchCandidates: db.query<SearchCandidateRow, [number, string]>(`
+      SELECT files.path AS path, files.raw_content AS raw_content
+      FROM file_search
+      JOIN files ON file_search.rowid = files.id
+      WHERE files.generation_id = ? AND file_search.raw_content LIKE ?
+    `),
+    selectScanSearchCandidates: db.query<SearchCandidateRow, [number]>(`
+      SELECT path, raw_content FROM files
+      WHERE generation_id = ? AND raw_content IS NOT NULL
+    `),
+    selectIndexedDefinitionCandidates: db.query<GotoDefinitionRow, [number, string, string]>(`
+      SELECT GotoDef.definition_key, GotoDef.kind, GotoDef.name, GotoDef.qualified_name,
+        GotoDef.source_path, GotoDef.source_line, GotoDef.source_column,
+        GotoDef.display_from, GotoDef.display_to, GotoDef.uml_scope_path,
+        GotoDef.uml_entity_name, GotoDef.uml_member_name, GotoDef.uml_member_occurrence
+      FROM goto_def_search
+      JOIN GotoDef ON goto_def_search.rowid = GotoDef.id
+      WHERE GotoDef.generation_id = ?
+        AND (goto_def_search.name LIKE ? OR goto_def_search.qualified_name LIKE ?)
+    `),
+    selectScanDefinitionCandidates: db.query<GotoDefinitionRow, [number]>(`
+      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
+        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
+        uml_member_name, uml_member_occurrence
+      FROM GotoDef WHERE generation_id = ?
+    `),
+    markGenerationActive: db.query<never, [number, number]>(`
+      UPDATE generations SET state = 'active', completed_at = ?
+      WHERE id = ? AND state IN ('building', 'active')
+    `),
+    upsertActivePointer: db.query<never, [string]>(`
+      INSERT INTO cache_meta(key, value) VALUES ('active_generation', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `),
+    deleteInactiveGeneration: db.query<never, [number]>(
+      "DELETE FROM generations WHERE id = ? AND state <> 'active'",
+    ),
+    markGenerationFailed: db.query<never, [number, number]>(`
+      UPDATE generations SET state = 'failed', completed_at = ?
+      WHERE id = ? AND state = 'building'
+    `),
+    optimizeSearch: db.query<never, []>(
+      "INSERT INTO file_search(file_search) VALUES ('optimize')",
+    ),
+    optimizeGotoDefinitionSearch: db.query<never, []>(
+      "INSERT INTO goto_def_search(goto_def_search) VALUES ('optimize')",
+    ),
+  };
 }

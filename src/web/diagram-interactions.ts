@@ -1,3 +1,4 @@
+import type { FileDefinition } from "../types.ts";
 import { UML_METHOD_RETURN_MARKER } from "../types.ts";
 
 export type ViewportState = {
@@ -54,16 +55,68 @@ export function hasPassedDragThreshold(
   return dx * dx + dy * dy >= threshold * threshold;
 }
 
-export function externalUserIdFromNodeId(id: string): string | undefined {
-  return /classId-(extern\d+)-\d+$/.exec(id)?.[1];
+export function definitionNodeIdFromNodeId(id: string): string | undefined {
+  return /classId-(d\d+)-\d+$/.exec(id)?.[1];
 }
 
-export function localUserIdFromNodeId(id: string): string | undefined {
-  return /classId-(local\d+)-\d+$/.exec(id)?.[1];
+export function fileNodeIdFromNodeId(id: string): string | undefined {
+  return /(?:^|-)flowchart-(f\d+)-\d+$/.exec(id)?.[1];
 }
 
 export function packageNodeIdFromNodeId(id: string): string | undefined {
   return /(?:^|-)flowchart-(p\d+)-\d+$/.exec(id)?.[1];
+}
+
+export type DiagramPointerTarget =
+  | { kind: "definition"; definition: FileDefinition }
+  | { kind: "file"; path: string };
+
+export type DiagramTapAction = {
+  action: "select" | "open";
+  target: DiagramPointerTarget;
+};
+
+/** Fixed gesture bounds; deliberately independent of the OS double-click interval. */
+const DIAGRAM_TAP_INTERVAL_MS = 500;
+const DIAGRAM_TAP_RADIUS_PX = 5;
+
+/**
+ * Pointer-anchored two-tap recognizer for diagram links. The second tap consumes the *first*
+ * tap's target, so a repaint, viewport reset or loading overlay that replaces the pressed SVG
+ * node between presses still opens what the user pressed.
+ */
+export class DiagramClickSequence {
+  #snapshot:
+    | { target: DiagramPointerTarget; pointerId: number; timeStamp: number; x: number; y: number }
+    | undefined;
+
+  record(
+    target: DiagramPointerTarget | undefined,
+    pointerId: number,
+    timeStamp: number,
+    x: number,
+    y: number,
+  ): DiagramTapAction | undefined {
+    const snapshot = this.#snapshot;
+    if (
+      snapshot
+      && snapshot.pointerId === pointerId
+      && timeStamp - snapshot.timeStamp <= DIAGRAM_TAP_INTERVAL_MS
+      && Math.abs(x - snapshot.x) <= DIAGRAM_TAP_RADIUS_PX
+      && Math.abs(y - snapshot.y) <= DIAGRAM_TAP_RADIUS_PX
+    ) {
+      this.#snapshot = undefined;
+      return { action: "open", target: snapshot.target };
+    }
+    this.#snapshot = undefined;
+    if (!target) return undefined;
+    this.#snapshot = { target, pointerId, timeStamp, x, y };
+    return { action: "select", target };
+  }
+
+  clear(): void {
+    this.#snapshot = undefined;
+  }
 }
 
 export function formatUmlMethodReturnLabel(text: string): string | undefined {

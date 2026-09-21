@@ -1,97 +1,248 @@
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
-import { UML_METHOD_RETURN_MARKER } from "../src/types.ts";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
+import type { UmlTarget } from "../src/types.ts";
 import { FULL_UML_VISIBILITY, type UmlVisibility } from "../src/uml/model.ts";
-import { renderUmlView } from "../src/uml/view.ts";
+import { renderUmlView, type RenderedUmlFrame, type RenderedUmlView } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { materializeUmlGraph } from "./support/normalized-graph.ts";
+import { umlLabel } from "./support/uml-contract.ts";
+import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
+const projects: UmlProject[] = [];
 
 afterEach(async () => {
+  for (const project of projects.splice(0)) project.close();
   await fixtures.cleanup();
 });
 
 const FIXTURE_FILES = {
-  "src/model.ts": `export interface Output { code: number; }
+  "src/model.ts": `import { Bridge } from "../test/bridge.test";
+export interface Output { code: number; }
 export class ResultService {
   private cache?: Output;
+  bridge: Bridge;
   execute(value: string): Output { return { code: value.length }; }
 }
+export const marker = 1;
 `,
-  "test/model.test.ts": `import { ResultService } from "../src/model.ts";
-export class TestHarness {}
-export function runs(): void { new ResultService().execute("x"); }
+  "test/bridge.test.ts": `import { Leaf } from "../src/leaf";
+export class Bridge { leaf: Leaf; }
+export class SecondRoot {}
 `,
+  "src/leaf.ts": "export class Leaf {}\n",
+  "src/empty.ts": "",
+  "only-tests/thing.test.ts": "export class OnlyTest {}\n",
 };
 
-test("global visibility toggles filter the maximal UML model at emission time", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-uml-visibility-", FIXTURE_FILES);
-  const materialized = await materializeUmlGraph(
-    root,
-    await extractUmlDiagramGraph(root, "", []),
+async function openFixture(prefix: string): Promise<UmlProject> {
+  const root = await fixtures.fixtureRoot(prefix, FIXTURE_FILES);
+  // A directory with no files at all; the tree still lists it as a selectable target.
+  await mkdir(join(root, "nothing"), { recursive: true });
+  const project = await buildUmlProject(root);
+  projects.push(project);
+  return project;
+}
+
+function render(
+  project: UmlProject,
+  target: UmlTarget,
+  overrides: Partial<UmlVisibility> = {},
+): RenderedUmlView {
+  const diagram = readCompleteUml(project, target);
+  return renderUmlView(diagram.view, { ...FULL_UML_VISIBILITY, ...overrides }, target);
+}
+
+/** The definitions a frame actually drew, by label, in emission order. */
+function drawn(frame: RenderedUmlFrame | undefined): string[] {
+  if (!frame) throw new Error("no frame rendered");
+  return frame.definitionLinks.map((link) => umlLabel(link.definition));
+}
+
+test("Attributes and Methods hide compartments without touching the graph", async () => {
+  const project = await openFixture("ts-explorer-uml-compartments-");
+  const target: UmlTarget = {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "ResultService"),
+  };
+
+  const full = render(project, target).frames[0];
+  const withoutAttributes = render(project, target, { attributes: false }).frames[0];
+  const withoutMethods = render(project, target, { methods: false }).frames[0];
+
+  const nodes = [
+    "Leaf@src/leaf.ts",
+    "Output@src/model.ts",
+    "ResultService@src/model.ts",
+    "Bridge@test/bridge.test.ts",
+  ];
+  expect(drawn(full)).toEqual(nodes);
+  expect(drawn(withoutAttributes)).toEqual(nodes);
+  expect(drawn(withoutMethods)).toEqual(nodes);
+  expect(full?.title).toContain("ResultService");
+  expect(full?.title).toContain("src/model.ts");
+
+  expect(full?.dsl).toContain("cache");
+  expect(full?.dsl).toContain("execute()");
+  expect(withoutAttributes?.dsl).not.toContain("cache");
+  expect(withoutAttributes?.dsl).toContain("execute()");
+  expect(withoutMethods?.dsl).toContain("cache");
+  expect(withoutMethods?.dsl).not.toContain("execute()");
+
+  // Navigation rows follow the emitted compartments, and the root keeps its emphasis either way.
+  const serviceLink = (frame: RenderedUmlFrame | undefined) =>
+    frame?.definitionLinks.find((link) => link.definition.qualifiedName === "ResultService");
+  expect(serviceLink(full)?.attributes.map(umlLabel)).toEqual([
+    "ResultService.cache@src/model.ts",
+    "ResultService.bridge@src/model.ts",
+  ]);
+  expect(serviceLink(full)?.methods.map(umlLabel)).toEqual(["ResultService.execute@src/model.ts"]);
+  expect(serviceLink(withoutAttributes)?.attributes).toEqual([]);
+  expect(serviceLink(withoutAttributes)?.methods.map(umlLabel)).toEqual([
+    "ResultService.execute@src/model.ts",
+  ]);
+  expect(serviceLink(withoutMethods)?.methods).toEqual([]);
+  const rootId = serviceLink(withoutMethods)?.nodeId;
+  expect(withoutMethods?.dsl).toContain(`cssClass "${rootId}" rootNode`);
+});
+
+test("a selected member root survives its own compartment control being off", async () => {
+  const project = await openFixture("ts-explorer-uml-member-root-");
+
+  const property = render(project, {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "ResultService.cache"),
+  }, { attributes: false }).frames[0];
+  expect(property?.emptyMessage).toBeUndefined();
+  expect(drawn(property)).toEqual([
+    "Output@src/model.ts",
+    "ResultService.cache@src/model.ts",
+  ]);
+
+  const method = render(project, {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "ResultService.execute"),
+  }, { methods: false }).frames[0];
+  expect(method?.emptyMessage).toBeUndefined();
+  expect(drawn(method)).toEqual([
+    "Output@src/model.ts",
+    "ResultService.execute@src/model.ts",
+  ]);
+});
+
+test("Types hides declared type text but never a type node", async () => {
+  const project = await openFixture("ts-explorer-uml-types-");
+  const service: UmlTarget = {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "ResultService"),
+  };
+
+  const full = render(project, service).frames[0];
+  const withoutTypes = render(project, service, { types: false }).frames[0];
+  expect(full?.dsl).toContain(": Output");
+  expect(withoutTypes?.dsl).not.toContain(": Output");
+  // `Output` is still a node of the graph, and still carries the property row that referenced it.
+  expect(drawn(withoutTypes)).toEqual(drawn(full));
+  expect(withoutTypes?.dsl).toContain("cache");
+
+  const marker: UmlTarget = {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "marker"),
+  };
+  // An unannotated value shows an em dash rather than an invented inferred type.
+  expect(render(project, marker).frames[0]?.dsl).toContain("—");
+  expect(render(project, marker, { types: false }).frames[0]?.dsl).not.toContain("—");
+});
+
+test("Tests hides test nodes and drops what only they reached", async () => {
+  const project = await openFixture("ts-explorer-uml-tests-filter-");
+  const service: UmlTarget = {
+    kind: "definition",
+    path: "src/model.ts",
+    definitionKey: project.key("src/model.ts", "ResultService"),
+  };
+
+  expect(drawn(render(project, service).frames[0])).toContain("Bridge@test/bridge.test.ts");
+
+  const withoutTests = render(project, service, { tests: false }).frames[0];
+  // `Leaf` is production code, but the only path to it ran through the hidden test class.
+  expect(drawn(withoutTests)).toEqual(["Output@src/model.ts", "ResultService@src/model.ts"]);
+  expect(withoutTests?.dsl).not.toContain("Leaf");
+});
+
+test("a hidden definition root says so while a file selection just omits its frames", async () => {
+  const project = await openFixture("ts-explorer-uml-hidden-root-");
+  const bridgeKey = project.key("test/bridge.test.ts", "Bridge");
+
+  const definition = render(project, {
+    kind: "definition",
+    path: "test/bridge.test.ts",
+    definitionKey: bridgeKey,
+  }, { tests: false });
+  expect(definition.frames).toHaveLength(1);
+  expect(definition.frames[0]?.emptyMessage).toBe(
+    "Selected definition is hidden by the Tests filter.",
   );
-  const { cached, record } = materialized;
-  const { view } = cached;
-  const dslFor = (overrides: Partial<UmlVisibility>): string =>
-    renderUmlView(view, { ...FULL_UML_VISIBILITY, ...overrides }).dsl;
+  expect(definition.frames[0]?.rootKey).toBe(bridgeKey);
+  expect(definition.frames[0]?.dsl).toBe("");
 
-  const full = dslFor({});
-  expect(full).toContain("cache");
-  expect(full).toContain("execute()");
-  expect(full).toContain(": Output");
-  expect(full).toContain("class local0[");
-  expect(full).toContain("TestHarness");
+  // The same file selected whole reports that nothing is left, without naming a root.
+  const file = render(project, { kind: "file", path: "test/bridge.test.ts" }, { tests: false });
+  expect(file.frames).toHaveLength(1);
+  expect(file.frames[0]?.emptyMessage).toBe("No visible definitions");
+  expect(file.frames[0]?.rootKey).toBeNull();
 
-  const withoutAttributes = dslFor({ attributes: false });
-  expect(withoutAttributes).not.toContain("cache");
-  expect(withoutAttributes).toContain("execute()");
-  expect(withoutAttributes).toContain("class local0[");
+  // Unfiltered, that file really does have two roots.
+  expect(render(project, { kind: "file", path: "test/bridge.test.ts" }).frames.map((frame) =>
+    frame.rootKey
+  )).toEqual([bridgeKey, project.key("test/bridge.test.ts", "SecondRoot")]);
+});
 
-  const withoutMethods = dslFor({ methods: false });
-  expect(withoutMethods).not.toContain("execute()");
-  expect(withoutMethods).toContain("cache");
+test("empty selections name the kind of thing that is missing", async () => {
+  const project = await openFixture("ts-explorer-uml-empty-states-");
 
-  const withoutTypes = dslFor({ types: false });
-  expect(withoutTypes).toContain("cache");
-  expect(withoutTypes).toContain("execute()");
-  expect(withoutTypes).not.toContain(": Output");
-  expect(withoutTypes).not.toContain(UML_METHOD_RETURN_MARKER);
+  const emptyFile = render(project, { kind: "file", path: "src/empty.ts" });
+  expect(emptyFile.frames[0]?.emptyMessage).toBe("No definitions");
+  expect(emptyFile.dsl).toBe("");
 
-  const withoutTests = dslFor({ tests: false });
-  expect(withoutTests).not.toContain("local0");
-  expect(withoutTests).not.toContain("TestHarness");
-  expect(withoutTests).toContain("ResultService");
-  expect(withoutTests).toContain("Output");
+  const emptyDirectory = render(project, { kind: "directory", path: "nothing" });
+  expect(emptyDirectory.frames[0]?.emptyMessage).toBe("No files");
+  expect(emptyDirectory.dsl).toBe("");
 
-  const namesOnly = dslFor({ attributes: false, methods: false, types: false, tests: false });
-  expect(namesOnly).toContain("ResultService");
-  expect(namesOnly).toContain("Output");
-  expect(namesOnly).toContain("classDef concrete");
-  expect(namesOnly).toContain('cssClass "ResultService" concrete');
-  expect(namesOnly).toContain('cssClass "Output" interface');
+  // A directory whose every file is hidden by the Tests filter is empty for the same reason.
+  const onlyTests = render(project, { kind: "directory", path: "only-tests" }, { tests: false });
+  expect(onlyTests.frames[0]?.emptyMessage).toBe("No files");
+});
 
-  const fullFrames = renderUmlView(view, FULL_UML_VISIBILITY).dsls;
-  expect(fullFrames.length).toBeGreaterThan(0);
-  for (const frame of fullFrames) expect(frame).toContain("classDiagram");
-  for (const frame of renderUmlView(view, { ...FULL_UML_VISIBILITY, tests: false }).dsls) {
-    expect(frame).not.toContain("TestHarness");
-  }
+test("a directory view ignores the compartment controls but obeys Tests", async () => {
+  const project = await openFixture("ts-explorer-uml-directory-visibility-");
+  const target: UmlTarget = { kind: "directory", path: "src" };
 
-  // SQLite keeps the maximal model: rendering a reduced view never rewrites what was persisted.
-  expect(record.properties.filter((property) => property.name === "cache")).toEqual([
-    expect.objectContaining({ name: "cache", type: "Output", optional: true }),
+  const full = render(project, target);
+  const withoutDetail = render(project, target, {
+    attributes: false,
+    methods: false,
+    types: false,
+  });
+  expect(withoutDetail.dsl).toBe(full.dsl);
+  expect(full.frames[0]?.fileLinks.map((link) => link.path)).toEqual([
+    "src/empty.ts",
+    "src/leaf.ts",
+    "src/model.ts",
+    "test/bridge.test.ts",
   ]);
-  expect(record.methods.filter((method) => method.name === "execute")).toEqual([
-    expect.objectContaining({
-      name: "execute",
-      returnType: `\n${UML_METHOD_RETURN_MARKER}() Output`,
-    }),
+
+  // The test file is an outside boundary leaf here; hiding tests removes it and its import arrow.
+  const withoutTests = render(project, target, { tests: false });
+  expect(withoutTests.frames[0]?.fileLinks.map((link) => link.path)).toEqual([
+    "src/empty.ts",
+    "src/leaf.ts",
+    "src/model.ts",
   ]);
-  expect(record.localUsers.map((user) => user.path)).toEqual(["test/model.test.ts"]);
-  expect(
-    view.declarations.flatMap((declaration) =>
-      declaration.classes.flatMap((entity) => entity.properties)
-    ),
-  ).toContainEqual(expect.objectContaining({ name: "cache", type: "Output" }));
+  expect(withoutTests.dsl).not.toContain("bridge.test.ts");
 });

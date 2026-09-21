@@ -6,304 +6,676 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import type {
   DefinitionLookupResponse,
   DiagramResponse,
+  FileDefinition,
+  FileDefinitionsResponse,
   FileResponse,
   GotoDefinition,
-  GotoDefinitionLookupResponse,
   PackageDiagramNode,
-  PackageInfo,
-  PreprocessControlRequest,
-  PreprocessPriorityResponse,
   SearchResponse,
   TreeNode,
-  UmlExternalUser,
-  UmlLocalUser,
   UmlSourceLocation,
+  UmlTarget,
   WatchMessage,
 } from "../types.ts";
 import { FULL_UML_VISIBILITY } from "../uml/model.ts";
-import { renderUmlView } from "../uml/view.ts";
+import { type RenderedUmlFrame, renderUmlView } from "../uml/view.ts";
 import {
   adjacentTreeRowIndex,
+  DiagramClickSequence,
+  type DiagramPointerTarget,
   RequestSequence,
-  externalUserIdFromNodeId,
   formatUmlMethodReturnLabel,
-  localUserIdFromNodeId,
-  packageNodeIdFromNodeId,
   hasDiagramBody,
   hasPassedDragThreshold,
   matchesSearchQuery,
+  packageNodeIdFromNodeId,
   panViewport,
   treeScrollTopForRow,
   zoomViewportAt,
   type ViewportState,
 } from "./diagram-interactions.ts";
 
-function $<T extends Element = HTMLInputElement>(selector:string):T{const element=document.querySelector<T>(selector);if(!element)throw new Error(`Missing required element: ${selector}`);return element;}
-type UmlDiagramResponse=Extract<DiagramResponse,{kind:"uml"}>;
-const state={tree:null as TreeNode|null,mode:"packages" as "packages"|"uml",activeView:"packages" as "packages"|"uml"|"editor",scope:"",umlScope:"",search:"",searchCaseInsensitive:false,searchFiles:new Set<string>(),searchDirs:new Set<string>(),searchDefinitions:[] as GotoDefinition[],version:0,file:null as FileResponse|null,view:null as EditorView|null,retry:250,expandedDirs:new Set<string>(),packages:[] as readonly PackageInfo[],umlVisibility:{...FULL_UML_VISIBILITY},umlRenders:[] as {scope:string;diagram:UmlDiagramResponse}[],umlScopedErrors:false};
-const ZOOM_IN_FACTOR=1.25;
-const ZOOM_OUT_FACTOR=1/ZOOM_IN_FACTOR;
-const EMPTY_DIAGRAM_MESSAGE="No diagram content for this scope";
-const viewport:ViewportState&{apply():void;reset():void;zoomAt(factor:number,x:number,y:number):void}={scale:1,x:0,y:0,apply(){$("#svg-holder").style.transform=`translate(${this.x}px,${this.y}px) scale(${this.scale})`;},reset(){this.scale=1;this.x=0;this.y=0;this.apply();const stage=$("#diagram-stage");stage.scrollLeft=0;stage.scrollTop=0;},zoomAt(factor,x,y){zoomViewportAt(this,factor,x,y);this.apply();}};
-const diagramRequests=new RequestSequence();
-const searchRequests=new RequestSequence();
-const priorityRequests=new RequestSequence();
-const definitionRequests=new RequestSequence();
-const editorRequests=new RequestSequence();
-const emittedUmlScopes=new Set<string>();
-const diagramLoadingState={loading:false,showMessage:false};
-let activeScopeSyncToken:number|undefined;
-let diagramError:string|undefined;
-let deferredOpenFileRefresh=false;
-mermaid.initialize({startOnLoad:false,securityLevel:"strict",theme:"dark"});
-async function api<T>(url:string,init?:RequestInit):Promise<T>{const response=await fetch(url,init);const body=await response.json() as T & {error?:string};if(!response.ok)throw new Error(body.error??`Request failed (${response.status})`);return body;}
-type PriorityPollResult={cancelled:true}|{cancelled:false;response:PreprocessPriorityResponse};
-const CANCELLED_PRIORITY_RESULT:PriorityPollResult={cancelled:true};
-async function sendPreprocessControl(request:PreprocessControlRequest):Promise<PreprocessPriorityResponse>{
-  return api<PreprocessPriorityResponse>("/api/preprocess",{
-    method:"POST",
-    headers:{"content-type":"application/json"},
-    body:JSON.stringify(request),
-  });
+function $<T extends Element = HTMLInputElement>(selector: string): T {
+  const element = document.querySelector<T>(selector);
+  if (!element) throw new Error(`Missing required element: ${selector}`);
+  return element;
 }
-async function prioritizeScope(
-  resource:string,
-  sequence:RequestSequence,
-  token:number,
-):Promise<PriorityPollResult>{
-  let response=await sendPreprocessControl({
-    action:"prioritize",
-    resource:resource===""?".":`./${resource}`,
-  });
-  if(!sequence.isCurrent(token))return CANCELLED_PRIORITY_RESULT;
-  while(response.status!=="done"){
-    await new Promise<void>((resolve)=>setTimeout(resolve,100));
-    if(!sequence.isCurrent(token))return CANCELLED_PRIORITY_RESULT;
-    response=await sendPreprocessControl({action:"poll",requestId:response.requestId});
-    if(!sequence.isCurrent(token))return CANCELLED_PRIORITY_RESULT;
-  }
-  return{cancelled:false,response};
+
+type UmlDiagramResponse = Extract<DiagramResponse, { kind: "uml" }>;
+type PackageDiagramResponse = Extract<DiagramResponse, { kind: "packages" }>;
+
+/** Per-file outline lifecycle. Entry identity is the guard against stale responses committing. */
+type FileDefinitionEntry =
+  | { status: "loading" }
+  | { status: "ready"; definitions: FileDefinition[] }
+  | { status: "error"; error: string };
+
+const ROOT_TARGET: UmlTarget = { kind: "directory", path: "" };
+
+const state = {
+  tree: null as TreeNode | null,
+  mode: "packages" as "packages" | "uml",
+  activeView: "packages" as "packages" | "uml" | "editor",
+  /** The full UML selection, including a definition root; retained across tab switches. */
+  umlTarget: ROOT_TARGET as UmlTarget,
+  search: "",
+  searchCaseInsensitive: false,
+  searchFiles: new Set<string>(),
+  searchDirs: new Set<string>(),
+  searchDefinitions: [] as GotoDefinition[],
+  version: 0,
+  file: null as FileResponse | null,
+  view: null as EditorView | null,
+  retry: 250,
+  expandedDirs: new Set<string>(),
+  expandedFiles: new Set<string>(),
+  fileDefinitions: new Map<string, FileDefinitionEntry>(),
+  umlVisibility: { ...FULL_UML_VISIBILITY },
+  umlRenders: [] as { target: UmlTarget; diagram: UmlDiagramResponse }[],
+  umlRenderVersion: -1,
+  umlScopedErrors: false,
+};
+
+const ZOOM_IN_FACTOR = 1.25;
+const ZOOM_OUT_FACTOR = 1 / ZOOM_IN_FACTOR;
+const EMPTY_DIAGRAM_MESSAGE = "No diagram content for this scope";
+
+const viewport: ViewportState & {
+  apply(): void;
+  reset(): void;
+  zoomAt(factor: number, x: number, y: number): void;
+} = {
+  scale: 1,
+  x: 0,
+  y: 0,
+  apply() {
+    $("#svg-holder").style.transform = `translate(${this.x}px,${this.y}px) scale(${this.scale})`;
+  },
+  reset() {
+    this.scale = 1;
+    this.x = 0;
+    this.y = 0;
+    this.apply();
+    const stage = $("#diagram-stage");
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+  },
+  zoomAt(factor, x, y) {
+    zoomViewportAt(this, factor, x, y);
+    this.apply();
+  },
+};
+
+const diagramRequests = new RequestSequence();
+const searchRequests = new RequestSequence();
+const definitionRequests = new RequestSequence();
+const editorRequests = new RequestSequence();
+const clickSequence = new DiagramClickSequence();
+const diagramLoadingState = { loading: false, showMessage: false };
+let diagramError: string | undefined;
+let pendingDiagram: { key: string; token: number } | undefined;
+let paintedUmlKey: string | undefined;
+
+mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
+
+async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  const body = await response.json() as T & { error?: string };
+  if (!response.ok) throw new Error(body.error ?? `Request failed (${response.status})`);
+  return body;
 }
-function setStatus(text:string,error=false){const node=$("#status");node.textContent=text;node.classList.toggle("error",error);}
-function renderErrorPanel():void{const panel=$("#error-panel");const text=(diagramLoadingState.loading||activeScopeSyncToken!==undefined)?undefined:diagramError;panel.textContent=text??"";panel.hidden=!text;}
-function showError(error:string|undefined){diagramError=error;renderErrorPanel();}
-function applyDiagramLoading():void{
-  const loading=diagramLoadingState.loading||activeScopeSyncToken!==undefined;
-  const showMessage=diagramLoadingState.showMessage||activeScopeSyncToken!==undefined;
-  const panel=$("#diagram-loading");
-  panel.hidden=!showMessage;
-  const stage=$("#diagram-stage");
-  stage.setAttribute("aria-busy",String(loading));
-  stage.classList.toggle("loading",loading);
+
+function diagramKey(target: UmlTarget): string {
+  return JSON.stringify(
+    target.kind === "definition"
+      ? ["definition", target.path, target.definitionKey]
+      : [target.kind, target.path],
+  );
+}
+
+function diagramQuery(target: UmlTarget): string {
+  const params = new URLSearchParams({ kind: "uml", target: target.kind, path: target.path });
+  if (target.kind === "definition") params.set("definition", target.definitionKey);
+  return params.toString();
+}
+
+function setStatus(text: string, error = false): void {
+  const node = $("#status");
+  node.textContent = text;
+  node.classList.toggle("error", error);
+}
+
+function renderErrorPanel(): void {
+  const panel = $("#error-panel");
+  const text = diagramLoadingState.loading ? undefined : diagramError;
+  panel.textContent = text ?? "";
+  panel.hidden = !text;
+}
+
+function showError(error: string | undefined): void {
+  diagramError = error;
   renderErrorPanel();
 }
-function setDiagramLoading(loading:boolean,showMessage=false):void{
-  diagramLoadingState.loading=loading;
-  diagramLoadingState.showMessage=showMessage;
+
+function applyDiagramLoading(): void {
+  const panel = $("#diagram-loading");
+  panel.hidden = !diagramLoadingState.showMessage;
+  const stage = $("#diagram-stage");
+  stage.setAttribute("aria-busy", String(diagramLoadingState.loading));
+  stage.classList.toggle("loading", diagramLoadingState.loading);
+  renderErrorPanel();
+}
+
+function setDiagramLoading(loading: boolean, showMessage = false): void {
+  diagramLoadingState.loading = loading;
+  diagramLoadingState.showMessage = showMessage;
   applyDiagramLoading();
 }
-function supersedeScopeSyncLoading():void{
-  activeScopeSyncToken=undefined;
-  deferredOpenFileRefresh=false;
-  applyDiagramLoading();
+
+function setEditorLoading(loading: boolean): void {
+  $("#editor-loading").hidden = !loading;
 }
-function beginScopeSyncLoading(token:number):void{
-  activeScopeSyncToken=token;
-  applyDiagramLoading();
-}
-function endScopeSyncLoading(token:number):void{
-  if(activeScopeSyncToken!==token)return;
-  activeScopeSyncToken=undefined;
-  applyDiagramLoading();
-  const refreshOpenFile=deferredOpenFileRefresh;
-  deferredOpenFileRefresh=false;
-  if(refreshOpenFile&&state.file)void reloadOpenFile();
-}
-function setEditorLoading(loading:boolean):void{$("#editor-loading").hidden=!loading;}
-function parseMethodName(text:string):string{const normalized=text.trim().replace(/^\\?[+\-#~]/,"");const parenthesis=normalized.indexOf("(");return (parenthesis===-1?normalized:normalized.slice(0,parenthesis)).trim();}
-function sourceFromLink(link:Element):UmlSourceLocation|undefined{const data=(link as HTMLElement).dataset;const line=Number(data.sourceLine);const column=Number(data.sourceColumn);if(!data.sourcePath||!Number.isInteger(line)||!Number.isInteger(column))return undefined;return{path:data.sourcePath,line,column};}
-function makeSourceLink(
-  element: Element,
-  location: UmlSourceLocation,
-  label: string,
-  view: "editor" | "uml",
-): void {
-  element.classList.add(view === "editor" ? "uml-source-link" : "uml-definition-link");
+
+// ---------------------------------------------------------------------------
+// Diagram link registry
+// ---------------------------------------------------------------------------
+
+const diagramLinks = new Map<string, DiagramPointerTarget>();
+let nextDiagramLinkId = 0;
+
+function registerDiagramLink(element: Element, target: DiagramPointerTarget, label: string): void {
+  const id = String(nextDiagramLinkId++);
+  diagramLinks.set(id, target);
+  const html = element as HTMLElement;
+  html.dataset.diagramLink = id;
+  element.classList.add(target.kind === "definition" ? "uml-definition-link" : "uml-file-link");
   element.setAttribute("role", "link");
   element.setAttribute("tabindex", "0");
-  element.setAttribute(
-    "aria-label",
-    view === "editor" ? `Open ${label} in editor` : `Open ${label} UML definition`,
-  );
-  const data = (element as HTMLElement).dataset;
-  data.sourcePath = location.path;
-  data.sourceLine = String(location.line);
-  data.sourceColumn = String(location.column);
+  element.setAttribute("aria-label", `Select ${label}; double-click to open its source`);
 }
-function decoratePackageNodes(root:Element,packageNodes:readonly PackageDiagramNode[]):void{const byId=new Map(packageNodes.map((pkg)=>[pkg.nodeId,pkg]));for(const node of root.querySelectorAll<SVGGElement>("g.node")){const nodeId=packageNodeIdFromNodeId(node.id);if(!nodeId)continue;const pkg=byId.get(nodeId);if(!pkg)continue;node.classList.add("package-link");node.setAttribute("role","link");node.setAttribute("tabindex","0");node.setAttribute("aria-label",`Open ${pkg.name} UML`);node.dataset.packageName=pkg.name;node.dataset.scopePath=pkg.path;}}
-function decorateUmlUsers(root:Element,localUsers:readonly UmlLocalUser[],externalUsers:readonly UmlExternalUser[]):void{
-  const localById=new Map(localUsers.map((user)=>[user.nodeId,user]));
-  const externalById=new Map(externalUsers.map((user)=>[user.nodeId,user]));
-  for(const node of root.querySelectorAll<SVGGElement>("g.node")){
-    const localId=localUserIdFromNodeId(node.id);
-    const local=localId?localById.get(localId):undefined;
-    if(local){const title=node.querySelector(".label-group .label, .classTitle");if(title)makeSourceLink(title,local,local.label,"editor");continue;}
-    const externalId=externalUserIdFromNodeId(node.id);
-    const external=externalId?externalById.get(externalId):undefined;
-    if(!external)continue;
-    const title=node.querySelector(".label-group .label, .classTitle");
-    if(!title)continue;
-    title.classList.add("uml-external-link");title.setAttribute("role","link");title.setAttribute("tabindex","0");title.setAttribute("aria-label","Open external user UML");(title as HTMLElement).dataset.scopePath=external.scopePath;
-  }
+
+function diagramTargetFromElement(node: EventTarget | null): DiagramPointerTarget | undefined {
+  if (!(node instanceof Element)) return undefined;
+  const link = node.closest<HTMLElement>("[data-diagram-link]");
+  const id = link?.dataset.diagramLink;
+  return id === undefined ? undefined : diagramLinks.get(id);
 }
-function bareDiagramName(name:string):string{const generic=name.search(/[<~]/);return generic===-1?name:name.slice(0,generic);}
-function compareDefinitions(left:GotoDefinition,right:GotoDefinition):number{return left.source.path.localeCompare(right.source.path)||left.source.line-right.source.line||left.source.column-right.source.column||left.key.localeCompare(right.key);}
-function decorateUmlDefinitions(root:Element,definitions:readonly GotoDefinition[]):void{
-  const ordered=[...definitions].sort(compareDefinitions);
-  for(const node of root.querySelectorAll<SVGGElement>("g.node")){
-    const match=/classId-(.+)-\d+$/.exec(node.id);
-    if(!match)continue;
-    const entityName=match[1];if(entityName===undefined)continue;
-    const candidates=ordered.filter((definition)=>bareDiagramName(definition.uml.entityName)===bareDiagramName(entityName));
-    const entity=candidates.find((definition)=>definition.kind!=="method");
-    const title=node.querySelector(".label-group .label, .classTitle");
-    if(title){
-      (title as HTMLElement).dataset.searchText=(title.textContent??"").trim()||entityName;
-      if(entity)makeSourceLink(title,entity.source,entity.qualifiedName,"uml");
+
+function parseMethodName(text: string): string {
+  const normalized = text.trim().replace(/^\\?[+\-#~]/, "");
+  const parenthesis = normalized.indexOf("(");
+  return (parenthesis === -1 ? normalized : normalized.slice(0, parenthesis)).trim();
+}
+
+function decorateDefinitionFrame(root: Element, frame: RenderedUmlFrame): void {
+  const byNodeId = new Map(frame.definitionLinks.map((link) => [link.nodeId, link] as const));
+  for (const node of root.querySelectorAll<SVGGElement>("g.node")) {
+    const match = /classId-(.+)-\d+$/.exec(node.id);
+    const nodeId = match?.[1];
+    const link = nodeId === undefined ? undefined : byNodeId.get(nodeId);
+    if (!link) continue;
+    const title = node.querySelector(".label-group .label, .classTitle");
+    if (title) {
+      (title as HTMLElement).dataset.searchText = (title.textContent ?? "").trim();
+      registerDiagramLink(
+        title,
+        { kind: "definition", definition: link.definition },
+        link.definition.qualifiedName,
+      );
     }
-    const occurrences=new Map<string,number>();
-    for(const label of node.querySelectorAll(".methods-group > .label")){
-      const formattedReturn=formatUmlMethodReturnLabel(label.textContent??"");
-      if(formattedReturn!==undefined){
-        const content=label.querySelector(".nodeLabel p, .nodeLabel")??label;
-        content.textContent=formattedReturn;
+    const attributeRows = [...node.querySelectorAll(".members-group > .label")];
+    for (const [index, row] of attributeRows.entries()) {
+      const member = link.attributes[index];
+      if (!member) continue;
+      (row as HTMLElement).dataset.searchText = (row.textContent ?? "").trim();
+      registerDiagramLink(row, { kind: "definition", definition: member }, member.qualifiedName);
+    }
+    let methodIndex = 0;
+    for (const row of node.querySelectorAll(".methods-group > .label")) {
+      const formattedReturn = formatUmlMethodReturnLabel(row.textContent ?? "");
+      if (formattedReturn !== undefined) {
+        const content = row.querySelector(".nodeLabel p, .nodeLabel") ?? row;
+        content.textContent = formattedReturn;
         continue;
       }
-      const methodName=parseMethodName(label.textContent??"");
-      if(!methodName)continue;
-      (label as HTMLElement).dataset.searchText=methodName;
-      const occurrence=occurrences.get(methodName)??0;
-      occurrences.set(methodName,occurrence+1);
-      const method=candidates.find((definition)=>
-        definition.kind==="method"
-        && definition.uml.memberName===methodName
-        && definition.uml.memberOccurrence===occurrence
-      );
-      if(method)makeSourceLink(label,method.source,method.qualifiedName,"uml");
+      const member = link.methods[methodIndex];
+      methodIndex += 1;
+      if (!member) continue;
+      (row as HTMLElement).dataset.searchText = parseMethodName(row.textContent ?? "");
+      registerDiagramLink(row, { kind: "definition", definition: member }, member.qualifiedName);
     }
   }
 }
-function focusUmlDefinition(location:UmlSourceLocation):boolean{
-  const target=[...document.querySelectorAll<HTMLElement>("#svg-holder .uml-definition-link")].find((element)=>
-    element.dataset.sourcePath===location.path
-    && Number(element.dataset.sourceLine)===location.line
-    && Number(element.dataset.sourceColumn)===location.column
-  );
-  if(!target)return false;
-  document.querySelectorAll("#svg-holder .definition-target").forEach((element)=>{element.classList.remove("definition-target");});
-  target.classList.add("definition-target");
-  target.scrollIntoView({block:"center",inline:"center"});
-  target.focus({preventScroll:true});
-  return true;
+
+function decorateFileFrame(root: Element, frame: RenderedUmlFrame): void {
+  const byNodeId = new Map(frame.fileLinks.map((link) => [link.nodeId, link] as const));
+  for (const node of root.querySelectorAll<SVGGElement>("g.node")) {
+    const match = /(?:^|-)flowchart-(f\d+)-\d+$/.exec(node.id);
+    const nodeId = match?.[1];
+    const link = nodeId === undefined ? undefined : byNodeId.get(nodeId);
+    if (!link) continue;
+    const label = node.querySelector(".nodeLabel") ?? node;
+    (label as HTMLElement).dataset.searchText = link.path;
+    registerDiagramLink(label, { kind: "file", path: link.path }, link.path);
+  }
 }
-function applySearchHighlights():void{
-  const input=$("#node-search");
-  for(const element of document.querySelectorAll("#svg-holder .search-match"))element.classList.remove("search-match");
-  if(!state.search){
+
+function decoratePackageNodes(root: Element, packageNodes: readonly PackageDiagramNode[]): void {
+  const byId = new Map(packageNodes.map((pkg) => [pkg.nodeId, pkg] as const));
+  for (const node of root.querySelectorAll<SVGGElement>("g.node")) {
+    const nodeId = packageNodeIdFromNodeId(node.id);
+    const pkg = nodeId === undefined ? undefined : byId.get(nodeId);
+    if (!pkg) continue;
+    node.classList.add("package-link");
+    node.setAttribute("role", "link");
+    node.setAttribute("tabindex", "0");
+    node.setAttribute("aria-label", `Open ${pkg.name} UML`);
+    node.dataset.packageName = pkg.name;
+    node.dataset.scopePath = pkg.path;
+  }
+}
+
+function applySearchHighlights(): void {
+  const input = $("#node-search");
+  for (const element of document.querySelectorAll("#svg-holder .search-match")) {
+    element.classList.remove("search-match");
+  }
+  if (!state.search) {
     input.classList.remove("no-match");
     input.removeAttribute("aria-invalid");
     return;
   }
-  if(state.activeView==="uml"){
-    for(const candidate of document.querySelectorAll<HTMLElement>("#svg-holder [data-search-text]")){
-      candidate.classList.toggle("search-match",matchesSearchQuery(candidate.dataset.searchText??"",state.search,state.searchCaseInsensitive));
+  if (state.activeView === "uml") {
+    for (const candidate of document.querySelectorAll<HTMLElement>("#svg-holder [data-search-text]")) {
+      candidate.classList.toggle(
+        "search-match",
+        matchesSearchQuery(candidate.dataset.searchText ?? "", state.search, state.searchCaseInsensitive),
+      );
     }
   }
-  const failed=state.searchFiles.size===0;
-  input.classList.toggle("no-match",failed);
-  if(failed)input.setAttribute("aria-invalid","true");else input.removeAttribute("aria-invalid");
+  const failed = state.searchFiles.size === 0;
+  input.classList.toggle("no-match", failed);
+  if (failed) input.setAttribute("aria-invalid", "true");
+  else input.removeAttribute("aria-invalid");
 }
-function renderTree(){
-  const root=$("#tree");
-  const activeElement=document.activeElement;
-  const focusedPath=activeElement instanceof HTMLElement&&activeElement.matches("#tree .tree-row")
-    ?activeElement.dataset.treePath
-    :undefined;
-  root.replaceChildren();
-  if(!state.tree){applySearchHighlights();return;}
-  const filter=$("#tree-filter").value.toLowerCase();
-  const buttonsByPath=new Map<string,HTMLButtonElement>();
-  type DrawResult={element:HTMLElement;hasSearchMatch:boolean};
-  const draw=(node:TreeNode):DrawResult|null=>{
-    const isDir=node.kind==="directory";
-    const nodeSearchMatch=isDir?state.searchDirs.has(node.path):state.searchFiles.has(node.path);
-    const children:DrawResult[]=[];
-    for(const childNode of node.children??[]){
-      const child=draw(childNode);
-      if(child)children.push(child);
-    }
-    const hasSearchMatch=nodeSearchMatch||children.some((child)=>child.hasSearchMatch);
-    const matching=!filter||node.name.toLowerCase().includes(filter)||node.path.toLowerCase().includes(filter);
-    if(!matching&&!children.length&&!nodeSearchMatch)return null;
-    const expanded=isDir&&(state.expandedDirs.has(node.path)||Boolean(filter)||hasSearchMatch);
-    const wrap=document.createElement("div");
-    const button=document.createElement("button");
-    button.className=`tree-row ${state.scope===node.path&&state.mode===(node.kind==="file"?state.mode:"uml")?"selected":""} ${nodeSearchMatch?"search-match":""}`.trim();
-    button.dataset.treePath=node.path;
-    button.innerHTML=`<span class="icon">${isDir?(expanded?"▾":"▸"):"·"}</span><span>${node.name}</span>`;
-    if(isDir)button.setAttribute("aria-expanded",String(expanded));
-    button.onclick=()=>{
-      if(isDir){
-        if(state.expandedDirs.has(node.path))state.expandedDirs.delete(node.path);else state.expandedDirs.add(node.path);
-        void selectScope(node);
-      }else if(node.viewable)void openFile(node.path);else void selectScope(node,"uml");
-    };
-    buttonsByPath.set(node.path,button);
-    wrap.append(button);
-    if(children.length&&expanded){
-      const nested=document.createElement("div");
-      nested.className="tree-children";
-      children.forEach((child)=>{nested.append(child.element);});
-      wrap.append(nested);
-    }
-    return{element:wrap,hasSearchMatch};
+
+// ---------------------------------------------------------------------------
+// File outline
+// ---------------------------------------------------------------------------
+
+/**
+ * Loads one file's outline. The installed loading object is the request's identity: a response is
+ * committed only while that exact object is still the file's entry, so a collapse, a re-expansion
+ * or a watcher invalidation discards whatever was already in flight.
+ */
+async function loadFileDefinitions(path: string): Promise<void> {
+  const pending: FileDefinitionEntry = { status: "loading" };
+  state.fileDefinitions.set(path, pending);
+  let settled: FileDefinitionEntry;
+  try {
+    const response = await api<FileDefinitionsResponse>(
+      `/api/file-definitions?${new URLSearchParams({ path })}`,
+    );
+    settled = { status: "ready", definitions: response.definitions };
+  } catch (error) {
+    settled = { status: "error", error: error instanceof Error ? error.message : String(error) };
+  }
+  if (state.fileDefinitions.get(path) !== pending) return;
+  state.fileDefinitions.set(path, settled);
+  // Never re-expand or steal focus: only repaint a file the user still has open.
+  if (!state.expandedFiles.has(path)) return;
+  renderTree();
+}
+
+async function readFileDefinitions(path: string): Promise<FileDefinition[]> {
+  const entry = state.fileDefinitions.get(path);
+  if (entry?.status === "ready") return entry.definitions;
+  const pending: FileDefinitionEntry = { status: "loading" };
+  state.fileDefinitions.set(path, pending);
+  const response = await api<FileDefinitionsResponse>(
+    `/api/file-definitions?${new URLSearchParams({ path })}`,
+  );
+  if (state.fileDefinitions.get(path) === pending) {
+    state.fileDefinitions.set(path, { status: "ready", definitions: response.definitions });
+  }
+  return response.definitions;
+}
+
+// ---------------------------------------------------------------------------
+// Tree
+// ---------------------------------------------------------------------------
+
+type DesiredDefinition = { key: string; definition: FileDefinition; selected: boolean };
+
+type DesiredRow = {
+  key: string;
+  node: TreeNode;
+  expanded: boolean;
+  searchMatch: boolean;
+  selected: boolean;
+  definitions: DesiredDefinition[] | { message: string; error: boolean } | undefined;
+  children: DesiredRow[];
+};
+
+function targetForNode(node: TreeNode): UmlTarget {
+  return node.kind === "directory"
+    ? { kind: "directory", path: node.path }
+    : { kind: "file", path: node.path };
+}
+
+function isSelectedTarget(target: UmlTarget): boolean {
+  return diagramKey(state.umlTarget) === diagramKey(target);
+}
+
+function definitionRowKey(definition: FileDefinition): string {
+  return JSON.stringify(["definition", definition.key]);
+}
+
+function desiredDefinitions(path: string): DesiredRow["definitions"] {
+  const entry = state.fileDefinitions.get(path);
+  if (entry === undefined || entry.status === "loading") {
+    return { message: "Loading definitions…", error: false };
+  }
+  if (entry.status === "error") return { message: entry.error, error: true };
+  if (!entry.definitions.length) return { message: "No definitions", error: false };
+  return entry.definitions.map((definition) => ({
+    key: definitionRowKey(definition),
+    definition,
+    selected: isSelectedTarget({
+      kind: "definition",
+      path: definition.source.path,
+      definitionKey: definition.key,
+    }),
+  }));
+}
+
+function buildDesiredRow(node: TreeNode, filter: string): DesiredRow | null {
+  const isDir = node.kind === "directory";
+  const nodeSearchMatch = isDir ? state.searchDirs.has(node.path) : state.searchFiles.has(node.path);
+  const children: DesiredRow[] = [];
+  for (const childNode of node.children ?? []) {
+    const child = buildDesiredRow(childNode, filter);
+    if (child) children.push(child);
+  }
+  const hasSearchMatch = nodeSearchMatch || children.some((child) => child.searchMatch);
+  const matching = !filter
+    || node.name.toLowerCase().includes(filter)
+    || node.path.toLowerCase().includes(filter);
+  if (!matching && !children.length && !nodeSearchMatch) return null;
+  const expanded = isDir
+    ? state.expandedDirs.has(node.path) || Boolean(filter) || hasSearchMatch
+    : state.expandedFiles.has(node.path);
+  return {
+    key: JSON.stringify(["path", node.path]),
+    node,
+    expanded,
+    searchMatch: hasSearchMatch,
+    selected: isSelectedTarget(targetForNode(node)),
+    definitions: !isDir && expanded ? desiredDefinitions(node.path) : undefined,
+    children,
   };
-  const result=draw(state.tree);
-  if(result)root.append(result.element);
-  if(focusedPath!==undefined)buttonsByPath.get(focusedPath)?.focus({preventScroll:true});
+}
+
+function reconcile(container: HTMLElement, keys: readonly string[], create: (key: string) => HTMLElement): HTMLElement[] {
+  const existing = new Map<string, HTMLElement>();
+  for (const child of [...container.children]) {
+    const key = (child as HTMLElement).dataset.nodeKey;
+    if (key !== undefined) existing.set(key, child as HTMLElement);
+  }
+  let cursor = container.firstChild;
+  const result: HTMLElement[] = [];
+  for (const key of keys) {
+    let element = existing.get(key);
+    if (element) existing.delete(key);
+    else {
+      element = create(key);
+      element.dataset.nodeKey = key;
+    }
+    // Retained rows that already occupy their final position are never detached.
+    if (element === cursor) cursor = cursor.nextSibling;
+    else container.insertBefore(element, cursor);
+    result.push(element);
+  }
+  for (const element of existing.values()) element.remove();
+  return result;
+}
+
+function createDefinitionRow(): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tree-row tree-definition-row";
+  const name = document.createElement("span");
+  name.className = "tree-definition-name";
+  const kind = document.createElement("span");
+  kind.className = "tree-definition-kind";
+  const type = document.createElement("span");
+  type.className = "tree-definition-type";
+  button.append(name, kind, type);
+  return button;
+}
+
+function patchDefinitionRow(button: HTMLButtonElement, row: DesiredDefinition): void {
+  const { definition } = row;
+  const type = definition.type ?? "—";
+  button.dataset.treeRowKey = row.key;
+  button.dataset.sourcePath = definition.source.path;
+  button.dataset.sourceLine = String(definition.source.line);
+  button.dataset.sourceColumn = String(definition.source.column);
+  button.dataset.definitionKey = definition.key;
+  button.title =
+    `${definition.qualifiedName} · ${definition.kind} · ${type}\n${definition.source.path}:${definition.source.line}:${definition.source.column}`;
+  button.classList.toggle("selected", row.selected);
+  if (row.selected) button.setAttribute("aria-current", "true");
+  else button.removeAttribute("aria-current");
+  // Names and types come from source text: build them as nodes, never as markup.
+  const [name, kind, typeSpan] = [...button.children] as HTMLElement[];
+  if (name) name.textContent = definition.qualifiedName;
+  if (kind) kind.textContent = definition.kind;
+  if (typeSpan) typeSpan.textContent = type;
+  button.onclick = (event) => {
+    if (event.detail > 1) return;
+    void selectUmlTarget({
+      kind: "definition",
+      path: definition.source.path,
+      definitionKey: definition.key,
+    });
+  };
+  button.ondblclick = () => {
+    void openFile(definition.source.path, definition.source);
+  };
+}
+
+function createTreeRow(): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "tree-node";
+  const line = document.createElement("div");
+  line.className = "tree-line";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "tree-toggle";
+  toggle.tabIndex = -1;
+  const label = document.createElement("button");
+  label.type = "button";
+  label.className = "tree-row";
+  const name = document.createElement("span");
+  label.append(name);
+  line.append(toggle, label);
+  wrap.append(line);
+  return wrap;
+}
+
+function patchTreeRow(wrap: HTMLElement, row: DesiredRow): void {
+  const line = wrap.firstElementChild as HTMLElement;
+  const toggle = line.firstElementChild as HTMLButtonElement;
+  const label = line.lastElementChild as HTMLButtonElement;
+  const { node } = row;
+  toggle.dataset.treePath = node.path;
+  toggle.textContent = row.expanded ? "▾" : "▸";
+  toggle.setAttribute("aria-label", row.expanded ? `Collapse ${node.name}` : `Expand ${node.name}`);
+  toggle.setAttribute("aria-expanded", String(row.expanded));
+  toggle.onclick = (event) => {
+    event.stopPropagation();
+    const set = node.kind === "directory" ? state.expandedDirs : state.expandedFiles;
+    if (set.has(node.path)) set.delete(node.path);
+    else {
+      set.add(node.path);
+      if (node.kind === "file" && state.fileDefinitions.get(node.path)?.status === "error") {
+        state.fileDefinitions.delete(node.path);
+      }
+    }
+    renderTree();
+  };
+  label.dataset.treePath = node.path;
+  label.dataset.treeRowKey = row.key;
+  label.classList.toggle("selected", row.selected);
+  label.classList.toggle("search-match", row.searchMatch);
+  label.setAttribute("aria-expanded", String(row.expanded));
+  label.title = node.kind === "file"
+    ? `${node.path}\nDouble-click to open its source.`
+    : node.path || ".";
+  if (row.selected) label.setAttribute("aria-current", "true");
+  else label.removeAttribute("aria-current");
+  const name = label.firstElementChild as HTMLElement;
+  name.textContent = node.name;
+  label.onclick = (event) => {
+    if (event.detail > 1) return;
+    void selectUmlTarget(targetForNode(node));
+  };
+  label.ondblclick = node.kind === "file"
+    ? () => {
+      void openFile(node.path);
+    }
+    : null;
+
+  let definitionsGroup = wrap.querySelector<HTMLElement>(":scope > .tree-definitions");
+  if (row.definitions === undefined) {
+    definitionsGroup?.remove();
+  } else {
+    if (!definitionsGroup) {
+      definitionsGroup = document.createElement("div");
+      definitionsGroup.className = "tree-children tree-definitions";
+      definitionsGroup.setAttribute("role", "group");
+      wrap.append(definitionsGroup);
+    }
+    definitionsGroup.setAttribute("aria-label", `Definitions in ${node.path}`);
+    if (Array.isArray(row.definitions)) {
+      const rows = row.definitions;
+      const elements = reconcile(definitionsGroup, rows.map((entry) => entry.key), () =>
+        createDefinitionRow());
+      for (const [index, element] of elements.entries()) {
+        const definitionRow = rows[index];
+        if (definitionRow) patchDefinitionRow(element as HTMLButtonElement, definitionRow);
+      }
+    } else {
+      const message = row.definitions;
+      const elements = reconcile(definitionsGroup, ["message"], () => {
+        const div = document.createElement("div");
+        div.className = "tree-definition-message";
+        return div;
+      });
+      const element = elements[0];
+      if (element) {
+        element.className = `tree-definition-message${message.error ? " error" : ""}`;
+        element.textContent = message.message;
+      }
+    }
+  }
+
+  let childrenGroup = wrap.querySelector<HTMLElement>(":scope > .tree-children:not(.tree-definitions)");
+  if (!row.children.length || !row.expanded) {
+    childrenGroup?.remove();
+    return;
+  }
+  if (!childrenGroup) {
+    childrenGroup = document.createElement("div");
+    childrenGroup.className = "tree-children";
+    wrap.append(childrenGroup);
+  }
+  patchRows(childrenGroup, row.children);
+}
+
+function patchRows(container: HTMLElement, rows: readonly DesiredRow[]): void {
+  const elements = reconcile(container, rows.map((row) => row.key), () => createTreeRow());
+  for (const [index, element] of elements.entries()) {
+    const row = rows[index];
+    if (row) patchTreeRow(element, row);
+  }
+}
+
+function renderTree(): void {
+  const root = $("#tree");
+  if (!state.tree) {
+    root.replaceChildren();
+    applySearchHighlights();
+    return;
+  }
+  const filter = $("#tree-filter").value.toLowerCase();
+  const desired = buildDesiredRow(state.tree, filter);
+  patchRows(root, desired ? [desired] : []);
+  scheduleVisibleFileDefinitions();
   applySearchHighlights();
 }
-function collectDirectoryPaths(node:TreeNode,paths=new Set<string>()):Set<string>{if(node.kind==="directory")paths.add(node.path);for(const child of node.children??[])collectDirectoryPaths(child,paths);return paths;}
-function isPackageParentDirectory(path:string):boolean{return state.packages.some((pkg)=>pkg.path.includes("/")&&pkg.path.slice(0,pkg.path.lastIndexOf("/"))===path);}
-let treeRefreshPromise:Promise<void>|undefined;
-let treeRefreshRequested=false;
-function loadTree():Promise<void>{
-  treeRefreshRequested=true;
-  if(treeRefreshPromise)return treeRefreshPromise;
-  treeRefreshPromise=(async()=>{
-    while(treeRefreshRequested){
-      treeRefreshRequested=false;
-      try{
-        const response=await api<{version:number;root:TreeNode}>("/api/tree");
-        if(treeRefreshRequested)continue;
-        const firstTree=state.tree===null;
-        const directories=collectDirectoryPaths(response.root);
-        state.expandedDirs=new Set([...state.expandedDirs].filter((path)=>directories.has(path)));
-        if(firstTree)state.expandedDirs.add(response.root.path);
-        state.tree=response.root;
-        state.version=response.version;
-        $("#source-label").textContent=response.root.name;
-        const packagesResponse=await api<{version:number;packages:PackageInfo[]}>("/api/packages").catch(()=>null);
-        if(packagesResponse)state.packages=packagesResponse.packages;
+
+/** Fetches outlines only for expanded file rows actually painted in the tree. */
+function scheduleVisibleFileDefinitions(): void {
+  for (const row of $("#tree").querySelectorAll<HTMLButtonElement>(".tree-row[data-tree-path]")) {
+    const path = row.dataset.treePath;
+    if (path === undefined || !state.expandedFiles.has(path)) continue;
+    if (state.fileDefinitions.has(path)) continue;
+    void loadFileDefinitions(path);
+  }
+}
+
+function collectTreePaths(
+  node: TreeNode,
+  paths = { directories: new Set<string>(), files: new Set<string>() },
+): { directories: Set<string>; files: Set<string> } {
+  if (node.kind === "directory") paths.directories.add(node.path);
+  else paths.files.add(node.path);
+  for (const child of node.children ?? []) collectTreePaths(child, paths);
+  return paths;
+}
+
+let treeRefreshPromise: Promise<void> | undefined;
+let treeRefreshRequested = false;
+
+function loadTree(): Promise<void> {
+  treeRefreshRequested = true;
+  if (treeRefreshPromise) return treeRefreshPromise;
+  treeRefreshPromise = (async () => {
+    while (treeRefreshRequested) {
+      treeRefreshRequested = false;
+      try {
+        const response = await api<{ version: number; root: TreeNode }>("/api/tree");
+        if (treeRefreshRequested) continue;
+        const firstTree = state.tree === null;
+        const { directories, files } = collectTreePaths(response.root);
+        state.expandedDirs = new Set([...state.expandedDirs].filter((path) => directories.has(path)));
+        if (firstTree) state.expandedDirs.add(response.root.path);
+        // Paths that no longer exist must not keep an expansion or a stale outline alive.
+        state.expandedFiles = new Set([...state.expandedFiles].filter((path) => files.has(path)));
+        for (const path of [...state.fileDefinitions.keys()]) {
+          if (!files.has(path)) state.fileDefinitions.delete(path);
+        }
+        state.tree = response.root;
+        state.version = response.version;
+        $("#source-label").textContent = response.root.name;
         renderTree();
-      }catch(error){
-        if(treeRefreshRequested)continue;
+      } catch (error) {
+        if (treeRefreshRequested) continue;
         throw error;
       }
     }
-  })().finally(()=>{treeRefreshPromise=undefined;});
+  })().finally(() => {
+    treeRefreshPromise = undefined;
+  });
   return treeRefreshPromise;
 }
+
+// ---------------------------------------------------------------------------
+// Diagram painting
+// ---------------------------------------------------------------------------
+
 type UmlPaint = {
   holder: HTMLElement;
   token: number;
@@ -314,50 +686,54 @@ type UmlPaint = {
   frameIndex: number;
 };
 
-function beginUmlPaint(
-  token: number,
-  isCurrent: () => boolean,
-  scopedErrors: boolean,
-): UmlPaint {
+function beginUmlPaint(token: number, isCurrent: () => boolean, scopedErrors: boolean): UmlPaint {
   const holder = $("#svg-holder");
   holder.replaceChildren();
   holder.classList.add("stacked");
   holder.setAttribute("role", "list");
+  // The tap snapshot deliberately survives the first tap's own repaint.
+  diagramLinks.clear();
   return { holder, token, isCurrent, scopedErrors, errors: [], dslSections: [], frameIndex: 0 };
 }
 
 async function renderUmlFrames(request: {
   paint: UmlPaint;
   scope: string;
-  dsls: readonly string[];
-  diagram: DiagramResponse;
+  frames: readonly RenderedUmlFrame[];
   directoryIndex: number;
 }): Promise<boolean> {
-  const { paint, scope, dsls, diagram, directoryIndex } = request;
-  for (const [frameIndex, dsl] of dsls.entries()) {
+  const { paint, scope, frames, directoryIndex } = request;
+  for (const [frameIndex, rendered] of frames.entries()) {
     const frame = document.createElement("div");
     frame.className = "uml-frame";
     frame.setAttribute("role", "listitem");
-    frame.setAttribute("aria-label", `UML diagram ${paint.frameIndex + 1}`);
     frame.dataset.index = String(paint.frameIndex);
-    if (!hasDiagramBody(dsl)) {
+    const heading = document.createElement("div");
+    heading.className = "uml-frame-heading";
+    heading.textContent = rendered.title;
+    frame.append(heading);
+    frame.setAttribute("aria-label", `UML diagram ${paint.frameIndex + 1}: ${rendered.title}`);
+    const body = document.createElement("div");
+    body.className = "uml-frame-body";
+    frame.append(body);
+    if (rendered.emptyMessage !== undefined || !hasDiagramBody(rendered.dsl)) {
       frame.classList.add("empty");
-      frame.textContent = EMPTY_DIAGRAM_MESSAGE;
+      body.textContent = rendered.emptyMessage ?? EMPTY_DIAGRAM_MESSAGE;
     } else {
       try {
-        const rendered = await mermaid.render(
+        const svg = await mermaid.render(
           `diagram-${paint.token}-${directoryIndex}-${frameIndex}`,
-          dsl,
+          rendered.dsl,
         );
         if (!paint.isCurrent()) return false;
-        frame.innerHTML = rendered.svg;
-        decorateUmlDefinitions(frame, diagram.definitions);
-        decorateUmlUsers(frame, diagram.localUsers, diagram.externalUsers);
+        body.innerHTML = svg.svg;
+        decorateDefinitionFrame(body, rendered);
+        decorateFileFrame(body, rendered);
       } catch (error) {
         if (!paint.isCurrent()) return false;
         const message = error instanceof Error ? error.message : String(error);
         frame.classList.add("error");
-        frame.textContent = `Diagram ${frameIndex + 1}: ${message}`;
+        body.textContent = `Diagram ${frameIndex + 1}: ${message}`;
         paint.errors.push(
           paint.scopedErrors
             ? `[${scope}] diagram ${frameIndex + 1}: ${message}`
@@ -373,16 +749,21 @@ async function renderUmlFrames(request: {
 
 async function paintUmlScope(
   paint: UmlPaint,
-  scope: string,
+  target: UmlTarget,
   diagram: UmlDiagramResponse,
   directoryIndex: number,
 ): Promise<boolean> {
-  const view = renderUmlView(diagram.view, state.umlVisibility);
+  const scope = target.path || ".";
+  const view = renderUmlView(diagram.view, state.umlVisibility, target);
   paint.dslSections.push(paint.scopedErrors ? `%% Scope: ${scope}\n${view.dsl}` : view.dsl);
-  if (paint.scopedErrors && diagram.status === "error") {
-    paint.errors.push(`[${scope}] ${diagram.error ?? "Diagram parse error"}`);
+  if (diagram.status === "error") {
+    paint.errors.push(
+      paint.scopedErrors
+        ? `[${scope}] ${diagram.error ?? "Diagram error"}`
+        : diagram.error ?? "Diagram error",
+    );
   }
-  return renderUmlFrames({ paint, scope, dsls: view.dsls, diagram, directoryIndex });
+  return renderUmlFrames({ paint, scope, frames: view.frames, directoryIndex });
 }
 
 function finishUmlPaint(paint: UmlPaint, errorStatus: string, readyStatus: string): void {
@@ -398,373 +779,449 @@ function finishUmlPaint(paint: UmlPaint, errorStatus: string, readyStatus: strin
     setStatus(readyStatus);
   }
 }
-async function loadDiagram(
-  token=diagramRequests.next(),
-  definitionToken?:number,
-  focus?:UmlSourceLocation,
-):Promise<void>{
-  const isCurrent=()=>diagramRequests.isCurrent(token)
-    &&(definitionToken===undefined||definitionRequests.isCurrent(definitionToken));
-  const showLoading=state.mode==="uml"&&!emittedUmlScopes.has(state.scope);
-  if(showLoading)emittedUmlScopes.add(state.scope);
-  if(isCurrent()){setDiagramLoading(state.mode==="uml",showLoading);showError(undefined);}
-  try{
-    const query=new URLSearchParams({kind:state.mode,path:state.scope});
-    const diagram=await api<DiagramResponse>(`/api/diagram?${query}`);
-    if(!isCurrent())return;
-    state.version=diagram.version;
-    const payload=diagram.kind==="uml"
-      ?{uml:diagram,...renderUmlView(diagram.view,state.umlVisibility)}
-      :{uml:undefined,dsl:diagram.dsl,dsls:diagram.dsls};
-    $("#dsl-content").textContent=payload.dsl;
-    showError(diagram.status==="error"?diagram.error:undefined);
-    const holder=$("#svg-holder");
-    if(diagram.status==="error"){
-      state.umlRenders=[];
-      holder.classList.add("stacked");
-      holder.setAttribute("role","list");
-      const frame=document.createElement("div");
-      frame.className="uml-frame error";
-      frame.setAttribute("role","listitem");
-      frame.textContent=diagram.error??"Diagram unavailable";
-      holder.replaceChildren(frame);
-      viewport.apply();
-      setStatus("Diagram unavailable",true);
-      return;
-    }
-    if(state.mode==="uml"){
-      const paint=beginUmlPaint(token,isCurrent,false);
-      state.umlRenders=payload.uml?[{scope:state.scope||".",diagram:payload.uml}]:[];
-      state.umlScopedErrors=false;
-      const complete=await renderUmlFrames({
-        paint,
-        scope:state.scope||".",
-        dsls:payload.dsls,
-        diagram,
-        directoryIndex:0,
-      });
-      if(!complete||!isCurrent())return;
-      applySearchHighlights();
-      viewport.apply();
-      if(focus&&!focusUmlDefinition(focus)){
-        showError("Definition not found");
-        setStatus("Definition not found",true);
-      }else if(paint.errors.length){
-        showError(paint.errors.join("\n"));
-        setStatus("Mermaid render error",true);
-      }else setStatus(`Updated · v${diagram.version}`);
-      return;
-    }
-    holder.classList.remove("stacked");
-    holder.removeAttribute("role");
-    if(!hasDiagramBody(payload.dsl)){
-      const frame=document.createElement("div");
-      frame.className="uml-frame empty";
-      frame.textContent=EMPTY_DIAGRAM_MESSAGE;
-      holder.replaceChildren(frame);
-      viewport.apply();
-      setStatus(`Updated · v${diagram.version}`);
-      return;
-    }
-    try{
-      const rendered=await mermaid.render(`diagram-${token}`,payload.dsl);
-      if(!isCurrent())return;
-      holder.innerHTML=rendered.svg;
-      decoratePackageNodes(holder,diagram.packageNodes);
-      decorateUmlDefinitions(holder,diagram.definitions);
-      decorateUmlUsers(holder,diagram.localUsers,diagram.externalUsers);
-      applySearchHighlights();
-      viewport.apply();
-      if(focus&&!focusUmlDefinition(focus)){
-        showError("Definition not found");
-        setStatus("Definition not found",true);
-      }else setStatus(`Updated · v${diagram.version}`);
-    }catch(error){
-      if(!isCurrent())return;
-      showError(error instanceof Error?error.message:String(error));
-      setStatus("Mermaid render error",true);
-    }
-  }catch(error){
-    if(!isCurrent())return;
-    throw error;
-  }finally{
-    if(isCurrent())setDiagramLoading(false);
+
+async function loadUmlDiagram(target: UmlTarget, token: number): Promise<void> {
+  const isCurrent = () => diagramRequests.isCurrent(token);
+  setDiagramLoading(true, true);
+  showError(undefined);
+  try {
+    const diagram = await api<DiagramResponse>(`/api/diagram?${diagramQuery(target)}`);
+    if (!isCurrent()) return;
+    if (diagram.kind !== "uml") throw new Error("Unexpected diagram kind");
+    state.version = diagram.version;
+    state.umlRenders = [{ target, diagram }];
+    state.umlRenderVersion = diagram.version;
+    state.umlScopedErrors = false;
+    const paint = beginUmlPaint(token, isCurrent, false);
+    const complete = await paintUmlScope(paint, target, diagram, 0);
+    if (!complete || !isCurrent()) return;
+    paintedUmlKey = diagramKey(target);
+    finishUmlPaint(paint, "Mermaid render error", `Updated · v${diagram.version}`);
+  } finally {
+    if (isCurrent()) setDiagramLoading(false);
   }
-}
-function renderDefinitionResults():void{
-  const results=$("#definition-results");
-  results.replaceChildren();
-  for(const definition of state.searchDefinitions){
-    const button=document.createElement("button");
-    button.type="button";
-    button.className="definition-result";
-    button.setAttribute("role","option");
-    const name=document.createElement("span");
-    name.className="definition-result-name";
-    name.textContent=`${definition.kind} · ${definition.qualifiedName}`;
-    const location=document.createElement("span");
-    location.className="definition-result-location";
-    location.textContent=`${definition.source.path}:${definition.source.line}`;
-    button.append(name,location);
-    button.onclick=()=>void navigateToDefinition(
-      definition.source,
-      state.activeView==="editor"?"editor":"uml",
-    );
-    results.append(button);
-  }
-  results.hidden=state.searchDefinitions.length===0;
 }
 
-function clearSearch():void{
+async function loadPackagesDiagram(token = diagramRequests.next()): Promise<void> {
+  const isCurrent = () => diagramRequests.isCurrent(token);
+  state.mode = "packages";
+  activateView("packages");
+  viewport.reset();
+  setDiagramLoading(true, true);
+  showError(undefined);
+  paintedUmlKey = undefined;
+  try {
+    const diagram = await api<DiagramResponse>("/api/diagram?kind=packages&path=");
+    if (!isCurrent()) return;
+    if (diagram.kind !== "packages") throw new Error("Unexpected diagram kind");
+    state.version = diagram.version;
+    paintPackages(diagram, token);
+  } catch (error) {
+    if (!isCurrent()) return;
+    showError(error instanceof Error ? error.message : String(error));
+    setStatus("Request failed", true);
+  } finally {
+    if (isCurrent()) setDiagramLoading(false);
+  }
+}
+
+function paintPackages(diagram: PackageDiagramResponse, token: number): void {
+  const holder = $("#svg-holder");
+  holder.classList.remove("stacked");
+  holder.removeAttribute("role");
+  diagramLinks.clear();
+  clickSequence.clear();
+  $("#dsl-content").textContent = diagram.dsl;
+  showError(diagram.status === "error" ? diagram.error : undefined);
+  if (!hasDiagramBody(diagram.dsl)) {
+    const frame = document.createElement("div");
+    frame.className = "uml-frame empty";
+    frame.textContent = EMPTY_DIAGRAM_MESSAGE;
+    holder.replaceChildren(frame);
+    viewport.apply();
+    setStatus(`Updated · v${diagram.version}`);
+    return;
+  }
+  void mermaid.render(`diagram-${token}`, diagram.dsl).then((rendered) => {
+    if (!diagramRequests.isCurrent(token)) return;
+    holder.innerHTML = rendered.svg;
+    decoratePackageNodes(holder, diagram.packageNodes);
+    applySearchHighlights();
+    viewport.apply();
+    setStatus(`Updated · v${diagram.version}`);
+  }, (error: unknown) => {
+    if (!diagramRequests.isCurrent(token)) return;
+    showError(error instanceof Error ? error.message : String(error));
+    setStatus("Mermaid render error", true);
+  });
+}
+
+function umlModelIsCurrent(target: UmlTarget): boolean {
+  const render = state.umlRenders.length === 1 ? state.umlRenders[0] : undefined;
+  return render !== undefined
+    && state.umlRenderVersion === state.version
+    && diagramKey(render.target) === diagramKey(target);
+}
+
+/**
+ * Supersedes every pending selection, activates UML and loads exactly `target`. It never opens the
+ * editor, so a late graph response can never switch the workspace away from a double-click.
+ */
+async function selectUmlTarget(target: UmlTarget): Promise<void> {
+  const key = diagramKey(target);
+  if (pendingDiagram && pendingDiagram.key === key && diagramRequests.isCurrent(pendingDiagram.token)) {
+    return;
+  }
+  if (state.activeView === "uml" && paintedUmlKey === key && umlModelIsCurrent(target)) return;
+  definitionRequests.next();
+  editorRequests.next();
+  searchRequests.next();
+  const token = diagramRequests.next();
+  const record = { key, token };
+  pendingDiagram = record;
+  state.mode = "uml";
+  state.umlTarget = target;
+  activateView("uml");
+  viewport.reset();
+  renderTree();
+  try {
+    await loadUmlDiagram(target, token);
+  } catch (error) {
+    if (!diagramRequests.isCurrent(token)) return;
+    setDiagramLoading(false);
+    showError(error instanceof Error ? error.message : String(error));
+    setStatus("Request failed", true);
+  } finally {
+    // Cleared by identity so a superseded record can never block a retry.
+    if (pendingDiagram === record) pendingDiagram = undefined;
+  }
+}
+
+async function rerenderUmlDiagrams(): Promise<void> {
+  if (state.activeView !== "uml" || !state.umlRenders.length) return;
+  const token = diagramRequests.next();
+  const isCurrent = () => diagramRequests.isCurrent(token);
+  const paint = beginUmlPaint(token, isCurrent, state.umlScopedErrors);
+  for (const [directoryIndex, render] of state.umlRenders.entries()) {
+    const complete = await paintUmlScope(paint, render.target, render.diagram, directoryIndex);
+    if (!complete) return;
+  }
+  finishUmlPaint(paint, "Mermaid render error", `Updated · v${state.version}`);
+}
+
+/** Restores the remembered UML selection, rerendering the retained model when it is still current. */
+function restoreUmlView(): void {
+  state.mode = "uml";
+  if (umlModelIsCurrent(state.umlTarget) && paintedUmlKey === diagramKey(state.umlTarget)) {
+    activateView("uml");
+    void rerenderUmlDiagrams();
+    return;
+  }
+  void selectUmlTarget(state.umlTarget);
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+function renderDefinitionResults(): void {
+  const results = $("#definition-results");
+  const keys = state.searchDefinitions.map((definition) =>
+    JSON.stringify([definition.source.path, definition.key])
+  );
+  const elements = reconcile(results, keys, () => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "definition-result";
+    button.setAttribute("role", "option");
+    const name = document.createElement("span");
+    name.className = "definition-result-name";
+    const location = document.createElement("span");
+    location.className = "definition-result-location";
+    button.append(name, location);
+    return button;
+  });
+  for (const [index, element] of elements.entries()) {
+    const definition = state.searchDefinitions[index];
+    if (!definition) continue;
+    const [name, location] = [...element.children] as HTMLElement[];
+    if (name) name.textContent = `${definition.kind} · ${definition.qualifiedName}`;
+    if (location) {
+      location.textContent = `${definition.source.path}:${definition.source.line}`;
+    }
+    const button = element as HTMLButtonElement;
+    button.onclick = (event) => {
+      if (event.detail > 1) return;
+      void selectSearchDefinition(definition);
+    };
+    button.ondblclick = () => {
+      void openFile(definition.source.path, definition.source);
+    };
+  }
+  results.hidden = state.searchDefinitions.length === 0;
+}
+
+/** Resolves a search hit to its outline key by exact source position, name and qualified name. */
+async function selectSearchDefinition(definition: GotoDefinition): Promise<void> {
+  const token = definitionRequests.next();
+  try {
+    const definitions = await readFileDefinitions(definition.source.path);
+    if (!definitionRequests.isCurrent(token)) return;
+    const match = definitions.find((candidate) =>
+      candidate.source.line === definition.source.line
+      && candidate.source.column === definition.source.column
+      && candidate.name === definition.name
+      && candidate.qualifiedName === definition.qualifiedName
+    );
+    if (!match) throw new Error("Definition not found");
+    if (!definitionRequests.isCurrent(token)) return;
+    await selectUmlTarget({
+      kind: "definition",
+      path: definition.source.path,
+      definitionKey: match.key,
+    });
+  } catch (error) {
+    if (!definitionRequests.isCurrent(token)) return;
+    const message = error instanceof Error ? error.message : String(error);
+    showError(message);
+    setStatus(message, true);
+  }
+}
+
+function clearSearch(): void {
   definitionRequests.next();
   searchRequests.next();
-  diagramRequests.next();
-  setDiagramLoading(false);
-  state.search="";
+  state.search = "";
   state.searchFiles.clear();
   state.searchDirs.clear();
-  state.searchDefinitions=[];
+  state.searchDefinitions = [];
   renderDefinitionResults();
   renderTree();
 }
-async function renderSearchDiagrams(renderDirs:readonly string[],searchToken:number):Promise<void>{
-  const renderToken=diagramRequests.next();
-  const isCurrent=()=>searchRequests.isCurrent(searchToken)&&diagramRequests.isCurrent(renderToken);
-  state.mode="uml";
-  state.scope="";
+
+async function renderSearchDiagrams(renderDirs: readonly string[], searchToken: number): Promise<void> {
+  const renderToken = diagramRequests.next();
+  const isCurrent = () =>
+    searchRequests.isCurrent(searchToken) && diagramRequests.isCurrent(renderToken);
+  state.mode = "uml";
   activateView("uml");
   viewport.reset();
-  setDiagramLoading(true);
-  const paint=beginUmlPaint(renderToken,isCurrent,true);
-  state.umlRenders=[];
-  state.umlScopedErrors=true;
-  try{
-    for(const [directoryIndex,renderDir] of renderDirs.entries()){
-      const scope=renderDir||".";
-      let diagram:UmlDiagramResponse;
-      try{
-        diagram=await api<UmlDiagramResponse>(`/api/diagram?kind=uml&path=${encodeURIComponent(renderDir)}`);
-        if(!isCurrent())return;
-      }catch(error){
-        if(!isCurrent())return;
-        const message=error instanceof Error?error.message:String(error);
-        paint.errors.push(`[${scope}] request: ${message}`);
+  setDiagramLoading(true, true);
+  paintedUmlKey = undefined;
+  const paint = beginUmlPaint(renderToken, isCurrent, true);
+  state.umlRenders = [];
+  state.umlRenderVersion = state.version;
+  state.umlScopedErrors = true;
+  try {
+    for (const [directoryIndex, renderDir] of renderDirs.entries()) {
+      const target: UmlTarget = { kind: "directory", path: renderDir };
+      let diagram: UmlDiagramResponse;
+      try {
+        const response = await api<DiagramResponse>(`/api/diagram?${diagramQuery(target)}`);
+        if (!isCurrent()) return;
+        if (response.kind !== "uml") throw new Error("Unexpected diagram kind");
+        diagram = response;
+      } catch (error) {
+        if (!isCurrent()) return;
+        const message = error instanceof Error ? error.message : String(error);
+        paint.errors.push(`[${renderDir || "."}] request: ${message}`);
         continue;
       }
-      state.umlRenders.push({scope,diagram});
-      const complete=await paintUmlScope(paint,scope,diagram,directoryIndex);
-      if(!complete)return;
+      state.umlRenders.push({ target, diagram });
+      const complete = await paintUmlScope(paint, target, diagram, directoryIndex);
+      if (!complete) return;
     }
     finishUmlPaint(
       paint,
       "Search diagram render error",
       `Search · ${state.searchFiles.size} files · v${state.version}`,
     );
-  }finally{
-    if(diagramRequests.isCurrent(renderToken))setDiagramLoading(false);
+  } finally {
+    if (diagramRequests.isCurrent(renderToken)) setDiagramLoading(false);
   }
 }
-async function rerenderUmlDiagrams():Promise<void>{
-  if(state.activeView!=="uml"||!state.umlRenders.length)return;
-  const token=diagramRequests.next();
-  const isCurrent=()=>diagramRequests.isCurrent(token);
-  setDiagramLoading(true);
-  const paint=beginUmlPaint(token,isCurrent,state.umlScopedErrors);
-  try{
-    for(const [directoryIndex,render] of state.umlRenders.entries()){
-      const complete=await paintUmlScope(paint,render.scope,render.diagram,directoryIndex);
-      if(!complete)return;
-    }
-    finishUmlPaint(paint,"Mermaid render error",`Updated · v${state.version}`);
-  }finally{
-    if(isCurrent())setDiagramLoading(false);
+
+async function commitSearch(query: string, caseInsensitive: boolean): Promise<void> {
+  if (!query) {
+    clearSearch();
+    return;
   }
-}
-async function commitSearch(query:string,caseInsensitive:boolean):Promise<void>{
-  if(!query){clearSearch();return;}
   definitionRequests.next();
-  const activeView=state.activeView;
-  const token=searchRequests.next();
+  const activeView = state.activeView;
+  const token = searchRequests.next();
   diagramRequests.next();
   setDiagramLoading(false);
-  state.search=query;
-  state.searchCaseInsensitive=caseInsensitive;
-  state.searchFiles=new Set();
-  state.searchDirs=new Set();
-  state.searchDefinitions=[];
+  state.search = query;
+  state.searchCaseInsensitive = caseInsensitive;
+  state.searchFiles = new Set();
+  state.searchDirs = new Set();
+  state.searchDefinitions = [];
   renderDefinitionResults();
   renderTree();
-  for(const element of document.querySelectorAll("#svg-holder .search-match"))element.classList.remove("search-match");
-  const input=$("#node-search");
+  const input = $("#node-search");
   input.classList.remove("no-match");
   input.removeAttribute("aria-invalid");
-  try{
-    const params=new URLSearchParams({q:query,caseInsensitive:String(caseInsensitive)});
-    const response=await api<SearchResponse>(`/api/search?${params}`);
-    if(!searchRequests.isCurrent(token))return;
-    if(response.caseInsensitive!==caseInsensitive)throw new Error("Search response mode mismatch");
-    state.search=response.query;
-    state.searchFiles=new Set(response.files);
-    state.searchDirs=new Set(response.directories);
-    state.searchDefinitions=response.definitions;
-    state.searchCaseInsensitive=response.caseInsensitive;
-    state.version=response.version;
+  try {
+    const params = new URLSearchParams({ q: query, caseInsensitive: String(caseInsensitive) });
+    const response = await api<SearchResponse>(`/api/search?${params}`);
+    if (!searchRequests.isCurrent(token)) return;
+    if (response.caseInsensitive !== caseInsensitive) throw new Error("Search response mode mismatch");
+    state.search = response.query;
+    state.searchFiles = new Set(response.files);
+    state.searchDirs = new Set(response.directories);
+    state.searchDefinitions = response.definitions;
+    state.searchCaseInsensitive = response.caseInsensitive;
+    state.version = response.version;
     renderDefinitionResults();
     renderTree();
-    if(activeView==="editor"){
+    if (activeView === "editor") {
       setStatus(`Search · ${response.definitions.length} definitions · v${response.version}`);
       return;
     }
-    if(response.files.length===0)return;
-    await renderSearchDiagrams(response.renderDirs,token);
-  }catch(error){
-    if(!searchRequests.isCurrent(token))return;
-    state.search=query;
-    state.searchCaseInsensitive=caseInsensitive;
-    state.searchFiles=new Set();
-    state.searchDirs=new Set();
-    state.searchDefinitions=[];
+    if (response.files.length === 0) return;
+    await renderSearchDiagrams(response.renderDirs, token);
+  } catch (error) {
+    if (!searchRequests.isCurrent(token)) return;
+    state.search = query;
+    state.searchCaseInsensitive = caseInsensitive;
+    state.searchFiles = new Set();
+    state.searchDirs = new Set();
+    state.searchDefinitions = [];
     renderDefinitionResults();
     renderTree();
-    setStatus(error instanceof Error?error.message:String(error),true);
+    setStatus(error instanceof Error ? error.message : String(error), true);
   }
 }
-function activateView(view:"packages"|"uml"|"editor"){state.activeView=view;const activeButtonId=view==="editor"?"editor-mode":`${state.mode}-mode`;document.querySelectorAll(".mode").forEach((button)=>{button.classList.toggle("active",button.id===activeButtonId);});const editorActive=view==="editor";$("#graph-panel").hidden=editorActive;$("#editor-panel").hidden=!editorActive;$("#uml-visibility").hidden=view!=="uml";const hasFile=state.file!==null;$("#editor-empty").hidden=hasFile;$("#editor-content").hidden=!hasFile;applySearchHighlights();}
-type DefinitionNavigationContext={
-  definitionToken:number;
-  diagramToken:number;
-  editorToken:number;
-};
-function definitionContextCurrent(context:DefinitionNavigationContext):boolean{
-  return definitionRequests.isCurrent(context.definitionToken)
-    &&diagramRequests.isCurrent(context.diagramToken)
-    &&editorRequests.isCurrent(context.editorToken);
+
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+function activateView(view: "packages" | "uml" | "editor"): void {
+  state.activeView = view;
+  const activeButtonId = view === "editor" ? "editor-mode" : `${state.mode}-mode`;
+  document.querySelectorAll(".mode").forEach((button) => {
+    button.classList.toggle("active", button.id === activeButtonId);
+  });
+  const editorActive = view === "editor";
+  $("#graph-panel").hidden = editorActive;
+  $("#editor-panel").hidden = !editorActive;
+  $("#uml-visibility").hidden = view !== "uml";
+  const hasFile = state.file !== null;
+  $("#editor-empty").hidden = hasFile;
+  $("#editor-content").hidden = !hasFile;
+  applySearchHighlights();
 }
-async function selectScope(
-  node:TreeNode,
-  requestedMode?: "packages"|"uml",
-  context?:DefinitionNavigationContext,
-  focus?:UmlSourceLocation,
-):Promise<boolean>{
-  if(!context){
-    definitionRequests.next();
-    editorRequests.next();
-  }
-  const diagramToken=context?.diagramToken??diagramRequests.next();
-  const priorityToken=priorityRequests.next();
-  supersedeScopeSyncLoading();
-  const isCurrent=()=>priorityRequests.isCurrent(priorityToken)
-    &&diagramRequests.isCurrent(diagramToken)
-    &&(context===undefined||definitionContextCurrent(context));
-  searchRequests.next();
-  if(!isCurrent())return false;
-  state.mode=requestedMode??(node.path===""||(node.kind==="directory"&&isPackageParentDirectory(node.path))?"packages":"uml");
-  state.scope=state.mode==="packages"?"":node.path;
-  if(state.mode==="uml")state.umlScope=node.path;
-  activateView(state.mode);
-  viewport.reset();
-  renderTree();
-  const syncClickedScope=state.mode==="uml"&&node.kind==="directory";
-  if(syncClickedScope)beginScopeSyncLoading(priorityToken);
-  try{
-    if(syncClickedScope){
-      const priority=await prioritizeScope(node.path,priorityRequests,priorityToken);
-      if(priority.cancelled)return false;
-    }
-    if(!isCurrent())return false;
-    await loadDiagram(diagramToken,context?.definitionToken,focus);
-    return isCurrent();
-  }catch(error){
-    if(!isCurrent())return false;
-    setDiagramLoading(false);
-    showError(error instanceof Error?error.message:String(error));
-    setStatus("Request failed",true);
-    return false;
-  }finally{
-    if(syncClickedScope)endScopeSyncLoading(priorityToken);
-  }
-}
-function destroyEditor(invalidate=true):void{
-  if(invalidate){
+
+function destroyEditor(invalidate = true): void {
+  if (invalidate) {
     definitionRequests.next();
     editorRequests.next();
   }
   state.view?.destroy();
-  state.view=null;
-  state.file=null;
-  $("#editor-content").hidden=true;
-  $("#editor-empty").hidden=false;
+  state.view = null;
+  state.file = null;
+  $("#editor-content").hidden = true;
+  $("#editor-empty").hidden = false;
 }
-function revealEditorOffset(offset:number,focus=true):void{if(!state.view)return;const clamped=Math.max(0,Math.min(offset,state.view.state.doc.length));state.view.dispatch({selection:EditorSelection.cursor(clamped),effects:EditorView.scrollIntoView(clamped,{y:"center"})});if(focus)state.view.focus();}
-function printEditor():void{
-  if(!state.view)return;
-  window.print();
+
+function revealEditorOffset(offset: number, focus = true): void {
+  if (!state.view) return;
+  const clamped = Math.max(0, Math.min(offset, state.view.state.doc.length));
+  state.view.dispatch({
+    selection: EditorSelection.cursor(clamped),
+    effects: EditorView.scrollIntoView(clamped, { y: "center" }),
+  });
+  if (focus) state.view.focus();
 }
-function editorHighlightDecorations(file:FileResponse){
-  return Decoration.set(file.highlights.flatMap((span)=>{
-    if(span.from<0||span.to>file.content.length||span.from>=span.to)return[];
-    return[Decoration.mark({class:`tok-${span.token}`}).range(span.from,span.to)];
-  }),true);
+
+function editorHighlightDecorations(file: FileResponse) {
+  return Decoration.set(
+    file.highlights.flatMap((span) => {
+      if (span.from < 0 || span.to > file.content.length || span.from >= span.to) return [];
+      return [Decoration.mark({ class: `tok-${span.token}` }).range(span.from, span.to)];
+    }),
+    true,
+  );
 }
-function editorDefinitionDecorations(file:FileResponse){
-  return Decoration.set(file.definitions.flatMap((definition)=>{
-    if(definition.displayFrom<0||definition.displayTo>file.content.length||definition.displayFrom>=definition.displayTo)return[];
-    return[Decoration.mark({
-      class:"editor-definition-link",
-      attributes:{
-        role:"link",
-        tabindex:"0",
-        "aria-label":`Open ${definition.qualifiedName} editor definition`,
-        "data-source-path":definition.source.path,
-        "data-source-line":String(definition.source.line),
-        "data-source-column":String(definition.source.column),
-        "data-definition-name":definition.name,
-        "data-qualified-name":definition.qualifiedName,
-      },
-    }).range(definition.displayFrom,definition.displayTo)];
-  }),true);
+
+function editorDefinitionDecorations(file: FileResponse) {
+  return Decoration.set(
+    file.definitions.flatMap((definition) => {
+      if (
+        definition.displayFrom < 0
+        || definition.displayTo > file.content.length
+        || definition.displayFrom >= definition.displayTo
+      ) return [];
+      return [Decoration.mark({
+        class: "editor-definition-link",
+        attributes: {
+          role: "link",
+          tabindex: "0",
+          "aria-label": `Open ${definition.qualifiedName} editor definition`,
+          "data-source-path": definition.source.path,
+          "data-source-line": String(definition.source.line),
+          "data-source-column": String(definition.source.column),
+          "data-definition-name": definition.name,
+          "data-qualified-name": definition.qualifiedName,
+        },
+      }).range(definition.displayFrom, definition.displayTo)];
+    }),
+    true,
+  );
 }
-function editorDefinitionHandlers(){
-  const activate=(event:Event):boolean=>{
-    const link=event.target instanceof Element?event.target.closest(".editor-definition-link"):null;
-    if(!link)return false;
-    const target=editorTargetFromLink(link);
-    if(!target)return false;
+
+type EditorDefinitionTarget = { path: string; name: string; qualifiedName: string };
+
+function editorTargetFromLink(link: Element): EditorDefinitionTarget | undefined {
+  const data = (link as HTMLElement).dataset;
+  if (!data.sourcePath || !data.definitionName || !data.qualifiedName) return undefined;
+  return { path: data.sourcePath, name: data.definitionName, qualifiedName: data.qualifiedName };
+}
+
+function editorDefinitionHandlers() {
+  const activate = (event: Event): boolean => {
+    const link = event.target instanceof Element
+      ? event.target.closest(".editor-definition-link")
+      : null;
+    if (!link) return false;
+    const target = editorTargetFromLink(link);
+    if (!target) return false;
     event.preventDefault();
     void navigateToEditorDefinition(target);
     return true;
   };
   return EditorView.domEventHandlers({
-    click:(event)=>activate(event),
-    keydown:(event)=>{
-      if(event.key!=="Enter"&&event.key!==" ")return false;
+    click: (event) => activate(event),
+    keydown: (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return false;
       return activate(event);
     },
   });
 }
-async function openFile(
-  path:string,
-  position?:UmlSourceLocation,
-  context?:DefinitionNavigationContext,
-  activate=true,
-):Promise<boolean>{
-  if(!context){
-    definitionRequests.next();
-    diagramRequests.next();
-  }
-  const editorToken=context?.editorToken??editorRequests.next();
-  const isCurrent=()=>editorRequests.isCurrent(editorToken)
-    &&(context===undefined||definitionContextCurrent(context));
-  try{
-    const query=new URLSearchParams({path});
-    if(position){query.set("line",String(position.line));query.set("column",String(position.column));}
-    const file=await api<FileResponse>(`/api/file?${query}`);
-    if(!isCurrent())return false;
+
+async function openFile(path: string, position?: UmlSourceLocation): Promise<boolean> {
+  definitionRequests.next();
+  // A late diagram response must never repaint over the editor this gesture opened.
+  diagramRequests.next();
+  searchRequests.next();
+  clickSequence.clear();
+  pendingDiagram = undefined;
+  const editorToken = editorRequests.next();
+  const isCurrent = () => editorRequests.isCurrent(editorToken);
+  try {
+    const query = new URLSearchParams({ path });
+    if (position) {
+      query.set("line", String(position.line));
+      query.set("column", String(position.column));
+    }
+    const file = await api<FileResponse>(`/api/file?${query}`);
+    if (!isCurrent()) return false;
     destroyEditor(false);
-    state.file=file;
-    $("#editor-name").textContent=path.split("/").at(-1)??path;
-    $("#editor-path").textContent=path;
-    const extensions=[
+    state.file = file;
+    $("#editor-name").textContent = path.split("/").at(-1) ?? path;
+    $("#editor-path").textContent = path;
+    const extensions = [
       basicSetup,
       oneDark,
       EditorState.readOnly.of(true),
@@ -773,215 +1230,440 @@ async function openFile(
       EditorView.decorations.of(editorDefinitionDecorations(file)),
       editorDefinitionHandlers(),
     ];
-    state.view=new EditorView({state:EditorState.create({doc:file.content,extensions}),parent:$("#editor")});
-    if(!isCurrent()){
+    state.view = new EditorView({
+      state: EditorState.create({ doc: file.content, extensions }),
+      parent: $("#editor"),
+    });
+    if (!isCurrent()) {
       destroyEditor(false);
       return false;
     }
-    if(activate)activateView("editor");
-    if(file.cursorOffset!==undefined)revealEditorOffset(file.cursorOffset,activate);
+    activateView("editor");
+    if (file.cursorOffset !== undefined) revealEditorOffset(file.cursorOffset);
     setStatus("Read-only preprocessed source");
     return true;
-  }catch(error){
-    if(!isCurrent())return false;
-    setStatus(error instanceof Error?error.message:String(error),true);
+  } catch (error) {
+    if (!isCurrent()) return false;
+    setStatus(error instanceof Error ? error.message : String(error), true);
     return false;
   }
 }
-async function lookupDefinition(location:UmlSourceLocation):Promise<GotoDefinitionLookupResponse>{
-  const query=new URLSearchParams({
-    path:location.path,
-    line:String(location.line),
-    column:String(location.column),
-  });
-  return api<GotoDefinitionLookupResponse>(`/api/goto-definition?${query}`);
-}
-function setDefinitionLoading(view:"uml"|"editor",loading:boolean):void{
-  if(view==="uml")setDiagramLoading(loading,loading);
-  else setEditorLoading(loading);
-}
-async function navigateToDefinition(
-  location:UmlSourceLocation,
-  view:"uml"|"editor",
-):Promise<void>{
-  const context:DefinitionNavigationContext={
-    definitionToken:definitionRequests.next(),
-    diagramToken:diagramRequests.next(),
-    editorToken:editorRequests.next(),
-  };
-  try{
-    let response=await lookupDefinition(location);
-    if(!definitionContextCurrent(context))return;
-    if(response.definition===null){
-      setDefinitionLoading(view,true);
-      const priority=await prioritizeScope(location.path,definitionRequests,context.definitionToken);
-      if(priority.cancelled||!definitionContextCurrent(context))return;
-      response=await lookupDefinition(location);
-      if(!definitionContextCurrent(context))return;
-    }
-    const definition=response.definition;
-    if(!definition)throw new Error("Definition not found");
-    if(view==="editor"){
-      await openFile(definition.source.path,definition.source,context);
-    }else{
-      const opened=await openFile(definition.source.path,definition.source,context,false);
-      if(!opened||!definitionContextCurrent(context))return;
-      await selectScope(
-        {
-          name:definition.name,
-          path:definition.uml.scopePath,
-          kind:"file",
-        },
-        "uml",
-        context,
-        definition.source,
-      );
-    }
-  }catch(error){
-    if(!definitionContextCurrent(context))return;
-    const message=error instanceof Error?error.message:String(error);
-    showError(message);
-    setStatus(message,true);
-  }finally{
-    if(definitionContextCurrent(context))setDefinitionLoading(view,false);
-  }
-}
-type EditorDefinitionTarget={path:string;name:string;qualifiedName:string};
-function editorTargetFromLink(link:Element):EditorDefinitionTarget|undefined{
-  const data=(link as HTMLElement).dataset;
-  if(!data.sourcePath||!data.definitionName||!data.qualifiedName)return undefined;
-  return{path:data.sourcePath,name:data.definitionName,qualifiedName:data.qualifiedName};
-}
-async function lookupEditorDefinition(target:EditorDefinitionTarget):Promise<DefinitionLookupResponse>{
-  const query=new URLSearchParams({
-    path:target.path,
-    name:target.name,
-    qualifiedName:target.qualifiedName,
+
+async function lookupEditorDefinition(
+  target: EditorDefinitionTarget,
+): Promise<DefinitionLookupResponse> {
+  const query = new URLSearchParams({
+    path: target.path,
+    name: target.name,
+    qualifiedName: target.qualifiedName,
   });
   return api<DefinitionLookupResponse>(`/api/definition?${query}`);
 }
-async function navigateToEditorDefinition(target:EditorDefinitionTarget):Promise<void>{
-  const context:DefinitionNavigationContext={
-    definitionToken:definitionRequests.next(),
-    diagramToken:diagramRequests.next(),
-    editorToken:editorRequests.next(),
-  };
-  try{
-    const response=await lookupEditorDefinition(target);
-    if(!definitionContextCurrent(context))return;
-    const location=response.definition;
-    if(!location)throw new Error("Definition not found");
-    await openFile(location.path,location,context);
-  }catch(error){
-    if(!definitionContextCurrent(context))return;
-    const message=error instanceof Error?error.message:String(error);
+
+async function navigateToEditorDefinition(target: EditorDefinitionTarget): Promise<void> {
+  const token = editorRequests.next();
+  try {
+    const response = await lookupEditorDefinition(target);
+    if (!editorRequests.isCurrent(token)) return;
+    const location = response.definition;
+    if (!location) throw new Error("Definition not found");
+    await openFile(location.path, location);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     showError(message);
-    setStatus(message,true);
-  }finally{
-    if(definitionContextCurrent(context))setDefinitionLoading("editor",false);
+    setStatus(message, true);
+  } finally {
+    setEditorLoading(false);
   }
 }
-async function reloadOpenFile():Promise<void>{if(!state.file)return;const path=state.file.path;const activeView=state.activeView;await openFile(path);if(activeView!=="editor")activateView(activeView);}
-function refreshCachedViews():void{
+
+async function reloadOpenFile(): Promise<void> {
+  if (!state.file) return;
+  const path = state.file.path;
+  const activeView = state.activeView;
+  await openFile(path);
+  if (activeView !== "editor") activateView(activeView);
+}
+
+function refreshCachedViews(): void {
   definitionRequests.next();
-  editorRequests.next();
-  void loadTree().catch((error)=>setStatus(error instanceof Error?error.message:String(error),true));
-  if(activeScopeSyncToken!==undefined){
-    deferredOpenFileRefresh||=state.file!==null;
+  void loadTree().catch((error) =>
+    setStatus(error instanceof Error ? error.message : String(error), true)
+  );
+  if (state.file) void reloadOpenFile();
+  if (state.search && state.mode === "uml") {
+    void commitSearch(state.search, state.searchCaseInsensitive);
     return;
   }
-  if(state.file)void reloadOpenFile();
-  if(state.search&&state.mode==="uml"&&state.scope==="")void commitSearch(state.search,state.searchCaseInsensitive);
-  else void loadDiagram();
+  if (state.activeView === "editor") return;
+  if (state.mode === "uml") {
+    paintedUmlKey = undefined;
+    void selectUmlTarget(state.umlTarget);
+  } else void loadPackagesDiagram();
 }
-function handleWatch(message:WatchMessage){
-  if(message.type==="watch-error"){setStatus(message.error,true);return;}
-  state.version=message.version;
-  if(message.type==="cache-ready"){refreshCachedViews();setStatus(`Cache ready · v${message.version}`);return;}
-  if(message.paths.length===0&&message.events.length===0){
-    void loadTree().catch((error)=>setStatus(error instanceof Error?error.message:String(error),true));
+
+function handleWatch(message: WatchMessage): void {
+  if (message.type === "watch-error") {
+    setStatus(message.error, true);
+    return;
+  }
+  state.version = message.version;
+  // `cache-ready` keeps settled outlines: the outline read already waited for the immutable
+  // definition index, so unrelated UML completion must not cause a second fetch and loading flash.
+  if (message.type === "cache-ready") {
+    if (state.activeView !== "editor") refreshCachedViews();
+    setStatus(`Cache ready · v${message.version}`);
+    return;
+  }
+  // Any source change invalidates every cached outline, including the reconnect refresh.
+  state.fileDefinitions.clear();
+  state.umlRenderVersion = -1;
+  paintedUmlKey = undefined;
+  diagramRequests.next();
+  if (message.paths.length === 0 && message.events.length === 0) {
+    void loadTree().catch((error) =>
+      setStatus(error instanceof Error ? error.message : String(error), true)
+    );
     return;
   }
   refreshCachedViews();
   setStatus(`Source changed · v${message.version}`);
 }
-function connect(){const protocol=location.protocol==="https:"?"wss":"ws";const ws=new WebSocket(`${protocol}://${location.host}/ws`);ws.onopen=()=>{state.retry=250;setStatus("Watcher connected");};ws.onmessage=(event)=>{try{handleWatch(JSON.parse(event.data) as WatchMessage);}catch(error){setStatus(String(error),true);}};ws.onclose=()=>{setStatus("watcher disconnected",true);setTimeout(connect,state.retry);state.retry=Math.min(2000,state.retry*2);};}
-function toggleSidebar(){const sidebar=$("#sidebar");const collapsed=sidebar.classList.toggle("collapsed");$(".workspace").classList.toggle("sidebar-collapsed",collapsed);const button=$("#sidebar-toggle");button.textContent=collapsed?"›":"‹";button.setAttribute("aria-label",collapsed?"Expand file tree":"Collapse file tree");button.setAttribute("aria-expanded",String(!collapsed));}
-const diagramStage=$("#diagram-stage");
-const dragState={pointerId:null as number|null,startX:0,startY:0,lastX:0,lastY:0,moved:false,suppressClick:false};
-function zoomAtStageCenter(factor:number):void{const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(factor,rect.width/2,rect.height/2);}
-function finishDrag(event:PointerEvent,suppressClick:boolean):void{if(dragState.pointerId!==event.pointerId)return;if(diagramStage.hasPointerCapture(event.pointerId))diagramStage.releasePointerCapture(event.pointerId);const moved=dragState.moved;dragState.pointerId=null;dragState.moved=false;diagramStage.classList.remove("dragging");if(moved&&suppressClick){dragState.suppressClick=true;setTimeout(()=>{dragState.suppressClick=false;},0);}}
-function activateDiagramLink(event:MouseEvent|KeyboardEvent):void{
-  if(event instanceof KeyboardEvent&&event.key!=="Enter"&&event.key!==" ")return;
-  const link=event.target instanceof Element?event.target.closest(".uml-definition-link, .uml-source-link, .uml-external-link, .package-link"):null;
-  if(!link)return;
-  let activate:(()=>void)|undefined;
-  if(link.matches(".uml-definition-link")){
-    const source=sourceFromLink(link);if(source)activate=()=>{void navigateToDefinition(source,"uml");};
-  }else if(link.matches(".uml-source-link")){
-    const source=sourceFromLink(link);if(source)activate=()=>{void openFile(source.path,source);};
-  }else if(link.matches(".uml-external-link")){
-    const scopePath=(link as HTMLElement).dataset.scopePath;
-    if(scopePath)activate=()=>{void selectScope({name:scopePath.split("/").at(-1)??scopePath,path:scopePath,kind:"file"});};
-  }else{
-    const data=(link as HTMLElement).dataset;
-    if(Object.hasOwn(data,"packageName")&&Object.hasOwn(data,"scopePath")){
-      const name=data.packageName??"";
-      const path=data.scopePath??"";
-      activate=()=>{void selectScope({name,path,kind:"directory"},"uml");};
+
+function connect(): void {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${protocol}://${location.host}/ws`);
+  ws.onopen = () => {
+    state.retry = 250;
+    setStatus("Watcher connected");
+  };
+  ws.onmessage = (event) => {
+    try {
+      handleWatch(JSON.parse(event.data) as WatchMessage);
+    } catch (error) {
+      setStatus(String(error), true);
+    }
+  };
+  ws.onclose = () => {
+    setStatus("watcher disconnected", true);
+    setTimeout(connect, state.retry);
+    state.retry = Math.min(2000, state.retry * 2);
+  };
+}
+
+function toggleSidebar(): void {
+  const sidebar = $("#sidebar");
+  const collapsed = sidebar.classList.toggle("collapsed");
+  $(".workspace").classList.toggle("sidebar-collapsed", collapsed);
+  const button = $("#sidebar-toggle");
+  button.textContent = collapsed ? "›" : "‹";
+  button.setAttribute("aria-label", collapsed ? "Expand file tree" : "Collapse file tree");
+  button.setAttribute("aria-expanded", String(!collapsed));
+}
+
+// ---------------------------------------------------------------------------
+// Diagram stage interaction
+// ---------------------------------------------------------------------------
+
+const diagramStage = $("#diagram-stage");
+const dragState = {
+  pointerId: null as number | null,
+  startX: 0,
+  startY: 0,
+  lastX: 0,
+  lastY: 0,
+  moved: false,
+  suppressClick: false,
+};
+type PendingTap = {
+  pointerId: number;
+  x: number;
+  y: number;
+  target: DiagramPointerTarget | undefined;
+  busy: boolean;
+};
+let pendingTap: PendingTap | undefined;
+
+function zoomAtStageCenter(factor: number): void {
+  const rect = diagramStage.getBoundingClientRect();
+  viewport.zoomAt(factor, rect.width / 2, rect.height / 2);
+}
+
+function finishDrag(event: PointerEvent, suppressClick: boolean): void {
+  if (dragState.pointerId !== event.pointerId) return;
+  if (diagramStage.hasPointerCapture(event.pointerId)) {
+    diagramStage.releasePointerCapture(event.pointerId);
+  }
+  const moved = dragState.moved;
+  dragState.pointerId = null;
+  dragState.moved = false;
+  diagramStage.classList.remove("dragging");
+  if (moved && suppressClick) suppressNextClick();
+}
+
+function suppressNextClick(): void {
+  dragState.suppressClick = true;
+  setTimeout(() => {
+    dragState.suppressClick = false;
+  }, 0);
+}
+
+function openDiagramTarget(target: DiagramPointerTarget): void {
+  if (target.kind === "file") {
+    void openFile(target.path);
+    return;
+  }
+  void openFile(target.definition.source.path, target.definition.source);
+}
+
+function selectDiagramTarget(target: DiagramPointerTarget): void {
+  if (target.kind === "file") {
+    void selectUmlTarget({ kind: "file", path: target.path });
+    return;
+  }
+  void selectUmlTarget({
+    kind: "definition",
+    path: target.definition.source.path,
+    definitionKey: target.definition.key,
+  });
+}
+
+function activateDiagramLink(event: MouseEvent | KeyboardEvent): void {
+  if (event instanceof KeyboardEvent && event.key !== "Enter" && event.key !== " ") return;
+  const element = event.target instanceof Element ? event.target : null;
+  if (!element) return;
+  if (event instanceof KeyboardEvent) {
+    const target = diagramTargetFromElement(element);
+    if (target) {
+      event.preventDefault();
+      if (event.ctrlKey || event.metaKey) openDiagramTarget(target);
+      else selectDiagramTarget(target);
+      return;
     }
   }
-  if(!activate)return;
+  const pkg = element.closest<HTMLElement>(".package-link");
+  if (!pkg) return;
+  const path = pkg.dataset.scopePath;
+  if (path === undefined) return;
   event.preventDefault();
-  if(event instanceof MouseEvent&&dragState.suppressClick)return;
-  activate();
+  if (event instanceof MouseEvent && dragState.suppressClick) return;
+  void selectUmlTarget({ kind: "directory", path });
 }
-const tree=$("#tree");
-function scrollTreeRowIntoView(row:HTMLButtonElement):void{
-  const treeRect=tree.getBoundingClientRect();
-  const rowRect=row.getBoundingClientRect();
-  tree.scrollTop=treeScrollTopForRow(
+
+diagramStage.addEventListener("wheel", (event) => {
+  if (diagramStage.getAttribute("aria-busy") === "true") return;
+  event.preventDefault();
+  const rect = diagramStage.getBoundingClientRect();
+  viewport.zoomAt(
+    event.deltaY > 0 ? ZOOM_OUT_FACTOR : ZOOM_IN_FACTOR,
+    event.clientX - rect.left,
+    event.clientY - rect.top,
+  );
+}, { passive: false });
+
+diagramStage.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  // Captured before the busy early return: a matching second press stays eligible while loading.
+  const busy = diagramStage.getAttribute("aria-busy") === "true";
+  pendingTap = {
+    pointerId: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+    target: diagramTargetFromElement(event.target),
+    busy,
+  };
+  if (busy || dragState.pointerId !== null) return;
+  dragState.pointerId = event.pointerId;
+  dragState.startX = dragState.lastX = event.clientX;
+  dragState.startY = dragState.lastY = event.clientY;
+  dragState.moved = false;
+});
+
+diagramStage.addEventListener("pointermove", (event) => {
+  if (dragState.pointerId !== event.pointerId) return;
+  if (!dragState.moved) {
+    if (!hasPassedDragThreshold(dragState.startX, dragState.startY, event.clientX, event.clientY)) {
+      return;
+    }
+    dragState.moved = true;
+    diagramStage.setPointerCapture(event.pointerId);
+    diagramStage.classList.add("dragging");
+  }
+  panViewport(viewport, event.clientX - dragState.lastX, event.clientY - dragState.lastY);
+  dragState.lastX = event.clientX;
+  dragState.lastY = event.clientY;
+  viewport.apply();
+});
+
+window.addEventListener("pointerup", (event) => {
+  const tap = pendingTap;
+  pendingTap = undefined;
+  const dragged = dragState.pointerId === event.pointerId && dragState.moved;
+  finishDrag(event, true);
+  if (!tap || tap.pointerId !== event.pointerId) return;
+  if (dragged || hasPassedDragThreshold(tap.x, tap.y, event.clientX, event.clientY)) {
+    clickSequence.clear();
+    return;
+  }
+  const action = clickSequence.record(
+    tap.busy ? undefined : tap.target,
+    event.pointerId,
+    event.timeStamp,
+    event.clientX,
+    event.clientY,
+  );
+  if (!action) return;
+  if (action.action === "open") {
+    suppressNextClick();
+    openDiagramTarget(action.target);
+    return;
+  }
+  selectDiagramTarget(action.target);
+});
+
+window.addEventListener("pointercancel", (event) => {
+  pendingTap = undefined;
+  clickSequence.clear();
+  finishDrag(event, false);
+});
+
+$("#svg-holder").addEventListener("click", activateDiagramLink);
+$("#svg-holder").addEventListener("keydown", activateDiagramLink);
+
+// ---------------------------------------------------------------------------
+// Tree keyboard
+// ---------------------------------------------------------------------------
+
+const tree = $("#tree");
+
+function scrollTreeRowIntoView(row: HTMLButtonElement): void {
+  const treeRect = tree.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  tree.scrollTop = treeScrollTopForRow(
     tree.scrollTop,
-    tree.scrollHeight-tree.clientHeight,
+    tree.scrollHeight - tree.clientHeight,
     treeRect.top,
     treeRect.bottom,
     rowRect.top,
     rowRect.bottom,
   );
 }
-tree.addEventListener("keydown",(event)=>{
-  if(event.key!=="ArrowUp"&&event.key!=="ArrowDown")return;
-  const current=event.target instanceof Element?event.target.closest<HTMLButtonElement>(".tree-row"):null;
-  if(!current||!tree.contains(current))return;
-  const rows=[...tree.querySelectorAll<HTMLButtonElement>(".tree-row")];
-  const nextIndex=adjacentTreeRowIndex(rows.indexOf(current),event.key==="ArrowUp"?-1:1,rows.length);
-  if(nextIndex<0)return;
+
+tree.addEventListener("keydown", (event) => {
+  const current = event.target instanceof Element
+    ? event.target.closest<HTMLButtonElement>(".tree-row")
+    : null;
+  if (!current || !tree.contains(current)) return;
+  if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    const rows = [...tree.querySelectorAll<HTMLButtonElement>(".tree-row")];
+    const nextIndex = adjacentTreeRowIndex(
+      rows.indexOf(current),
+      event.key === "ArrowUp" ? -1 : 1,
+      rows.length,
+    );
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    const next = rows[nextIndex];
+    if (!next) return;
+    next.focus({ preventScroll: true });
+    scrollTreeRowIntoView(next);
+    return;
+  }
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    // Consumed so the native button click cannot select UML over the editor.
+    event.preventDefault();
+    event.stopPropagation();
+    const definitionKey = current.dataset.definitionKey;
+    const path = current.dataset.sourcePath ?? current.dataset.treePath;
+    if (path === undefined) return;
+    if (definitionKey !== undefined) {
+      const line = Number(current.dataset.sourceLine);
+      const column = Number(current.dataset.sourceColumn);
+      void openFile(path, { path, line, column });
+      return;
+    }
+    void openFile(path);
+    return;
+  }
+  if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+  const path = current.dataset.treePath;
+  if (path === undefined) return;
+  const node = findTreeNode(state.tree, path);
+  if (!node) return;
   event.preventDefault();
-  const next=rows[nextIndex];if(!next)return;
-  next.focus({preventScroll:true});
-  scrollTreeRowIntoView(next);
+  const set = node.kind === "directory" ? state.expandedDirs : state.expandedFiles;
+  if (event.key === "ArrowRight") set.add(path);
+  else set.delete(path);
+  renderTree();
 });
-const nodeSearch=$("#node-search");
-nodeSearch.onkeydown=(event)=>{if(event.key!=="Enter")return;event.preventDefault();void commitSearch(nodeSearch.value.trim(),$("#search-case-insensitive").checked);};
-nodeSearch.oninput=()=>{if(nodeSearch.value!=="")return;clearSearch();};
-$("#packages-mode").onclick=()=>void selectScope({name:"Packages",path:"",kind:"directory"},"packages");
-$("#uml-mode").onclick=()=>void selectScope({name:"Selected",path:state.umlScope,kind:"directory"},"uml");
-$("#editor-mode").onclick=()=>{definitionRequests.next();diagramRequests.next();activateView("editor");};$("#tree-filter").oninput=renderTree;$("#zoom-in").onclick=()=>zoomAtStageCenter(ZOOM_IN_FACTOR);$("#zoom-out").onclick=()=>zoomAtStageCenter(ZOOM_OUT_FACTOR);$("#zoom-reset").onclick=()=>viewport.reset();$("#legend-toggle").onclick=()=>{$("#legend").hidden=!$("#legend").hidden;};$("#sidebar-toggle").onclick=toggleSidebar;$("#editor-close").onclick=()=>{setEditorLoading(false);destroyEditor();activateView(state.mode);};$("#editor-print").onclick=printEditor;
-for(const [selector,key] of [["#uml-show-attributes","attributes"],["#uml-show-methods","methods"],["#uml-show-types","types"],["#uml-show-tests","tests"]] as const){
-  const input=$(selector);
-  input.checked=state.umlVisibility[key];
-  input.onchange=()=>{state.umlVisibility[key]=input.checked;void rerenderUmlDiagrams();};
+
+function findTreeNode(root: TreeNode | null, path: string): TreeNode | undefined {
+  if (!root) return undefined;
+  const stack = [root];
+  for (let node = stack.pop(); node; node = stack.pop()) {
+    if (node.path === path) return node;
+    if (node.children) stack.push(...node.children);
+  }
+  return undefined;
 }
-diagramStage.addEventListener("wheel",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true")return;event.preventDefault();const rect=diagramStage.getBoundingClientRect();viewport.zoomAt(event.deltaY>0?ZOOM_OUT_FACTOR:ZOOM_IN_FACTOR,event.clientX-rect.left,event.clientY-rect.top);},{passive:false});
-diagramStage.addEventListener("pointerdown",(event)=>{if(diagramStage.getAttribute("aria-busy")==="true"||event.button!==0||dragState.pointerId!==null)return;dragState.pointerId=event.pointerId;dragState.startX=dragState.lastX=event.clientX;dragState.startY=dragState.lastY=event.clientY;dragState.moved=false;});
-diagramStage.addEventListener("pointermove",(event)=>{if(dragState.pointerId!==event.pointerId)return;if(!dragState.moved){if(!hasPassedDragThreshold(dragState.startX,dragState.startY,event.clientX,event.clientY))return;dragState.moved=true;diagramStage.setPointerCapture(event.pointerId);diagramStage.classList.add("dragging");}panViewport(viewport,event.clientX-dragState.lastX,event.clientY-dragState.lastY);dragState.lastX=event.clientX;dragState.lastY=event.clientY;viewport.apply();});
-window.addEventListener("pointerup",(event)=>finishDrag(event,true));
-window.addEventListener("pointercancel",(event)=>finishDrag(event,false));
-$("#svg-holder").addEventListener("click",activateDiagramLink);
-$("#svg-holder").addEventListener("keydown",activateDiagramLink);
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+
+const nodeSearch = $("#node-search");
+nodeSearch.onkeydown = (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  void commitSearch(nodeSearch.value.trim(), $("#search-case-insensitive").checked);
+};
+nodeSearch.oninput = () => {
+  if (nodeSearch.value !== "") return;
+  clearSearch();
+};
+$("#packages-mode").onclick = () => void loadPackagesDiagram();
+$("#uml-mode").onclick = () => restoreUmlView();
+$("#editor-mode").onclick = () => {
+  definitionRequests.next();
+  diagramRequests.next();
+  activateView("editor");
+};
+$("#tree-filter").oninput = renderTree;
+$("#zoom-in").onclick = () => zoomAtStageCenter(ZOOM_IN_FACTOR);
+$("#zoom-out").onclick = () => zoomAtStageCenter(ZOOM_OUT_FACTOR);
+$("#zoom-reset").onclick = () => viewport.reset();
+$("#legend-toggle").onclick = () => {
+  $("#legend").hidden = !$("#legend").hidden;
+};
+$("#sidebar-toggle").onclick = toggleSidebar;
+$("#editor-close").onclick = () => {
+  setEditorLoading(false);
+  destroyEditor();
+  if (state.mode === "uml") restoreUmlView();
+  else void loadPackagesDiagram();
+};
+$("#editor-print").onclick = () => {
+  if (state.view) window.print();
+};
+for (
+  const [selector, key] of [
+    ["#uml-show-attributes", "attributes"],
+    ["#uml-show-methods", "methods"],
+    ["#uml-show-types", "types"],
+    ["#uml-show-tests", "tests"],
+  ] as const
+) {
+  const input = $(selector);
+  input.checked = state.umlVisibility[key];
+  input.onchange = () => {
+    state.umlVisibility[key] = input.checked;
+    void rerenderUmlDiagrams();
+  };
+}
+
 await loadTree();
 connect();
-void loadDiagram().catch((error)=>{
-  showError(error instanceof Error?error.message:String(error));
-  setStatus("Request failed",true);
+void loadPackagesDiagram().catch((error) => {
+  showError(error instanceof Error ? error.message : String(error));
+  setStatus("Request failed", true);
 });

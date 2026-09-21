@@ -1,10 +1,10 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
-import type { UmlEntityKind } from "../diagram-graph.ts";
 import type { UmlModifier } from "../uml/model.ts";
 import { children, namedChildren } from "./ast.ts";
 import { loadLanguage, parseTree } from "./runtime.ts";
 
-export const RUST_ENTITY_KIND_BY_NODE: Record<string, UmlEntityKind> = {
+/** Nominal Rust items the legacy editor/search span parser addresses. */
+export const RUST_ENTITY_KIND_BY_NODE: Record<string, "class" | "interface" | "enum" | "type"> = {
   struct_item: "class",
   union_item: "class",
   trait_item: "interface",
@@ -15,12 +15,6 @@ export const RUST_ENTITY_KIND_BY_NODE: Record<string, UmlEntityKind> = {
 export const RUST_METHOD_NODE_TYPES: ReadonlySet<string> = new Set([
   "function_item",
   "function_signature_item",
-]);
-
-/** Item kinds that carry members when they appear inside a `declaration_list`. */
-export const RUST_PROPERTY_NODE_TYPES: ReadonlySet<string> = new Set([
-  "const_item",
-  "static_item",
 ]);
 
 const RUST_FUNCTION_MODIFIERS: Record<string, UmlModifier> = {
@@ -88,7 +82,7 @@ export function rustFunctionModifiers(node: Node): UmlModifier[] {
 }
 
 /** The named type an `impl` block applies to, unwrapped through `Foo<..>` and `&Foo`. */
-export function rustImplTarget(node: Node): Node | undefined {
+function rustImplTarget(node: Node): Node | undefined {
   let current = node.childForFieldName("type") ?? undefined;
   while (current) {
     if (current.type === "generic_type") {

@@ -1,584 +1,501 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
+import type { ParsedFileDefinition } from "../goto-definition.ts";
 import { firstAncestor, namedChildren } from "../lang/ast.ts";
-import {
-  annotationType,
-  declarationName,
-  ENTITY_KIND_BY_NODE,
-  isAccessor,
-  METHOD_NODE_TYPES,
-  memberName,
-  topLevelDeclarations,
-} from "../lang/typescript.ts";
-import { analysisLanguageForPath } from "../lang/registry.ts";
-import { rustTopLevelItems } from "../lang/rust.ts";
-import { isDeclarationPath } from "../source.ts";
+import { highlightLanguageForPath } from "../lang/registry.ts";
+import type { UmlRelationKind } from "../diagram-graph.ts";
+import type { FileDefinitionKind } from "../types.ts";
+import { collectRustReferences } from "./rust-usage.ts";
 import type {
-  GotoDefinition,
-  UmlExternalUserKind,
-  UmlSourceLocation,
-} from "../types.ts";
-import { collectRenderedModel } from "./definitions.ts";
-import {
-  scopeRelativePath,
-  umlEntityKey,
-  umlFileKey,
-} from "./keys.ts";
-import { bareUmlName, formatSignatureType } from "./mermaid.ts";
-import type {
-  CategoryMap,
-  ExternalUserNode,
-  FileDeclaration,
-  LocalUserNode,
-  UmlDependency,
-  UmlReference,
+  DefinitionBindingSpace,
+  DefinitionBindingTarget,
+  DefinitionResolutionIndex,
+  IndexedFileDefinition,
 } from "./model.ts";
-import { parseSourceUnits } from "./parse.ts";
-import { classifyRustReferenceOwner, rustMethodReturnAnnotations } from "./rust-usage.ts";
-import { buildSymbolTable, type EntityReference, type SymbolTable } from "./resolve.ts";
 
-type ReferenceOwner = {
-  scopePath: string;
-  signature: string;
-  kind: UmlExternalUserKind;
-  source: UmlSourceLocation;
-  ownerEntityKey?: string;
+/** One resolved outgoing reference: `ownerKey` uses `targetKey`. Occurrences deduplicate. */
+export type UmlReferenceEdge = {
+  ownerKey: string;
+  targetKey: string;
+  kind: UmlRelationKind;
 };
 
-const ENTITY_DECLARATION_TYPES = new Set([...Object.keys(ENTITY_KIND_BY_NODE), "class"]);
+const NOMINAL_KINDS: Record<string, true> = {
+  class: true,
+  interface: true,
+  trait: true,
+  struct: true,
+  union: true,
+  enum: true,
+  type: true,
+};
 
-const OWNING_TYPE_TYPES = new Set([
-  "class_declaration",
-  "abstract_class_declaration",
-  "class",
-  "interface_declaration",
-  "type_alias_declaration",
-]);
-
-const PROPERTY_TYPES = new Set(["public_field_definition", "property_signature"]);
-
-const PARAMETER_TYPES = new Set(["required_parameter", "optional_parameter"]);
-
-const WRAPPER_EXPRESSIONS = new Set([
-  "as_expression",
-  "satisfies_expression",
-  "parenthesized_expression",
-  "type_assertion",
-  "non_null_expression",
-]);
-
-const CALLABLE_TYPES = new Set(["arrow_function", "function_expression"]);
-
-function unwrapExpression(node: Node | undefined): Node | undefined {
-  let current = node;
-  while (current && WRAPPER_EXPRESSIONS.has(current.type)) {
-    current = current.type === "type_assertion"
-      ? current.namedChild(1) ?? undefined
-      : current.namedChild(0) ?? undefined;
-  }
-  return current;
+export function isNominalKind(kind: FileDefinitionKind): boolean {
+  return NOMINAL_KINDS[kind] === true;
 }
 
-function parameterNodes(callable: Node): Node[] {
-  const parameters = callable.childForFieldName("parameters");
-  if (!parameters) return [];
-  return namedChildren(parameters).filter((parameter) => PARAMETER_TYPES.has(parameter.type));
-}
+const SCOPE_KINDS: Record<string, true> = { namespace: true, module: true };
 
 /**
- * `fallback` supplies positional parameter types for an unannotated arrow bound to a variable that
- * carries a `function_type` annotation of its own.
+ * Reference attribution shared by both languages: which indexed declaration a syntax node sits in,
+ * and which lexical scope chain its names resolve through.
  */
-function parameterTypes(callable: Node, fallback?: Node): string {
-  const fallbackParameters = fallback ? parameterNodes(fallback) : [];
-  return parameterNodes(callable)
-    .map((parameter, index) => {
-      const annotation = annotationType(parameter, "type")
-        ?? (fallbackParameters[index] && annotationType(fallbackParameters[index], "type"));
-      return formatSignatureType(annotation?.text);
-    })
-    .join(", ");
-}
+export class ReferenceContext {
+  readonly path: string;
+  readonly index: DefinitionResolutionIndex;
+  readonly byKey = new Map<string, IndexedFileDefinition>();
+  private readonly ownersByNode = new Map<number, string[]>();
+  private readonly edges = new Map<string, UmlReferenceEdge>();
 
-function owningTypeName(node: Node): string | undefined {
-  const owner = firstAncestor(node, (candidate) => OWNING_TYPE_TYPES.has(candidate.type));
-  return owner ? declarationName(owner) : undefined;
-}
-
-function enclosingEntityDeclaration(node: Node): Node | undefined {
-  return firstAncestor(node, (candidate) => ENTITY_DECLARATION_TYPES.has(candidate.type));
-}
-
-function referenceSource(sourceDir: string, file: string, node: Node): UmlSourceLocation {
-  return {
-    path: scopeRelativePath(sourceDir, file),
-    line: node.startPosition.row + 1,
-    column: node.startPosition.column + 1,
-  };
-}
-
-function isExportDeclarationStatement(node: Node): boolean {
-  if (node.type !== "export_statement") return false;
-  if (node.childForFieldName("source")) return true;
-  return namedChildren(node).some((child) => child.type === "export_clause");
-}
-
-function classifyReferenceOwner(
-  reference: Node,
-  file: string,
-  sourceDir: string,
-  entityKeyOf: (declaration: Node, file: string) => string | undefined,
-): ReferenceOwner | undefined {
-  if (isDeclarationPath(file)) return undefined;
-
-  const exportSpecifier = firstAncestor(
-    reference,
-    (candidate) => candidate.type === "export_specifier",
-  );
-  if (exportSpecifier) {
-    const nameNode = exportSpecifier.childForFieldName("name");
-    const exportedName = exportSpecifier.childForFieldName("alias")?.text ?? nameNode?.text;
-    if (!nameNode || exportedName === undefined) return undefined;
-    return {
-      scopePath: scopeRelativePath(sourceDir, file),
-      signature: exportedName,
-      kind: "export",
-      source: referenceSource(sourceDir, file, nameNode),
-    };
+  constructor(path: string, index: DefinitionResolutionIndex, parsed: readonly ParsedFileDefinition[]) {
+    this.path = path;
+    this.index = index;
+    for (const entry of parsed) {
+      this.byKey.set(entry.definition.key, { ...entry.definition, hasBody: entry.hasBody });
+      const existing = this.ownersByNode.get(entry.declaration.id);
+      // Destructuring leaves share one declarator, and therefore one reference set.
+      if (existing) existing.push(entry.definition.key);
+      else this.ownersByNode.set(entry.declaration.id, [entry.definition.key]);
+    }
   }
-  if (
-    firstAncestor(reference, (candidate) =>
-      candidate.type === "import_statement"
-      || candidate.type === "import_alias"
-      || isExportDeclarationStatement(candidate))
-  ) {
+
+  ownersOf(node: Node): readonly string[] {
+    let current: Node | undefined = node;
+    while (current) {
+      const owners = this.ownersByNode.get(current.id);
+      if (owners) return owners;
+      current = current.parent ?? undefined;
+    }
+    return [];
+  }
+
+  /** The nearest enclosing nominal declaration, for `this`/`Self` receivers. */
+  enclosingNominal(node: Node): string | undefined {
+    for (const owner of this.ownersOf(node)) {
+      let key: string | undefined = owner;
+      while (key !== undefined) {
+        const definition = this.byKey.get(key);
+        if (!definition) return undefined;
+        if (isNominalKind(definition.kind)) return definition.key;
+        key = definition.parentKey ?? undefined;
+      }
+    }
     return undefined;
   }
 
-  const scopePath = scopeRelativePath(sourceDir, file);
-  const ownerDeclaration = enclosingEntityDeclaration(reference);
-  const ownerEntityKey = ownerDeclaration ? entityKeyOf(ownerDeclaration, file) : undefined;
-  const result = (
-    signature: string,
-    kind: UmlExternalUserKind,
-    sourceNode: Node,
-  ): ReferenceOwner => ({
-    scopePath,
-    signature,
-    kind,
-    source: referenceSource(sourceDir, file, sourceNode),
-    ...(ownerEntityKey ? { ownerEntityKey } : {}),
-  });
+  /** Lexical namespace/module scopes enclosing `ownerKey`, innermost first, ending at file scope. */
+  scopeChain(ownerKey: string | undefined): string[] {
+    const chain: string[] = [];
+    let key = ownerKey;
+    while (key !== undefined) {
+      const definition = this.byKey.get(key);
+      if (!definition) break;
+      if (SCOPE_KINDS[definition.kind] === true) chain.push(definition.key);
+      key = definition.parentKey ?? undefined;
+    }
+    chain.push("");
+    return chain;
+  }
 
-  const propertyAssignment = firstAncestor(reference, (candidate) => candidate.type === "pair");
-  const callable = firstAncestor(reference, (candidate) => CALLABLE_TYPES.has(candidate.type));
-  if (
-    propertyAssignment
-    && callable
-    && unwrapExpression(propertyAssignment.childForFieldName("value") ?? undefined)?.id === callable.id
-  ) {
-    const objectLiteral = firstAncestor(
-      propertyAssignment,
-      (candidate) => candidate.type === "object",
+  resolveName(
+    name: string,
+    space: DefinitionBindingSpace,
+    chain: readonly string[],
+  ): DefinitionBindingTarget[] {
+    for (const scope of chain) {
+      const local = this.index.bindings(this.path, scope, name, space, false);
+      if (local.length) return [...local];
+      if (!scope) continue;
+      const canonical = canonicalScopeKey(scope);
+      const exported = this.index.bindings(this.path, canonical, name, space, true);
+      if (exported.length) return [...exported];
+    }
+    return [];
+  }
+
+  /** Members a resolved receiver exposes under `name`, deduplicated by target key. */
+  resolveMember(
+    receiver: DefinitionBindingTarget,
+    name: string,
+    space: DefinitionBindingSpace,
+  ): string[] {
+    if (receiver.kind === "module") {
+      return this.index.bindings(receiver.path, "", name, space, true)
+        .flatMap((target) => (target.kind === "definition" ? [target.key] : []));
+    }
+    const definition = this.byKey.get(receiver.key) ?? this.index.definition(receiver.key);
+    if (!definition) return [];
+    if (SCOPE_KINDS[definition.kind] === true) {
+      const scope = canonicalScopeKey(definition.key);
+      const exported = this.index.bindings(definition.source.path, scope, name, space, true);
+      if (exported.length) {
+        return [...new Set(exported.flatMap((target) => (target.kind === "definition" ? [target.key] : [])))];
+      }
+      // An out-of-line Rust module exposes its body file's own top-level declarations.
+      return this.index.members(definition.key)
+        .filter((member) => member.name === name)
+        .map((member) => member.key);
+    }
+    return this.index.members(definition.key)
+      .filter((member) => member.name === name)
+      .map((member) => member.key);
+  }
+
+  add(ownerKeys: readonly string[], targetKey: string, kind: UmlRelationKind): void {
+    for (const ownerKey of ownerKeys) {
+      const key = `${ownerKey}\u0000${targetKey}\u0000${kind}`;
+      if (this.edges.has(key)) continue;
+      this.edges.set(key, { ownerKey, targetKey, kind });
+    }
+  }
+
+  addResolved(node: Node, targets: readonly DefinitionBindingTarget[], kind: UmlRelationKind): void {
+    const owners = this.ownersOf(node);
+    if (!owners.length) return;
+    for (const target of targets) {
+      if (target.kind !== "definition") continue;
+      this.add(owners, target.key, kind);
+    }
+  }
+
+  result(): UmlReferenceEdge[] {
+    return [...this.edges.values()].sort((left, right) =>
+      left.ownerKey.localeCompare(right.ownerKey)
+      || left.targetKey.localeCompare(right.targetKey)
+      || left.kind.localeCompare(right.kind)
     );
-    const variable = firstAncestor(
-      propertyAssignment,
-      (candidate) => candidate.type === "variable_declarator",
+  }
+}
+
+/** Repeated same-file namespace blocks share the occurrence-0 key as their export scope. */
+export function canonicalScopeKey(scopeKey: string): string {
+  try {
+    const parts = JSON.parse(scopeKey) as unknown;
+    if (!Array.isArray(parts) || parts.length !== 4) return scopeKey;
+    return JSON.stringify([parts[0], parts[1], parts[2], 0]);
+  } catch {
+    return scopeKey;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Script references
+// ---------------------------------------------------------------------------
+
+const SCRIPT_IMPORT_BINDING_PARENTS: Record<string, true> = {
+  import_specifier: true,
+  namespace_import: true,
+  import_clause: true,
+  import_alias: true,
+  import_require_clause: true,
+};
+
+const SCRIPT_DECLARATION_NAME_PARENTS: Record<string, true> = {
+  class_declaration: true,
+  abstract_class_declaration: true,
+  class: true,
+  interface_declaration: true,
+  enum_declaration: true,
+  type_alias_declaration: true,
+  function_declaration: true,
+  generator_function_declaration: true,
+  function_signature: true,
+  variable_declarator: true,
+  method_definition: true,
+  method_signature: true,
+  abstract_method_signature: true,
+  public_field_definition: true,
+  field_definition: true,
+  property_signature: true,
+  required_parameter: true,
+  optional_parameter: true,
+  enum_assignment: true,
+  type_parameter: true,
+  internal_module: true,
+  module: true,
+  labeled_statement: true,
+};
+
+/** Nodes whose whole subtree never contributes a reference. */
+const SCRIPT_SKIPPED_SUBTREES: Record<string, true> = {
+  import_statement: true,
+  comment: true,
+};
+
+function scriptParameterNames(parameters: Node | null, out: Set<string>): void {
+  for (const parameter of parameters ? namedChildren(parameters) : []) {
+    const pattern = parameter.childForFieldName("pattern") ?? parameter;
+    collectPatternNames(pattern, out);
+  }
+}
+
+function collectPatternNames(pattern: Node, out: Set<string>): void {
+  switch (pattern.type) {
+    case "identifier":
+    case "shorthand_property_identifier_pattern":
+      out.add(pattern.text);
+      return;
+    case "pair_pattern": {
+      const value = pattern.childForFieldName("value");
+      if (value) collectPatternNames(value, out);
+      return;
+    }
+    case "assignment_pattern":
+    case "object_assignment_pattern": {
+      const left = pattern.childForFieldName("left");
+      if (left) collectPatternNames(left, out);
+      return;
+    }
+    case "rest_pattern":
+    case "object_pattern":
+    case "array_pattern":
+      for (const child of namedChildren(pattern)) collectPatternNames(child, out);
+      return;
+  }
+}
+
+type ScopeFrame = { values: Set<string>; types: Set<string> };
+
+function scriptScopeFrame(node: Node): ScopeFrame | undefined {
+  const values = new Set<string>();
+  const types = new Set<string>();
+  const typeParameters = node.childForFieldName("type_parameters");
+  for (const parameter of typeParameters ? namedChildren(typeParameters) : []) {
+    const name = parameter.childForFieldName("name")?.text;
+    if (name) types.add(name);
+  }
+  switch (node.type) {
+    case "function_declaration":
+    case "generator_function_declaration":
+    case "function_expression":
+    case "generator_function":
+    case "arrow_function":
+    case "function_signature":
+    case "method_definition":
+    case "method_signature":
+    case "abstract_method_signature": {
+      scriptParameterNames(node.childForFieldName("parameters"), values);
+      const single = node.childForFieldName("parameter");
+      if (single) collectPatternNames(single, values);
+      break;
+    }
+    case "statement_block":
+    case "class_body":
+      for (const statement of namedChildren(node)) {
+        if (
+          statement.type === "lexical_declaration"
+          || statement.type === "variable_declaration"
+          || statement.type === "using_declaration"
+        ) {
+          for (const declarator of namedChildren(statement)) {
+            const name = declarator.childForFieldName("name");
+            if (name) collectPatternNames(name, values);
+          }
+        } else if (
+          statement.type === "function_declaration"
+          || statement.type === "generator_function_declaration"
+        ) {
+          const name = statement.childForFieldName("name")?.text;
+          if (name) values.add(name);
+        }
+      }
+      break;
+    case "for_statement":
+    case "for_in_statement": {
+      const initializer = node.childForFieldName("initializer") ?? node.childForFieldName("left");
+      if (initializer) {
+        if (initializer.type === "identifier") values.add(initializer.text);
+        else {
+          for (const declarator of namedChildren(initializer)) {
+            const name = declarator.childForFieldName("name") ?? declarator;
+            collectPatternNames(name, values);
+          }
+        }
+      }
+      break;
+    }
+    case "catch_clause": {
+      const parameter = node.childForFieldName("parameter");
+      if (parameter) collectPatternNames(parameter, values);
+      break;
+    }
+  }
+  return values.size || types.size ? { values, types } : undefined;
+}
+
+function shadowed(frames: readonly ScopeFrame[], name: string, space: DefinitionBindingSpace): boolean {
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    if (!frame) continue;
+    if (space === "value" ? frame.values.has(name) : frame.types.has(name)) return true;
+  }
+  return false;
+}
+
+function scriptIsUsage(node: Node): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (SCRIPT_IMPORT_BINDING_PARENTS[parent.type] === true) return false;
+  if (parent.type === "export_specifier") return false;
+  if (parent.type === "member_expression") return parent.childForFieldName("property")?.id !== node.id;
+  if (parent.type === "nested_type_identifier") return parent.childForFieldName("name")?.id !== node.id;
+  if (parent.type === "pair") return parent.childForFieldName("key")?.id !== node.id;
+  if (SCRIPT_DECLARATION_NAME_PARENTS[parent.type] === true) {
+    if (parent.childForFieldName("name")?.id === node.id) return false;
+    if (parent.childForFieldName("pattern")?.id === node.id) return false;
+  }
+  return true;
+}
+
+function scriptHeritageKind(node: Node): UmlRelationKind {
+  const clause = firstAncestor(node, (candidate) =>
+    candidate.type === "extends_clause"
+    || candidate.type === "implements_clause"
+    || candidate.type === "extends_type_clause"
+  );
+  if (!clause) return "references";
+  return clause.type === "extends_clause" ? "extends" : "implements";
+}
+
+/** A receiver expression's declared type or namespace, when it is statically knowable. */
+function scriptReceiverTargets(
+  context: ReferenceContext,
+  node: Node,
+  frames: readonly ScopeFrame[],
+  chain: readonly string[],
+): DefinitionBindingTarget[] {
+  if (node.type === "this") {
+    const nominal = context.enclosingNominal(node);
+    return nominal ? [{ kind: "definition", key: nominal }] : [];
+  }
+  if (node.type === "identifier") {
+    if (!shadowed(frames, node.text, "value")) {
+      const resolved = context.resolveName(node.text, "value", chain);
+      if (resolved.length) return resolved;
+    }
+    return scriptLocalReceiverType(context, node, chain);
+  }
+  if (node.type === "member_expression") {
+    const object = node.childForFieldName("object");
+    const property = node.childForFieldName("property");
+    if (!object || !property) return [];
+    const receivers = scriptReceiverTargets(context, object, frames, chain);
+    const keys = receivers.flatMap((receiver) =>
+      context.resolveMember(receiver, property.text, "value")
     );
-    const variableName = variable?.childForFieldName("name");
-    const keyNode = propertyAssignment.childForFieldName("key");
+    return [...new Set(keys)].map((key) => ({ kind: "definition", key } as const));
+  }
+  return [];
+}
+
+/** `const widget: Widget = …` / `const widget = new Widget()` name their receiver's type. */
+function scriptLocalReceiverType(
+  context: ReferenceContext,
+  node: Node,
+  chain: readonly string[],
+): DefinitionBindingTarget[] {
+  const scope = firstAncestor(node, (candidate) =>
+    candidate.type === "statement_block" || candidate.type === "program"
+  );
+  const declarator = findLocalDeclarator(scope, node.text);
+  if (!declarator) return [];
+  const annotation = declarator.childForFieldName("type")?.namedChild(0);
+  const typeName = annotation && annotation.type === "type_identifier" ? annotation.text : undefined;
+  if (typeName !== undefined) return context.resolveName(typeName, "type", chain);
+  const value = declarator.childForFieldName("value");
+  if (value?.type !== "new_expression") return [];
+  const constructed = value.childForFieldName("constructor");
+  if (constructed?.type !== "identifier") return [];
+  return context.resolveName(constructed.text, "type", chain);
+}
+
+function findLocalDeclarator(scope: Node | undefined, name: string): Node | undefined {
+  if (!scope) return undefined;
+  for (const statement of namedChildren(scope)) {
     if (
-      objectLiteral
-      && variable
-      && keyNode
-      && variableName?.type === "identifier"
-      && unwrapExpression(variable.childForFieldName("value") ?? undefined)?.id === objectLiteral.id
-    ) {
-      return result(
-        `${variableName.text}.${memberName(propertyAssignment)?.name ?? keyNode.text}(${
-          parameterTypes(callable)
-        })`,
-        "method",
-        keyNode,
-      );
+      statement.type !== "lexical_declaration"
+      && statement.type !== "variable_declaration"
+      && statement.type !== "using_declaration"
+    ) continue;
+    for (const declarator of namedChildren(statement)) {
+      if (declarator.type !== "variable_declarator") continue;
+      if (declarator.childForFieldName("name")?.text === name) return declarator;
     }
-  }
-
-  const method = firstAncestor(
-    reference,
-    (candidate) => METHOD_NODE_TYPES.has(candidate.type) && memberName(candidate)?.name !== "constructor",
-  );
-  if (method) {
-    const owner = owningTypeName(method);
-    const nameNode = method.childForFieldName("name");
-    if (owner && nameNode) {
-      return result(
-        `${owner}.${memberName(method)?.name ?? nameNode.text}(${parameterTypes(method)})`,
-        "method",
-        nameNode,
-      );
-    }
-  }
-
-  const constructorDeclaration = firstAncestor(
-    reference,
-    (candidate) => candidate.type === "method_definition" && memberName(candidate)?.name === "constructor",
-  );
-  if (constructorDeclaration) {
-    const owner = owningTypeName(constructorDeclaration);
-    if (owner) {
-      return result(
-        `${owner}.constructor(${parameterTypes(constructorDeclaration)})`,
-        "constructor",
-        constructorDeclaration,
-      );
-    }
-  }
-
-  const property = firstAncestor(reference, (candidate) => PROPERTY_TYPES.has(candidate.type));
-  if (property) {
-    const owner = owningTypeName(property);
-    const nameNode = property.childForFieldName("name");
-    if (owner && nameNode) {
-      return result(
-        `${owner}.${memberName(property)?.name ?? nameNode.text}: ${
-          formatSignatureType(annotationType(property, "type")?.text)
-        }`,
-        "property",
-        nameNode,
-      );
-    }
-  }
-
-  if (
-    ownerDeclaration
-    && ownerDeclaration.type !== "type_alias_declaration"
-  ) {
-    const name = declarationName(ownerDeclaration);
-    const nameNode = ownerDeclaration.childForFieldName("name");
-    return name ? result(name, "class", nameNode ?? ownerDeclaration) : undefined;
-  }
-
-  const fn = firstAncestor(reference, (candidate) => candidate.type === "function_declaration");
-  if (fn) {
-    const nameNode = fn.childForFieldName("name");
-    return nameNode
-      ? result(`${nameNode.text}(${parameterTypes(fn)})`, "function", nameNode)
-      : undefined;
-  }
-
-  const variable = firstAncestor(
-    reference,
-    (candidate) => candidate.type === "variable_declarator",
-  );
-  if (variable) {
-    const nameNode = variable.childForFieldName("name");
-    const declaration = variable.parent;
-    const statement = declaration?.parent?.type === "export_statement"
-      ? declaration.parent
-      : declaration;
-    const initializer = unwrapExpression(variable.childForFieldName("value") ?? undefined);
-    const annotation = annotationType(variable, "type");
-    if (
-      nameNode?.type === "identifier"
-      && statement?.parent?.type === "program"
-      && initializer
-      && CALLABLE_TYPES.has(initializer.type)
-    ) {
-      return result(
-        `${nameNode.text}(${
-          parameterTypes(initializer, annotation?.type === "function_type" ? annotation : undefined)
-        })`,
-        "function",
-        nameNode,
-      );
-    }
-    if (nameNode) {
-      return result(
-        `${nameNode.text}: ${formatSignatureType(annotation?.text)}`,
-        "variable",
-        nameNode,
-      );
-    }
-  }
-
-  const alias = firstAncestor(
-    reference,
-    (candidate) => candidate.type === "type_alias_declaration",
-  );
-  if (alias) {
-    const nameNode = alias.childForFieldName("name");
-    const name = declarationName(alias);
-    if (name && nameNode) return result(name, "type", nameNode);
   }
   return undefined;
 }
 
-/** The Rust classifier's result in the shape `collectUsageGraph` consumes. */
-function rustReferenceOwner(
-  reference: Node,
-  file: string,
-  sourceDir: string,
-): ReferenceOwner | undefined {
-  const owner = classifyRustReferenceOwner(reference);
-  if (!owner) return undefined;
-  return {
-    scopePath: scopeRelativePath(sourceDir, file),
-    signature: owner.signature,
-    kind: owner.kind,
-    source: referenceSource(sourceDir, file, owner.source),
-    ...(owner.ownerName === undefined
-      ? {}
-      : { ownerEntityKey: umlEntityKey(file, bareUmlName(owner.ownerName)) }),
-  };
-}
-
-function collectUsageGraph(
-  sourceDir: string,
-  inScopeFiles: ReadonlySet<string>,
-  references: readonly EntityReference[],
-  entities: ReadonlyMap<string, UmlReference>,
-  fileDeclarations: readonly FileDeclaration[],
-  methodReturnDependencies: readonly UmlDependency[],
-  ignoredExternalUserFiles: ReadonlySet<string>,
-  entityKeyOf: (declaration: Node, file: string) => string | undefined,
-): {
-  usageEdges: UmlDependency[];
-  localUserNodes: LocalUserNode[];
-  externalUserNodes: ExternalUserNode[];
-} {
-  const directedKeys = new Set<string>();
-  for (const declaration of fileDeclarations) {
-    for (const clauses of declaration.heritageClauses) {
-      for (const clause of clauses) directedKeys.add(`${clause.classTypeId}\0${clause.clauseTypeId}`);
-    }
-  }
-  for (const dependency of methodReturnDependencies) {
-    directedKeys.add(`${dependency.sourceId}\0${dependency.targetId}`);
-  }
-
-  const usageEdges: UmlDependency[] = [];
-  const localGroups = new Map<string, ReferenceOwner & {
-    ownerEntityId?: string;
-    targets: Map<string, UmlReference>;
-  }>();
-  const externalGroups = new Map<string, {
-    scopePath: string;
-    signature: string;
-    kind: UmlExternalUserKind;
-    targets: Map<string, UmlReference>;
-  }>();
-
-  for (const reference of references) {
-    const user = analysisLanguageForPath(reference.file) === "rust"
-      ? rustReferenceOwner(reference.node, reference.file, sourceDir)
-      : classifyReferenceOwner(reference.node, reference.file, sourceDir, entityKeyOf);
-    if (!user) continue;
-    const ownerDeclaration = enclosingEntityDeclaration(reference.node);
-    const userEntity = user.ownerEntityKey ? entities.get(user.ownerEntityKey) : undefined;
-    const isLocalTypeAlias = ownerDeclaration?.type === "type_alias_declaration"
-      && !ownerDeclaration.childForFieldName("type_parameters");
-    if (userEntity?.id === reference.target.id) continue;
-
-    const referenceFileKey = umlFileKey(reference.file);
-    if (inScopeFiles.has(referenceFileKey)) {
-      if (userEntity && !isLocalTypeAlias) {
-        const key = `${userEntity.id}\0${reference.target.id}`;
-        if (directedKeys.has(key)) continue;
-        directedKeys.add(key);
-        usageEdges.push({
-          sourceId: userEntity.id,
-          sourceName: userEntity.name,
-          targetId: reference.target.id,
-          targetName: reference.target.name,
-        });
-        continue;
-      }
-      const key = `${user.scopePath}\0${user.signature}\0${user.kind}`;
-      let group = localGroups.get(key);
-      if (!group) {
-        group = {
-          ...user,
-          ...(userEntity ? { ownerEntityId: userEntity.id } : {}),
-          targets: new Map<string, UmlReference>(),
-        };
-        localGroups.set(key, group);
-      }
-      group.targets.set(reference.target.id, reference.target);
-      continue;
-    }
-
-    if (ignoredExternalUserFiles.has(referenceFileKey)) continue;
-
-    const key = `${user.scopePath}\0${user.signature}`;
-    let group = externalGroups.get(key);
-    if (!group) {
-      group = {
-        scopePath: user.scopePath,
-        signature: user.signature,
-        kind: user.kind,
-        targets: new Map<string, UmlReference>(),
-      };
-      externalGroups.set(key, group);
-    }
-    group.targets.set(reference.target.id, reference.target);
-  }
-
-  usageEdges.sort((left, right) =>
-    left.sourceName.localeCompare(right.sourceName)
-    || left.targetName.localeCompare(right.targetName)
-    || left.sourceId.localeCompare(right.sourceId)
-    || left.targetId.localeCompare(right.targetId)
-  );
-  const localUserNodes = [...localGroups.values()]
-    .sort((left, right) =>
-      left.scopePath.localeCompare(right.scopePath)
-      || left.signature.localeCompare(right.signature)
-      || left.kind.localeCompare(right.kind)
-    )
-    .map((group, index) => {
-      const nodeId = `local${index}`;
-      return {
-        navigation: {
-          nodeId,
-          label: `${group.kind === "export" ? "export" : "local"}: ${group.scopePath}: ${group.signature}`,
-          kind: group.kind,
-          ...group.source,
-        },
-        ...(group.ownerEntityId ? { ownerEntityId: group.ownerEntityId } : {}),
-        targets: [...group.targets.values()].sort((left, right) =>
-          left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
-        ),
-      };
-    });
-  const externalUserNodes = [...externalGroups.values()]
-    .sort((left, right) =>
-      left.scopePath.localeCompare(right.scopePath)
-      || left.signature.localeCompare(right.signature)
-      || left.kind.localeCompare(right.kind)
-    )
-    .map((group, index) => {
-      const nodeId = `extern${index}`;
-      return {
-        navigation: {
-          nodeId,
-          label: `extern: ${group.scopePath}: ${group.signature}`,
-          scopePath: group.scopePath,
-          kind: group.kind,
-        },
-        targets: [...group.targets.values()].sort((left, right) =>
-          left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
-        ),
-      };
-    });
-  return { usageEdges, localUserNodes, externalUserNodes };
-}
-
-
-function methodNodes(declaration: Node): Node[] {
-  const nodes: Node[] = [];
-  const body = declaration.type === "type_alias_declaration"
-    ? declaration.childForFieldName("value")
-    : declaration.childForFieldName("body");
-  if (!body) return nodes;
-  if (declaration.type === "type_alias_declaration" && body.type !== "object_type") return nodes;
-  for (const member of namedChildren(body)) {
-    if (!METHOD_NODE_TYPES.has(member.type) || isAccessor(member)) continue;
-    if (memberName(member)?.name === "constructor") continue;
-    nodes.push(member);
-  }
-  return nodes;
-}
-
-export type UmlAnalysisInput = {
-  sourceDir: string;
-  sourceFiles: readonly string[];
-  projectFiles: readonly string[];
-  contents: ReadonlyMap<string, string>;
-  declarations: FileDeclaration[];
-  categories: CategoryMap;
-  ignoredExternalUserFiles: ReadonlySet<string>;
-};
-
-export function analyzeUmlTypes(input: UmlAnalysisInput): {
-  methodReturnDependencies: UmlDependency[];
-  usageEdges: UmlDependency[];
-  definitions: GotoDefinition[];
-  localUserNodes: LocalUserNode[];
-  externalUserNodes: ExternalUserNode[];
-} {
-  const { sourceDir, sourceFiles, declarations, categories, ignoredExternalUserFiles } = input;
-  const parsed = parseSourceUnits(input.projectFiles, input.contents);
+function visitScript(
+  context: ReferenceContext,
+  node: Node,
+  frames: ScopeFrame[],
+): void {
+  if (SCRIPT_SKIPPED_SUBTREES[node.type] === true) return;
+  const frame = scriptScopeFrame(node);
+  if (frame) frames.push(frame);
   try {
-    const { definitions, entities } = collectRenderedModel(sourceDir, declarations, input.contents);
-    const symbols: SymbolTable = buildSymbolTable(parsed.units, entities);
-    const entityKeyOf = (declaration: Node, file: string): string | undefined => {
-      const name = declarationName(declaration);
-      return name === undefined ? undefined : umlEntityKey(file, bareUmlName(name));
-    };
-
-    const methodReturnDependencies: UmlDependency[] = [];
-    const dependencyKeys = new Set<string>();
-    const addMethodReturns = (path: string, source: UmlReference, annotation: Node): void => {
-      for (const target of symbols.resolveTypeReferences(path, annotation)) {
-        if (source.id === target.id) continue;
-        const dependencyKey = `${source.id}\0${target.id}`;
-        if (dependencyKeys.has(dependencyKey)) continue;
-        dependencyKeys.add(dependencyKey);
-        methodReturnDependencies.push({
-          sourceId: source.id,
-          sourceName: source.name,
-          targetId: target.id,
-          targetName: target.name,
-        });
+    const owners = context.ownersOf(node);
+    const chain = context.scopeChain(owners[0]);
+    if (node.type === "nested_type_identifier") {
+      const module = node.childForFieldName("module");
+      const name = node.childForFieldName("name");
+      if (module && name) {
+        const receivers = scriptReceiverTargets(context, module, frames, chain);
+        const keys = [
+          ...new Set(receivers.flatMap((receiver) => context.resolveMember(receiver, name.text, "type"))),
+        ];
+        const kind = scriptHeritageKind(node);
+        for (const key of keys) context.add(owners, key, kind);
       }
-    };
-    for (const file of sourceFiles) {
-      const unit = parsed.byKey.get(umlFileKey(file));
-      if (!unit) continue;
-      if (analysisLanguageForPath(unit.path) === "rust") {
-        for (const owner of rustMethodReturnAnnotations(rustTopLevelItems(unit.root))) {
-          const source = entities.get(umlEntityKey(unit.path, bareUmlName(owner.ownerName)));
-          if (!source) continue;
-          addMethodReturns(unit.path, source, owner.annotation);
-        }
-        continue;
-      }
-      for (const declaration of topLevelDeclarations(unit.root)) {
-        if (!ENTITY_DECLARATION_TYPES.has(declaration.type)) continue;
-        const key = entityKeyOf(declaration, unit.path);
-        const source = key === undefined ? undefined : entities.get(key);
-        if (!source) continue;
-        if (declaration.type === "abstract_class_declaration") {
-          const existing = categories.get(source.name);
-          if (existing) existing.category = "abstract";
-        }
-        for (const method of methodNodes(declaration)) {
-          const annotation = annotationType(method, "return_type");
-          if (!annotation) continue;
-          addMethodReturns(unit.path, source, annotation);
-        }
-      }
+      return;
     }
-
-    const inScopeFiles = new Set(sourceFiles.map(umlFileKey));
-    const { usageEdges, localUserNodes, externalUserNodes } = collectUsageGraph(
-      sourceDir,
-      inScopeFiles,
-      symbols.references(),
-      entities,
-      declarations,
-      methodReturnDependencies,
-      ignoredExternalUserFiles,
-      entityKeyOf,
-    );
-    return {
-      methodReturnDependencies,
-      usageEdges,
-      definitions,
-      localUserNodes,
-      externalUserNodes,
-    };
+    if (node.type === "member_expression") {
+      const object = node.childForFieldName("object");
+      const property = node.childForFieldName("property");
+      if (object && property) {
+        const receivers = scriptReceiverTargets(context, object, frames, chain);
+        const keys = [
+          ...new Set(receivers.flatMap((receiver) => context.resolveMember(receiver, property.text, "value"))),
+        ];
+        for (const key of keys) context.add(owners, key, "references");
+        // Executable receiver subexpressions still carry their own references.
+        if (object.type !== "identifier" && object.type !== "this" && object.type !== "member_expression") {
+          visitScript(context, object, frames);
+        }
+      }
+      return;
+    }
+    if (node.type === "type_identifier" || node.type === "identifier") {
+      if (scriptIsUsage(node)) {
+        const space: DefinitionBindingSpace = node.type === "type_identifier" ? "type" : "value";
+        if (!shadowed(frames, node.text, space)) {
+          context.addResolved(node, context.resolveName(node.text, space, chain), scriptHeritageKind(node));
+        }
+      }
+      return;
+    }
+    for (const child of namedChildren(node)) visitScript(context, child, frames);
   } finally {
-    parsed.dispose();
+    if (frame) frames.pop();
   }
+}
+
+export function collectScriptReferences(
+  context: ReferenceContext,
+  root: Node,
+): UmlReferenceEdge[] {
+  visitScript(context, root, []);
+  return context.result();
+}
+
+/** Every resolved outgoing reference one source file contributes, in deterministic order. */
+export function collectFileReferences(
+  path: string,
+  root: Node,
+  parsed: readonly ParsedFileDefinition[],
+  index: DefinitionResolutionIndex,
+): UmlReferenceEdge[] {
+  const context = new ReferenceContext(path, index, parsed);
+  return highlightLanguageForPath(path) === "rust"
+    ? collectRustReferences(context, root)
+    : collectScriptReferences(context, root);
 }

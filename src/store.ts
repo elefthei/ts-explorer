@@ -4,8 +4,9 @@ import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import { readTree } from "./tree.ts";
 import type {
   DefinitionLookupResponse,
-  DiagramKind,
+  DiagramRequest,
   DiagramResponse,
+  FileDefinitionsResponse,
   FileResponse,
   GotoDefinitionLookupResponse,
   PackageInfo,
@@ -108,14 +109,9 @@ export class ExplorerStore {
     return { version: this.version, ...result };
   }
 
-  async getDiagram(
-    kind: DiagramKind,
-    scopePath: string,
-  ): Promise<DiagramResponse> {
+  async getDiagram(request: DiagramRequest): Promise<DiagramResponse> {
     const requestedVersion = this.version;
-    const result = await this.fromPreprocessor(() =>
-      this.preprocessor.getDiagram(kind, scopePath),
-    );
+    const result = await this.fromPreprocessor(() => this.preprocessor.getDiagram(request));
     return { version: requestedVersion, ...result };
   }
 
@@ -137,6 +133,14 @@ export class ExplorerStore {
       this.preprocessor.getDefinition(relativePath, location),
     );
     return { version: requestedVersion, definition };
+  }
+
+  async getFileDefinitions(relativePath: string): Promise<FileDefinitionsResponse> {
+    const requestedVersion = this.version;
+    const definitions = await this.fromPreprocessor(() =>
+      this.preprocessor.getFileDefinitions(relativePath),
+    );
+    return { version: requestedVersion, definitions };
   }
 
   async lookupDefinition(

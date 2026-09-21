@@ -1,139 +1,109 @@
 import { expect } from "bun:test";
 import { join } from "node:path";
-import { Cache } from "../../src/cache.ts";
+import { Cache, type CachePackageDiagramInput } from "../../src/cache.ts";
 import type {
-  DiagramGraph,
   PackageDiagramGraph,
-  RenderedDiagram,
   RenderedPackageDiagram,
-  RenderedUmlDiagram,
   UmlDiagramGraph,
 } from "../../src/diagram-graph.ts";
 import { renderPackageDiagramGraph } from "../../src/packages.ts";
-import { hydrateUmlGraph } from "../../src/uml/graph.ts";
-import { FULL_UML_VISIBILITY } from "../../src/uml/model.ts";
-import { renderUmlDiagramGraph } from "../../src/uml/render.ts";
-import { renderUmlView } from "../../src/uml/view.ts";
-import type { DiagramPayload } from "../../src/types.ts";
+import type { PackageDiagramPayload } from "../../src/types.ts";
+import type { UmlProject } from "./uml-project.ts";
 
 let cacheOrdinal = 0;
 
+/**
+ * Every array a persisted UML file graph carries. A reload that silently drops one of these has to
+ * fail the round-trip check instead of passing because the hydrator happened to default it.
+ */
 const UML_RECORD_ARRAY_FIELDS = [
   "nodes",
-  "aliases",
   "edges",
   "relations",
-  "declarations",
   "entities",
   "properties",
-  "propertyTypeIds",
   "methods",
-  "methodReturnTypeIds",
+  "memberModifiers",
   "enumItems",
-  "entityHeritageClauses",
-  "declarationHeritageGroups",
-  "declarationHeritageClauses",
-  "memberAssociations",
   "categories",
-  "methodReturnDependencies",
-  "usageEdges",
-  "localUsers",
-  "externalUsers",
-  "localUserTargets",
-  "externalUserTargets",
-  "definitions",
 ] as const satisfies readonly {
-  [Field in keyof UmlDiagramGraph]:
-    UmlDiagramGraph[Field] extends readonly unknown[] ? Field : never;
+  [Field in keyof UmlDiagramGraph]: UmlDiagramGraph[Field] extends readonly unknown[] ? Field
+    : never;
 }[keyof UmlDiagramGraph][];
 
-export function renderDiagramGraph(graph: PackageDiagramGraph): RenderedPackageDiagram;
-export function renderDiagramGraph(graph: UmlDiagramGraph): RenderedUmlDiagram;
-export function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram;
-export function renderDiagramGraph(graph: DiagramGraph): RenderedDiagram {
-  return graph.kind === "packages"
-    ? renderPackageDiagramGraph(graph)
-    : renderUmlDiagramGraph(graph);
+function expectUmlGraphsEqual(actual: UmlDiagramGraph, expected: UmlDiagramGraph): void {
+  expect({
+    kind: actual.kind,
+    scopePath: actual.scopePath,
+    formatVersion: actual.formatVersion,
+    renderMode: actual.renderMode,
+  }).toEqual({
+    kind: expected.kind,
+    scopePath: expected.scopePath,
+    formatVersion: expected.formatVersion,
+    renderMode: expected.renderMode,
+  });
+  for (const field of UML_RECORD_ARRAY_FIELDS) {
+    expect(actual[field], `${expected.scopePath}: ${field}`).toEqual(expected[field]);
+  }
 }
 
-export async function materializeUmlGraph(
+/**
+ * Reloads one file's persisted graph through `Cache.readDiagramGraph` and asserts it equals what
+ * `extractFileUmlGraph` produced, field by field. This is the normalized-table contract: what the
+ * writer accepted is exactly what a later selection read will see.
+ */
+export function expectUmlGraphRoundTrip(project: UmlProject, path: string): UmlDiagramGraph {
+  const extracted = project.fileGraph(path);
+  const reloaded = project.cache.readDiagramGraph(project.generationId, "uml", path);
+  if (reloaded?.kind !== "uml") throw new Error(`no persisted UML graph for ${path}`);
+  expectUmlGraphsEqual(reloaded, extracted);
+  return reloaded;
+}
+
+/** The same round-trip over every source file the project indexed. */
+export function expectFileGraphRoundTrips(project: UmlProject): void {
+  for (const path of project.sourcePaths) expectUmlGraphRoundTrip(project, path);
+}
+
+export type MaterializedPackageGraph = {
+  extracted: PackageDiagramGraph;
+  reloaded: PackageDiagramGraph;
+  rendered: RenderedPackageDiagram;
+  cached: PackageDiagramPayload;
+};
+
+/**
+ * Writes a package graph through the real discovery transaction and reads it back. Packages are
+ * the one diagram whose `diagrams` row is still the complete public payload.
+ */
+export function materializePackageGraph(
   cacheDirectory: string,
-  extracted: UmlDiagramGraph,
-) {
+  extracted: PackageDiagramGraph,
+  outcome: CachePackageDiagramInput["outcome"] = { status: "ready" },
+): MaterializedPackageGraph {
   cacheOrdinal += 1;
-  const cache = new Cache(join(cacheDirectory, `.uml-graph-${cacheOrdinal}.sqlite`));
+  const cache = new Cache(join(cacheDirectory, `.package-graph-${cacheOrdinal}.sqlite`));
   try {
     const generationId = cache.beginGeneration("startup", "");
-    const cached = cache.writeScope(
+    const cached = cache.writeDiscovery(
       generationId,
-      {
-        entries: [],
-        diagram: { graph: extracted, outcome: { status: "ready" } },
-        definitions: [],
-      },
-      renderDiagramGraph,
+      [],
+      { graph: extracted, outcome },
+      renderPackageDiagramGraph,
     );
-    const record = cache.readDiagramGraph(generationId, "uml", extracted.scopePath);
-    if (record?.kind !== "uml") {
-      throw new Error(`Expected reloaded UML graph for ${extracted.scopePath}`);
-    }
-    if (cached.kind !== "uml") {
-      throw new Error(`Expected a cached UML diagram for ${extracted.scopePath}`);
-    }
-    return {
-      ...cached,
-      ...renderUmlView(cached.view, FULL_UML_VISIBILITY),
-      cached,
-      extracted,
-      record,
-      graph: hydrateUmlGraph(record.nodes, record.aliases, record.edges, record.relations),
-    };
+    const reloaded = cache.readDiagramGraph(generationId, "packages", "");
+    if (reloaded?.kind !== "packages") throw new Error("no persisted package graph");
+    expect(reloaded).toEqual(extracted);
+    const rendered = renderPackageDiagramGraph(reloaded);
+    expect(cached).toEqual({
+      ...rendered,
+      scopePath: "",
+      status: outcome.status,
+      ...(outcome.status === "error" ? { error: outcome.error } : {}),
+    });
+    return { extracted, reloaded, rendered, cached };
   } finally {
     cache.close();
   }
-}
-
-export function expectTopologyRoundTrip(actual: DiagramGraph, expected: DiagramGraph): void {
-  expect({
-    nodes: actual.nodes,
-    aliases: actual.aliases,
-    edges: actual.edges,
-    relations: actual.relations,
-  }).toEqual({
-    nodes: expected.nodes,
-    aliases: expected.aliases,
-    edges: expected.edges,
-    relations: expected.relations,
-  });
-}
-
-export function expectNormalizedUmlRoundTrip(
-  actual: UmlDiagramGraph,
-  expected: UmlDiagramGraph,
-): void {
-  for (const field of UML_RECORD_ARRAY_FIELDS) {
-    expect(actual[field], field).toEqual(expected[field]);
-  }
-}
-
-type MaterializedRendering = RenderedUmlDiagram & {
-  cached: DiagramPayload;
-  record: UmlDiagramGraph;
-};
-
-export function expectCachedRendering(materialized: MaterializedRendering): void {
-  const rendered: RenderedUmlDiagram = {
-    kind: "uml",
-    view: materialized.view,
-    packageNodes: materialized.packageNodes,
-    definitions: materialized.definitions,
-    externalUsers: materialized.externalUsers,
-    localUsers: materialized.localUsers,
-  };
-  expect(rendered).toEqual(renderDiagramGraph(materialized.record));
-  expect(materialized.cached).toEqual({
-    ...rendered,
-    scopePath: materialized.record.scopePath,
-    status: "ready",
-  });
 }

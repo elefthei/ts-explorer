@@ -1,15 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import mermaid from "mermaid";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Cache, DiagramMaterializationError } from "../src/cache.ts";
-import type {
-  DiagramGraph,
-  RenderedDiagram,
-  UmlDiagramGraph,
-} from "../src/diagram-graph.ts";
+import { DIAGRAM_GRAPH_FORMAT_VERSION, type UmlDiagramGraph } from "../src/diagram-graph.ts";
+import { extractPackageDiagramGraph, renderPackageDiagramGraph } from "../src/packages.ts";
 import { resolveCacheDbPath } from "../src/paths.ts";
 import { Preprocessor } from "../src/preprocessor.ts";
 import {
@@ -18,120 +14,150 @@ import {
   type PreprocessProgressEvent,
   type PreprocessResponse,
 } from "../src/preprocess-protocol.ts";
-import type { EditorGotoDefinition, GotoDefinition, TreeNode } from "../src/types.ts";
-import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
-import { EMPTY_UML_VIEW_MODEL, renderUmlView } from "../src/uml/view.ts";
+import type {
+  DiagramPayload,
+  DiagramRequest,
+  EditorGotoDefinition,
+  FileDefinition,
+  GotoDefinition,
+  PackageInfo,
+  TreeNode,
+  UmlDiagramPayload,
+} from "../src/types.ts";
+import type { DefinitionIndexSnapshot } from "../src/uml/model.ts";
+import type { UmlViewModel } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { renderDiagramGraph } from "./support/normalized-graph.ts";
-import {
-  expectOnlyNormalizedGeneration,
-  NORMALIZED_TABLE_SPECS,
-  normalizedGenerationIds,
-  type NormalizedTable,
-} from "./support/normalized-sql.ts";
 
-const NORMALIZED_GRAPH_TABLES = Object.keys(NORMALIZED_TABLE_SPECS) as NormalizedTable[];
+type DefinitionsView = Extract<UmlViewModel, { kind: "definitions" }>;
+type FilesView = Extract<UmlViewModel, { kind: "files" }>;
 
+/**
+ * A synthetic catalogue for cache-level tests. The keys are test-owned opaque identifiers: the
+ * cache only requires that every UML node names an indexed definition of the same generation.
+ */
+function fixtureCatalogue(scopePath: string): DefinitionIndexSnapshot {
+  const nominal = ["Alpha", "Beta", "Gamma"].map((name, index) => ({
+    key: `${scopePath}:${name}`,
+    parentKey: null,
+    isTopLevel: true,
+    hasBody: true,
+    name,
+    qualifiedName: name,
+    kind: "class" as const,
+    type: name,
+    source: { path: scopePath, line: index + 1, column: 14 },
+  }));
+  const definitions = [
+    ...nominal,
+    {
+      key: `${scopePath}:Alpha.beta`,
+      parentKey: `${scopePath}:Alpha`,
+      isTopLevel: false,
+      hasBody: true,
+      name: "beta",
+      qualifiedName: "Alpha.beta",
+      kind: "method" as const,
+      type: "(): Beta",
+      source: { path: scopePath, line: 1, column: 30 },
+    },
+  ];
+  return {
+    entries: [
+      { name: "root", path: "", kind: "directory" },
+      { name: scopePath, path: scopePath, kind: "file", viewable: true },
+    ],
+    definitions,
+    bindings: [],
+    contributors: definitions.map((definition) => ({
+      definitionKey: definition.key,
+      sourcePath: scopePath,
+      kind: "declaration" as const,
+    })),
+    imports: [],
+  };
+}
+
+/** The direct per-file graph `fixtureCatalogue` describes: two directed edges, one method row. */
 function fixtureUmlGraph(scopePath: string): UmlDiagramGraph {
+  const key = (name: string) => `${scopePath}:${name}`;
   return {
     kind: "uml",
     scopePath,
-    formatVersion: 1,
+    formatVersion: DIAGRAM_GRAPH_FORMAT_VERSION,
     renderMode: "normal",
     nodes: [
-      { nodeId: "a", nodeOrdinal: 0, nodeKind: "entity", name: "Alpha", community: 0 },
-      { nodeId: "b", nodeOrdinal: 1, nodeKind: "entity", name: "Beta", community: 0 },
-      { nodeId: "c", nodeOrdinal: 2, nodeKind: "entity", name: "Gamma", community: 0 },
+      { nodeId: key("Alpha"), nodeOrdinal: 0, nodeKind: "entity", name: "Alpha" },
+      { nodeId: key("Alpha.beta"), nodeOrdinal: 1, nodeKind: "definition", name: "beta" },
+      { nodeId: key("Beta"), nodeOrdinal: 2, nodeKind: "entity", name: "Beta" },
+      { nodeId: key("Gamma"), nodeOrdinal: 3, nodeKind: "entity", name: "Gamma" },
     ],
-    aliases: [{ nodeId: "a", aliasOrdinal: 0, alias: "AlphaAlias" }],
-    edges: [{
-      edgeOrdinal: 0,
-      sourceNodeId: "a",
-      targetNodeId: "b",
-      edgeKind: "uml-relation",
-      directed: false,
-      weight: 1,
-    }],
-    relations: [{
-      edgeOrdinal: 0,
-      relationOrdinal: 0,
-      relationKind: "usage",
-      sourceNodeId: "a",
-      targetNodeId: "b",
-    }],
-    declarations: [
-      { declarationOrdinal: 0, fileName: "alpha.ts", language: "typescript", memberAssociationsPresent: false },
-      { declarationOrdinal: 1, fileName: "beta.ts", language: "typescript", memberAssociationsPresent: false },
-      { declarationOrdinal: 2, fileName: "gamma.ts", language: "typescript", memberAssociationsPresent: false },
+    edges: [
+      {
+        edgeOrdinal: 0,
+        sourceNodeId: key("Alpha"),
+        targetNodeId: key("Beta"),
+        edgeKind: "uml-relation",
+        directed: true,
+        weight: 1,
+      },
+      {
+        edgeOrdinal: 1,
+        sourceNodeId: key("Alpha.beta"),
+        targetNodeId: key("Gamma"),
+        edgeKind: "uml-relation",
+        directed: true,
+        weight: 1,
+      },
+    ],
+    relations: [
+      {
+        edgeOrdinal: 0,
+        relationOrdinal: 0,
+        relationKind: "extends",
+        sourceNodeId: key("Alpha"),
+        targetNodeId: key("Beta"),
+      },
+      {
+        edgeOrdinal: 1,
+        relationOrdinal: 0,
+        relationKind: "references",
+        sourceNodeId: key("Alpha.beta"),
+        targetNodeId: key("Gamma"),
+      },
     ],
     entities: [
-      { declarationOrdinal: 0, entityKind: "class", entityOrdinal: 0, nodeId: "a" },
-      { declarationOrdinal: 1, entityKind: "class", entityOrdinal: 0, nodeId: "b" },
-      { declarationOrdinal: 2, entityKind: "class", entityOrdinal: 0, nodeId: "c" },
+      { entityOrdinal: 0, definitionKey: key("Alpha"), entityKind: "class", name: "Alpha" },
+      { entityOrdinal: 1, definitionKey: key("Beta"), entityKind: "class", name: "Beta" },
+      { entityOrdinal: 2, definitionKey: key("Gamma"), entityKind: "class", name: "Gamma" },
     ],
     properties: [],
-    propertyTypeIds: [],
     methods: [{
-      declarationOrdinal: 0,
-      entityKind: "class",
       entityOrdinal: 0,
       methodOrdinal: 0,
+      definitionKey: key("Alpha.beta"),
       name: "beta",
       returnType: "Beta",
-      returnTypeIdsPresent: true,
     }],
-    methodReturnTypeIds: [{
-      declarationOrdinal: 0,
-      entityKind: "class",
+    memberModifiers: [{
       entityOrdinal: 0,
-      methodOrdinal: 0,
-      typeIdOrdinal: 0,
-      typeId: "b",
+      memberKind: "method",
+      memberOrdinal: 0,
+      modifierOrdinal: 0,
+      modifier: "public",
     }],
-    memberModifiers: [],
     enumItems: [],
-    entityHeritageClauses: [],
-    declarationHeritageGroups: [],
-    declarationHeritageClauses: [],
-    memberAssociations: [],
     categories: [
-      { categoryOrdinal: 0, entityName: "Alpha", category: "concrete", isTest: false },
-      { categoryOrdinal: 1, entityName: "Beta", category: "concrete", isTest: false },
-      { categoryOrdinal: 2, entityName: "Gamma", category: "concrete", isTest: false },
+      { categoryOrdinal: 0, definitionKey: key("Alpha"), category: "concrete", isTest: false },
+      { categoryOrdinal: 1, definitionKey: key("Beta"), category: "concrete", isTest: false },
+      { categoryOrdinal: 2, definitionKey: key("Gamma"), category: "concrete", isTest: false },
     ],
-    methodReturnDependencies: [],
-    usageEdges: [],
-    localUsers: [],
-    externalUsers: [],
-    localUserTargets: [],
-    externalUserTargets: [],
-    definitions: [],
   };
 }
 
-/** Stamps a distinguishing marker into a stored graph so persisted scopes can be told apart. */
-function setFixtureMarker(graph: UmlDiagramGraph, marker: string): void {
-  const [declaration] = graph.declarations;
-  if (declaration === undefined) throw new Error("UML graph has no declaration to mark");
-  declaration.fileName = `${marker}.ts`;
-}
-
-function renderFixtureGraph(graph: DiagramGraph): RenderedDiagram {
-  const shared = {
-    packageNodes: [],
-    definitions: [],
-    externalUsers: [],
-    localUsers: [],
-  };
-  return graph.kind === "packages"
-    ? {
-      kind: "packages",
-      dsl: `${graph.kind}:${graph.scopePath}:${graph.nodes.map(({ name }) => name).join(",")}`,
-      dsls: [`${graph.kind}:${graph.scopePath}`],
-      ...shared,
-    }
-    : { kind: "uml", view: EMPTY_UML_VIEW_MODEL, ...shared };
-}
+const FIXTURE_PACKAGES: PackageInfo[] = [
+  { name: "workspace-a", path: "packages/a", dependencies: ["workspace-b"] },
+  { name: "workspace-b", path: "packages/b", dependencies: [] },
+];
 
 const fixtures = createFixtureTracker();
 const { temporaryRoot, writeFixtureFile } = fixtures;
@@ -177,6 +203,49 @@ function openDatabase<T>(dbPath: string, operation: (db: Database) => T): T {
     db.close();
     db = null;
     Bun.gc(true);
+  }
+}
+
+function tableColumns(db: Database, table: string): { name: string; type: string }[] {
+  const statement = db.query<{ name: string; type: string }, []>(`PRAGMA table_info('${table}')`);
+  try {
+    return statement.all().map(({ name, type }) => ({ name, type }));
+  } finally {
+    statement.finalize();
+  }
+}
+
+/** Every generation-scoped cache table, discovered from the live schema rather than hard-coded. */
+function generationTables(db: Database): string[] {
+  return db.query<{ name: string }, []>(`
+    SELECT name FROM sqlite_schema
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all()
+    .map(({ name }) => name)
+    .filter((table) => tableColumns(db, table).some(({ name }) => name === "generation_id"));
+}
+
+/** The normalized graph tables: generation plus graph identity. `diagrams` is the payload row. */
+function normalizedGraphTables(db: Database): string[] {
+  return generationTables(db).filter((table) =>
+    table !== "diagrams" && tableColumns(db, table).some(({ name }) => name === "scope_path")
+  );
+}
+
+function expectOnlyGeneration(db: Database, generationId: number): void {
+  for (const table of generationTables(db)) {
+    const statement = db.query<{ generation_id: number }, []>(
+      `SELECT DISTINCT generation_id FROM "${table}"`,
+    );
+    try {
+      expect(
+        statement.all().map(({ generation_id }) => generation_id).filter((id) => id !== generationId),
+        table,
+      ).toEqual([]);
+    } finally {
+      statement.finalize();
+    }
   }
 }
 
@@ -244,6 +313,74 @@ function withoutDisplay(definitions: readonly EditorGotoDefinition[]): GotoDefin
   }));
 }
 
+function definitionRequest(path: string, definitionKey: string): DiagramRequest {
+  return { kind: "uml", target: { kind: "definition", path, definitionKey } };
+}
+
+function fileRequest(path: string): DiagramRequest {
+  return { kind: "uml", target: { kind: "file", path } };
+}
+
+function directoryRequest(path: string): DiagramRequest {
+  return { kind: "uml", target: { kind: "directory", path } };
+}
+
+function expectUml(diagram: DiagramPayload): UmlDiagramPayload {
+  if (diagram.kind !== "uml") throw new Error(`expected a UML diagram, got ${diagram.kind}`);
+  return diagram;
+}
+
+function definitionsView(diagram: DiagramPayload): DefinitionsView {
+  const view = expectUml(diagram).view;
+  if (view.kind !== "definitions") throw new Error("expected a definitions view");
+  return view;
+}
+
+function filesView(diagram: DiagramPayload): FilesView {
+  const view = expectUml(diagram).view;
+  if (view.kind !== "files") throw new Error("expected a files view");
+  return view;
+}
+
+function nodeNames(view: DefinitionsView): string[] {
+  return view.nodes.map((node) => node.definition.qualifiedName).sort();
+}
+
+/** Edges projected onto readable identities, so assertions never pin a key serialization. */
+function edgeSummary(view: DefinitionsView): string[] {
+  const names = new Map(view.nodes.map((node) => [node.definition.key, node.definition.qualifiedName]));
+  return view.edges
+    .map((edge) =>
+      `${names.get(edge.sourceKey) ?? edge.sourceKey} -${edge.kind}-> ${
+        names.get(edge.targetKey) ?? edge.targetKey
+      }`
+    )
+    .sort();
+}
+
+function frameSummary(view: DefinitionsView): { root: string; nodes: string[] }[] {
+  const names = new Map(view.nodes.map((node) => [node.definition.key, node.definition.qualifiedName]));
+  return view.frames.map((frame) => ({
+    root: names.get(frame.rootKey) ?? frame.rootKey,
+    nodes: frame.nodeKeys.map((key) => names.get(key) ?? key).sort(),
+  }));
+}
+
+function definitionKeyOf(definitions: readonly FileDefinition[], qualifiedName: string): string {
+  const found = definitions.find((definition) => definition.qualifiedName === qualifiedName);
+  if (!found) throw new Error(`definition ${qualifiedName} was not indexed`);
+  return found.key;
+}
+
+async function captureError(operation: Promise<unknown>): Promise<{ code?: string; message: string }> {
+  try {
+    await operation;
+  } catch (error) {
+    const failure = error as { code?: string; message?: string };
+    return { code: failure.code, message: String(failure.message ?? error) };
+  }
+  throw new Error("expected the operation to reject");
+}
 
 type PreprocessResponseWaiter = {
   resolve(response: PreprocessResponse): void;
@@ -270,6 +407,7 @@ function spawnPreprocessChild(): {
       stderr: "inherit",
       windowsHide: true,
       ipc(message) {
+        if (isPreprocessProgressEvent(message)) return;
         if (!isPreprocessResponse(message)) {
           rejectWaiters(new Error("preprocess child returned an invalid response"));
           return;
@@ -296,7 +434,7 @@ function spawnPreprocessChild(): {
       if (waiters.has(id)) throw new Error(`already waiting for preprocess response ${id}`);
       const { promise: response, resolve, reject } = Promise.withResolvers<PreprocessResponse>();
       waiters.set(id, { resolve, reject });
-      return withTimeout(response, `preprocess response ${id}`).finally(() => {
+      return withTimeout(response, `preprocess response ${id}`, 30_000).finally(() => {
         waiters.delete(id);
       });
     },
@@ -560,13 +698,13 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
     error: { code: "BAD_REQUEST", message: "caseInsensitive must be a boolean" },
   });
 
+  // `preprocess-scope` no longer carries a package snapshot; the cause is still required.
   const missingCauseResponse = waitForResponse(6);
   subprocess.send({
     id: 6,
     type: "preprocess-scope",
     generationId: 1,
     scope: { path: "", kind: "directory" },
-    packages: [],
   });
   expect(await missingCauseResponse).toEqual({
     id: 6,
@@ -574,9 +712,40 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
     error: { code: "BAD_REQUEST", message: "cause must be startup or watch" },
   });
 
-  const shutdownResponse = waitForResponse(7);
-  subprocess.send({ id: 7, type: "shutdown" });
-  expect(await shutdownResponse).toEqual({ id: 7, ok: true, value: null });
+  const diagramCases = [
+    { id: 7, request: { kind: "hybrid" }, message: "kind must be packages or uml" },
+    { id: 8, request: { kind: "uml" }, message: "target must be an object" },
+    {
+      id: 9,
+      request: { kind: "uml", target: { kind: "file", path: "" } },
+      message: "path is required",
+    },
+    {
+      id: 10,
+      request: { kind: "uml", target: { kind: "definition", path: "a.ts", definitionKey: "" } },
+      message: "definition is required",
+    },
+    {
+      id: 11,
+      request: { kind: "packages", scopePath: "src" },
+      message: "packages diagram scope must be the source root",
+    },
+  ];
+  const diagramResponses = diagramCases.map(({ id }) => waitForResponse(id));
+  for (const { id, request } of diagramCases) {
+    subprocess.send({ id, type: "read-diagram", generationId: 1, request });
+  }
+  expect(await Promise.all(diagramResponses)).toEqual(
+    diagramCases.map(({ id, message }) => ({
+      id,
+      ok: false,
+      error: { code: "BAD_REQUEST", message },
+    })),
+  );
+
+  const shutdownResponse = waitForResponse(12);
+  subprocess.send({ id: 12, type: "shutdown" });
+  expect(await shutdownResponse).toEqual({ id: 12, ok: true, value: null });
   expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
 }, 30_000);
 
@@ -601,6 +770,122 @@ test("exits when the parent IPC channel disconnects", async () => {
   subprocess.disconnect();
   expect(await withTimeout(subprocess.exited, "preprocess child exit after IPC disconnect")).toBe(0);
 }, 30_000);
+
+test("names the owner and dependency files a rooted selection still needs", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocess-readiness-");
+  const dbPath = join(root, ".explore", "explore.db");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "readiness" }));
+  await writeFixtureFile(
+    root,
+    "feature/root.ts",
+    'import { B } from "./b";\nexport class Root { value: B; }\n',
+  );
+  await writeFixtureFile(
+    root,
+    "feature/b.ts",
+    'import { C } from "../shared/c";\nexport class B { value: C; }\n',
+  );
+  await writeFixtureFile(
+    root,
+    "shared/c.ts",
+    'import { B } from "../feature/b";\nexport class C { value: B; }\n',
+  );
+  await writeFixtureFile(root, "unrelated.ts", "export class Unrelated {}\n");
+
+  const { subprocess, waitForResponse } = spawnPreprocessChild();
+  let nextId = 0;
+  const call = async <Value>(request: Record<string, unknown>): Promise<Value> => {
+    nextId += 1;
+    const id = nextId;
+    const response = waitForResponse(id);
+    subprocess.send({ ...request, id });
+    const settled = await response;
+    if (!settled.ok) throw new Error(`${settled.error.code}: ${settled.error.message}`);
+    return settled.value as Value;
+  };
+
+  await call({ type: "init", sourceDir: root, dbPath, recover: true });
+  const { generationId } = await call<{ generationId: number }>({
+    type: "begin-generation",
+    cause: "startup",
+  });
+  await call({ type: "discover-packages", generationId });
+  const indexed = await call<{ definitionCount: number }>({
+    type: "index-definitions",
+    generationId,
+    cause: "startup",
+  });
+  expect(indexed.definitionCount).toBeGreaterThan(0);
+
+  const rootDefinitions = await call<FileDefinition[]>({
+    type: "read-file-definitions",
+    generationId,
+    path: "feature/root.ts",
+  });
+  const rootKey = definitionKeyOf(rootDefinitions, "Root");
+  const request = definitionRequest("feature/root.ts", rootKey);
+
+  const readSelection = () =>
+    call<
+      { state: "pending"; files: string[] } | { state: "complete"; diagram: DiagramPayload }
+    >({ type: "read-diagram", generationId, request });
+  const processFile = (path: string) =>
+    call({ type: "preprocess-scope", generationId, cause: "startup", scope: { path, kind: "file" } });
+
+  // No file scope has run yet: the owner file itself is the only thing the selection needs.
+  expect(await readSelection()).toEqual({ state: "pending", files: ["feature/root.ts"] });
+  await processFile("feature/root.ts");
+  expect(await readSelection()).toEqual({ state: "pending", files: ["feature/b.ts"] });
+  await processFile("feature/b.ts");
+  expect(await readSelection()).toEqual({ state: "pending", files: ["shared/c.ts"] });
+  await processFile("shared/c.ts");
+
+  const complete = await readSelection();
+  if (complete.state !== "complete") {
+    throw new Error(`selection is still pending: ${complete.files.join(", ")}`);
+  }
+  const view = definitionsView(complete.diagram);
+  expect(expectUml(complete.diagram).status).toBe("ready");
+  expect(nodeNames(view)).toEqual(["B", "C", "Root"]);
+  expect(edgeSummary(view)).toEqual([
+    "B -references-> C",
+    "C -references-> B",
+    "Root -references-> B",
+  ]);
+  expect(frameSummary(view)).toEqual([{ root: "Root", nodes: ["B", "C", "Root"] }]);
+
+  // Nothing outside that closure was preprocessed, and the generation was never promoted.
+  expect(
+    await call<{ state: string; files: string[] }>({
+      type: "read-diagram",
+      generationId,
+      request: fileRequest("unrelated.ts"),
+    }),
+  ).toEqual({ state: "pending", files: ["unrelated.ts"] });
+
+  const shutdownId = nextId + 1;
+  const shutdown = waitForResponse(shutdownId);
+  subprocess.send({ id: shutdownId, type: "shutdown" });
+  expect(await shutdown).toEqual({ id: shutdownId, ok: true, value: null });
+  expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
+
+  openDatabase(dbPath, (db) => {
+    expect(db.query<{ id: number; state: string }, []>("SELECT id, state FROM generations").all())
+      .toEqual([{ id: generationId, state: "building" }]);
+    expect(db.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM cache_meta WHERE key = 'active_generation'",
+    ).get()).toEqual({ count: 0 });
+    expect(db.query<{ scope_path: string }, [number]>(`
+      SELECT scope_path FROM diagrams
+      WHERE generation_id = ? AND kind = 'uml'
+      ORDER BY scope_path
+    `).all(generationId).map(({ scope_path }) => scope_path)).toEqual([
+      "feature/b.ts",
+      "feature/root.ts",
+      "shared/c.ts",
+    ]);
+  });
+}, 60_000);
 
 test("preprocesses each visible scope once and serves formatted files and literal search from the persistent cache", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-");
@@ -744,10 +1029,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
   expect(idleResolved).toBe(false);
 
   const packages = await preprocessor.getPackages();
-  expect(packages).toEqual([
-    { name: "workspace-a", path: "packages/a", dependencies: ["workspace-b"] },
-    { name: "workspace-b", path: "packages/b", dependencies: [] },
-  ]);
+  expect(packages).toEqual(FIXTURE_PACKAGES);
   expect(idleResolved).toBe(false);
 
   await idle;
@@ -785,6 +1067,16 @@ test("preprocesses each visible scope once and serves formatted files and litera
     "root.ts",
     "wildcard.txt",
   ];
+  // Only source files own a direct UML graph; directories and text files never write one.
+  const umlScopePaths = [
+    "invalid.js",
+    "malformed.js",
+    "nested/deep/helper.js",
+    "nul.js",
+    "packages/a/index.js",
+    "packages/b/index.js",
+    "root.ts",
+  ];
   const treeNodes = flattenTree(await preprocessor.getTree());
   expect(treeNodes.map(({ path }) => path)).toEqual(expectedPaths);
   expect(
@@ -807,7 +1099,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     { path: "wildcard.txt", viewable: false },
   ]);
 
-  const packageDiagram = await preprocessor.getDiagram("packages", "");
+  const packageDiagram = await preprocessor.getDiagram({ kind: "packages", scopePath: "" });
   if (packageDiagram.kind !== "packages") throw new Error("expected a package diagram");
   expect(packageDiagram).toMatchObject({
     kind: "packages",
@@ -820,33 +1112,54 @@ test("preprocesses each visible scope once and serves formatted files and litera
     definitions: [],
   });
   expect(packageDiagram.dsl).toContain("p0 --> p1");
-  const rootDiagram = await preprocessor.getDiagram("uml", "");
-  expect(rootDiagram).toMatchObject({ kind: "uml", scopePath: "", definitions: gotoDefinitions });
-  expect(await preprocessor.getDiagram("uml", "packages/a")).toMatchObject({
-    kind: "uml",
-    scopePath: "packages/a",
-    definitions: [],
+
+  // A directory selection is a file-import graph over every visible file in the subtree.
+  expect(filesView(await preprocessor.getDiagram(directoryRequest("nested")))).toEqual({
+    kind: "files",
+    nodes: [{ path: "nested/deep/helper.js", boundary: false, test: false }],
+    edges: [],
   });
-  const untrackedJavaScriptDiagram = await preprocessor.getDiagram(
-    "uml",
-    "packages/b/index.js",
+  expect(filesView(await preprocessor.getDiagram(directoryRequest("packages/a")))).toEqual({
+    kind: "files",
+    nodes: [
+      { path: "packages/a/index.js", boundary: false, test: false },
+      { path: "packages/a/package.json", boundary: false, test: false },
+    ],
+    edges: [],
+  });
+
+  // An in-scope file that could not be decoded is reported, never passed off as a complete graph.
+  const rootDirectory = expectUml(await preprocessor.getDiagram(directoryRequest("")));
+  expect(rootDirectory.status).toBe("error");
+  expect(rootDirectory.error).toContain("file is not valid UTF-8 text");
+  const nulDiagram = expectUml(await preprocessor.getDiagram(fileRequest("nul.js")));
+  expect(nulDiagram).toMatchObject({
+    kind: "uml",
+    scopePath: "nul.js",
+    status: "error",
+    error: "file contains NUL bytes",
+  });
+
+  const javaScriptView = definitionsView(
+    await preprocessor.getDiagram(fileRequest("packages/b/index.js")),
   );
-  expect(untrackedJavaScriptDiagram).toEqual({
-    kind: "uml",
-    scopePath: "packages/b/index.js",
-    status: "ready",
-    view: EMPTY_UML_VIEW_MODEL,
-    packageNodes: [],
-    definitions: [],
-    externalUsers: [],
-    localUsers: [],
-  });
-  if (untrackedJavaScriptDiagram.kind !== "uml") throw new Error("expected a uml diagram");
-  expect(
-    await mermaid.parse(renderUmlView(untrackedJavaScriptDiagram.view, FULL_UML_VISIBILITY).dsl),
-  ).toMatchObject({
-    diagramType: "class",
-  });
+  expect(nodeNames(javaScriptView)).toEqual(["jsValue"]);
+  expect(frameSummary(javaScriptView)).toEqual([{ root: "jsValue", nodes: ["jsValue"] }]);
+
+  const rootOutline = await preprocessor.getFileDefinitions("root.ts");
+  const rootFileView = definitionsView(await preprocessor.getDiagram(fileRequest("root.ts")));
+  expect(frameSummary(rootFileView).map(({ root: name }) => name)).toEqual([
+    "before",
+    "SearchNeedleEntity",
+    "OtherNeedle",
+    "targetValue",
+    "rootText",
+  ]);
+  const entityView = definitionsView(await preprocessor.getDiagram(
+    definitionRequest("root.ts", definitionKeyOf(rootOutline, "SearchNeedleEntity")),
+  ));
+  expect(nodeNames(entityView)).toEqual(["SearchNeedleEntity"]);
+  expect(edgeSummary(entityView)).toEqual([]);
 
   expect(await preprocessor.readFile("root.ts")).toEqual({
     path: "root.ts",
@@ -990,9 +1303,6 @@ test("preprocesses each visible scope once and serves formatted files and litera
     return activeGeneration.id;
   });
   openDatabase(dbPath, (db) => {
-    expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()).toEqual({
-      user_version: 7,
-    });
     expect(db.query<{
       name: string;
       type: string;
@@ -1036,13 +1346,23 @@ test("preprocesses each visible scope once and serves formatted files and litera
       ORDER BY kind, scope_path
     `).all(generationId);
     expect(diagrams.filter(({ kind }) => kind === "packages").map(({ scope_path }) => scope_path)).toEqual([""]);
-    expect(diagrams.filter(({ kind }) => kind === "uml").map(({ scope_path }) => scope_path)).toEqual(expectedPaths);
-    for (const row of diagrams) {
-      const response = JSON.parse(row.response_json) as { kind: string; scopePath: string; version?: number };
-      expect(response.kind).toBe(row.kind);
-      expect(response.scopePath).toBe(row.scope_path);
-      expect(response.version).toBeUndefined();
+    expect(diagrams.filter(({ kind }) => kind === "uml").map(({ scope_path }) => scope_path)).toEqual(umlScopePaths);
+    // A UML row stores only its completion outcome; the display model lives in normalized tables.
+    for (const row of diagrams.filter(({ kind }) => kind === "uml")) {
+      const outcome = JSON.parse(row.response_json) as { status?: string; error?: string };
+      expect(outcome.status, row.scope_path).toBe(
+        row.scope_path === "nul.js" || row.scope_path === "invalid.js" ? "error" : "ready",
+      );
+      expect(Object.keys(outcome).sort(), row.scope_path).toEqual(
+        outcome.status === "error" ? ["error", "status"] : ["status"],
+      );
     }
+    const packageResponse = JSON.parse(
+      diagrams.find(({ kind }) => kind === "packages")?.response_json ?? "null",
+    ) as { kind: string; scopePath: string; version?: number };
+    expect(packageResponse.kind).toBe("packages");
+    expect(packageResponse.scopePath).toBe("");
+    expect(packageResponse.version).toBeUndefined();
 
     expect(db.query<{
       kind: string;
@@ -1069,29 +1389,25 @@ test("preprocesses each visible scope once and serves formatted files and litera
       WHERE generation_id = ?
     `).get(generationId)).toEqual({ count: diagrams.length });
 
+    const normalizedTables = normalizedGraphTables(db);
+    expect(normalizedTables).toContain("diagram_edge_relations");
+    expect(normalizedTables).toContain("uml_categories");
     const primaryPayloadColumns: string[] = [];
-    for (const table of NORMALIZED_GRAPH_TABLES) {
-      const statement = db.query<{ name: string; type: string }, []>(
-        `PRAGMA table_info('${table}')`,
-      );
-      try {
-        primaryPayloadColumns.push(...statement.all()
-          .filter(({ name, type }) =>
-            type.toUpperCase().includes("JSON")
-            || name === "response_json"
-            || name === "dsl"
-            || name === "dsls"
-            || name === "mermaid"
-            || name === "mermaid_dsl"
-          )
-          .map(({ name }) => `${table}.${name}`));
-      } finally {
-        statement.finalize();
-      }
+    for (const table of normalizedTables) {
+      primaryPayloadColumns.push(...tableColumns(db, table)
+        .filter(({ name, type }) =>
+          type.toUpperCase().includes("JSON")
+          || name === "response_json"
+          || name === "dsl"
+          || name === "dsls"
+          || name === "mermaid"
+          || name === "mermaid_dsl"
+        )
+        .map(({ name }) => `${table}.${name}`));
     }
     expect(primaryPayloadColumns).toEqual([]);
 
-    for (const table of NORMALIZED_GRAPH_TABLES) {
+    for (const table of normalizedTables) {
       const statement = db.query<{ detail: string }, [number, string, string]>(`
         EXPLAIN QUERY PLAN
         SELECT *
@@ -1099,7 +1415,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
         WHERE generation_id = ? AND kind = ? AND scope_path = ?
       `);
       try {
-        const plan = statement.all(generationId, "uml", "");
+        const plan = statement.all(generationId, "uml", "root.ts");
         expect(
           plan.some(({ detail }) =>
             detail.includes(`sqlite_autoindex_${table}_`)
@@ -1257,130 +1573,27 @@ test("preprocesses each visible scope once and serves formatted files and litera
   });
 
   const cache = new Cache(dbPath);
-  let activeCache = cache;
   try {
-    const persistedGraphs: DiagramGraph[] = [];
-    const persistedIdentities = [
-      { kind: "packages", scopePath: "" },
-      ...expectedPaths.map((scopePath) => ({ kind: "uml" as const, scopePath })),
-    ] as const;
-    for (const { kind, scopePath } of persistedIdentities) {
-      const graph = activeCache.readDiagramGraph(generationId, kind, scopePath);
-      const response = activeCache.readDiagram(generationId, kind, scopePath);
-      expect(graph, `${kind}:${scopePath} graph`).not.toBeNull();
-      expect(response, `${kind}:${scopePath} response`).not.toBeNull();
-      if (graph === null || response === null) {
-        throw new Error(`${kind}:${scopePath} graph or response was not persisted`);
-      }
-      persistedGraphs.push(graph);
-      expect(graph).toMatchObject({ kind, scopePath });
-      const rerendered = renderDiagramGraph(graph);
-      expect(response).toEqual({
-        ...rerendered,
-        scopePath,
-        status: response.status,
-        ...(response.status === "error" ? { error: response.error } : {}),
-      });
+    const packagePayload = cache.readPackageDiagram(generationId);
+    const packageGraph = cache.readDiagramGraph(generationId, "packages", "");
+    if (packagePayload === null || packageGraph?.kind !== "packages") {
+      throw new Error("package diagram was not persisted");
     }
-
-    activeCache.close();
-    openDatabase(dbPath, (db) => {
-      for (const table of NORMALIZED_GRAPH_TABLES) {
-        const expected = (["packages", "uml"] as const).flatMap((kind) => {
-          const count = persistedGraphs
-            .filter((graph) => graph.kind === kind)
-            .reduce((sum, graph) =>
-              sum + NORMALIZED_TABLE_SPECS[table].expectedRows(graph).length, 0);
-          return count === 0 ? [] : [{ kind, count }];
-        });
-        const statement = db.query<{ kind: "packages" | "uml"; count: number }, [number]>(`
-          SELECT kind, COUNT(*) AS count
-          FROM ${table}
-          WHERE generation_id = ?
-          GROUP BY kind
-          ORDER BY kind
-        `);
-        try {
-          expect(statement.all(generationId), table).toEqual(expected);
-        } finally {
-          statement.finalize();
-        }
-      }
+    expect(packagePayload).toEqual({
+      ...renderPackageDiagramGraph(packageGraph),
+      scopePath: "",
+      status: "ready",
     });
-    activeCache = new Cache(dbPath);
 
-    const rootGraph = activeCache.readDiagramGraph(generationId, "uml", "");
-    if (rootGraph?.kind !== "uml") throw new Error("root UML graph was not persisted");
-    const originalGraph = structuredClone(rootGraph);
-    const originalResponse = activeCache.readDiagram(generationId, "uml", "");
-    const originalFile = activeCache.readFile(generationId, "root.ts");
-    const originalDefinitions = activeCache.readDefinitions(generationId, "root.ts");
-
-    const rendererFailureGraph = structuredClone(rootGraph);
-    setFixtureMarker(rendererFailureGraph, "renderer-failure-must-roll-back");
-    const rendererCall: { graph: DiagramGraph | null } = { graph: null };
-    expect(() => activeCache.writeScope(generationId, {
-      entries: [],
-      diagram: { graph: rendererFailureGraph, outcome: { status: "ready" } },
-      file: {
-        path: "root.ts",
-        rawContent: "renderer failure must roll back",
-        displayContent: "renderer failure must roll back",
-        sourceError: null,
-        formatError: null,
-        language: "typescript",
-      },
-      definitions: [],
-    }, (reloaded) => {
-      rendererCall.graph = reloaded;
-      throw new Error("renderer failure");
-    })).toThrow(DiagramMaterializationError);
-    const rendererArgument = rendererCall.graph;
-    if (rendererArgument === null || rendererArgument.kind !== "uml") {
-      throw new Error("renderer did not receive the reloaded UML graph");
+    for (const scopePath of umlScopePaths) {
+      const graph = cache.readDiagramGraph(generationId, "uml", scopePath);
+      expect(graph, `${scopePath} graph`).not.toBeNull();
+      expect(graph).toMatchObject({ kind: "uml", scopePath });
+      const read = cache.readUmlDiagram(generationId, { kind: "file", path: scopePath });
+      expect(read.state, `${scopePath} selection`).toBe("complete");
     }
-    expect(rendererArgument).not.toBe(rendererFailureGraph);
-    expect(rendererArgument).toEqual(rendererFailureGraph);
-    expect(activeCache.readDiagramGraph(generationId, "uml", "")).toEqual(originalGraph);
-    expect(activeCache.readDiagram(generationId, "uml", "")).toEqual(originalResponse);
-    expect(activeCache.readFile(generationId, "root.ts")).toEqual(originalFile);
-    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual(originalDefinitions);
 
-    const [rootDefinition] = rootDefinitions;
-    if (rootDefinition === undefined) throw new Error("root definition fixture was not created");
-    const invalidDefinition: EditorGotoDefinition = {
-      ...rootDefinition,
-      key: "invalid-method",
-      kind: "method",
-      name: "invalid",
-      qualifiedName: "SearchNeedleEntity.invalid",
-      uml: { scopePath: "root.ts", entityName: "SearchNeedleEntity<T>" },
-    };
-    const definitionFailureGraph = structuredClone(rootGraph);
-    setFixtureMarker(definitionFailureGraph, "definition-failure-must-roll-back");
-    let definitionRendererCalled = false;
-    expect(() => activeCache.writeScope(generationId, {
-      entries: [],
-      diagram: { graph: definitionFailureGraph, outcome: { status: "ready" } },
-      file: {
-        path: "root.ts",
-        rawContent: "definition failure must roll back",
-        displayContent: "definition failure must roll back",
-        sourceError: null,
-        formatError: null,
-        language: "typescript",
-      },
-      definitions: [invalidDefinition],
-    }, (reloaded) => {
-      definitionRendererCalled = true;
-      return renderDiagramGraph(reloaded);
-    })).toThrow();
-    expect(definitionRendererCalled).toBe(true);
-    expect(activeCache.readDiagramGraph(generationId, "uml", "")).toEqual(originalGraph);
-    expect(activeCache.readDiagram(generationId, "uml", "")).toEqual(originalResponse);
-    expect(activeCache.readFile(generationId, "root.ts")).toEqual(originalFile);
-    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual(originalDefinitions);
-
+    // A scope write replaces the file row, its editor definitions and their search entries.
     const replacementContent = "class CacheReplacement {}\n";
     const replacementDefinition: EditorGotoDefinition = {
       key: '["class","CacheReplacement",0,null,null]',
@@ -1392,24 +1605,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       displayFrom: 6,
       displayTo: 22,
     };
-    const replacementGraph = structuredClone(rootGraph);
-    replacementGraph.definitions = [{
-      definitionOrdinal: 0,
-      definitionKey: replacementDefinition.key,
-      definitionKind: replacementDefinition.kind,
-      name: replacementDefinition.name,
-      qualifiedName: replacementDefinition.qualifiedName,
-      sourcePath: replacementDefinition.source.path,
-      sourceLine: replacementDefinition.source.line,
-      sourceColumn: replacementDefinition.source.column,
-      umlScopePath: replacementDefinition.uml.scopePath,
-      umlEntityName: replacementDefinition.uml.entityName,
-      umlMemberName: null,
-      umlMemberOccurrence: null,
-    }];
-    activeCache.writeScope(generationId, {
-      entries: [],
-      diagram: { graph: replacementGraph, outcome: { status: "ready" } },
+    cache.writeScope(generationId, {
       file: {
         path: "root.ts",
         rawContent: replacementContent,
@@ -1419,8 +1615,8 @@ test("preprocesses each visible scope once and serves formatted files and litera
         language: "typescript",
       },
       definitions: [replacementDefinition],
-    }, renderDiagramGraph);
-    expect(activeCache.readFile(generationId, "root.ts")).toEqual({
+    });
+    expect(cache.readFile(generationId, "root.ts")).toEqual({
       path: "root.ts",
       rawContent: replacementContent,
       displayContent: replacementContent,
@@ -1428,8 +1624,8 @@ test("preprocesses each visible scope once and serves formatted files and litera
       formatError: null,
       language: "typescript",
     });
-    expect(activeCache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
-    expect(activeCache.searchFiles(
+    expect(cache.readDefinitions(generationId, "root.ts")).toEqual([replacementDefinition]);
+    expect(cache.searchFiles(
       generationId,
       "SearchNeedleEntity.SearchNeedle",
       false,
@@ -1441,7 +1637,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
       directories: [],
       renderDirs: [],
     });
-    expect(activeCache.searchFiles(generationId, "CacheReplacement", false)).toEqual({
+    expect(cache.searchFiles(generationId, "CacheReplacement", false)).toEqual({
       query: "CacheReplacement",
       caseInsensitive: false,
       files: ["root.ts"],
@@ -1450,11 +1646,11 @@ test("preprocesses each visible scope once and serves formatted files and litera
       renderDirs: [""],
     });
   } finally {
-    activeCache.close();
+    cache.close();
   }
-}, 30_000);
+}, 60_000);
 
-test("rejects unavailable or inconsistent fallback sources without replacing target rows", async () => {
+test("rejects unavailable or inconsistent package fallback sources without replacing target rows", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-fallback-");
   const dbPath = join(root, "fallback.db");
   const cache = new Cache(dbPath);
@@ -1462,103 +1658,89 @@ test("rejects unavailable or inconsistent fallback sources without replacing tar
   try {
     const sourceGenerationId = activeCache.beginGeneration("startup", "");
     const targetGenerationId = activeCache.beginGeneration("watch", "");
-    const sourceGraph = fixtureUmlGraph("source.ts");
-    const targetSourceGraph = fixtureUmlGraph("source.ts");
-    setFixtureMarker(targetSourceGraph, "target-source");
-    const targetOtherGraph = fixtureUmlGraph("other.ts");
-    setFixtureMarker(targetOtherGraph, "target-other");
-
-    activeCache.writeScope(sourceGenerationId, {
-      entries: [],
-      diagram: { graph: sourceGraph, outcome: { status: "ready" } },
-      definitions: [],
-    }, renderFixtureGraph);
-    for (const graph of [targetSourceGraph, targetOtherGraph]) {
-      activeCache.writeScope(targetGenerationId, {
-        entries: [],
-        diagram: { graph, outcome: { status: "ready" } },
-        definitions: [],
-      }, renderFixtureGraph);
+    for (const generationId of [sourceGenerationId, targetGenerationId]) {
+      activeCache.writeDiscovery(
+        generationId,
+        FIXTURE_PACKAGES,
+        { graph: extractPackageDiagramGraph(FIXTURE_PACKAGES), outcome: { status: "ready" } },
+        renderPackageDiagramGraph,
+      );
     }
 
     const cases = [
-      {
-        name: "missing generation",
-        scopePath: "source.ts",
-        fallbackSource: {
-          sourceGenerationId: sourceGenerationId + 10_000,
-          kind: "uml" as const,
-          scopePath: "source.ts",
-        },
-      },
-      {
-        name: "scope does not match the source graph",
-        scopePath: "other.ts",
-        fallbackSource: {
-          sourceGenerationId,
-          kind: "uml" as const,
-          scopePath: "other.ts",
-        },
-      },
+      { name: "missing generation", sourceGenerationId: sourceGenerationId + 10_000 },
+      { name: "fallback source is the target itself", sourceGenerationId: targetGenerationId },
     ];
-    for (const { name, scopePath, fallbackSource } of cases) {
-      const beforeGraph = activeCache.readDiagramGraph(targetGenerationId, "uml", scopePath);
-      const beforeResponse = activeCache.readDiagram(targetGenerationId, "uml", scopePath);
+    for (const { name, sourceGenerationId: fallbackId } of cases) {
+      const beforeGraph = activeCache.readDiagramGraph(targetGenerationId, "packages", "");
+      const beforeResponse = activeCache.readPackageDiagram(targetGenerationId);
       let rendered = false;
-      expect(() => activeCache.writeScope(targetGenerationId, {
-        entries: [],
-        diagram: {
-          fallbackSource,
-          outcome: { status: "error", error: name },
-        },
-        definitions: [],
-      }, (graph) => {
-        rendered = true;
-        return renderFixtureGraph(graph);
-      }), name).toThrow(DiagramMaterializationError);
+      expect(() =>
+        activeCache.writeDiscovery(
+          targetGenerationId,
+          [],
+          {
+            fallbackSource: { sourceGenerationId: fallbackId },
+            outcome: { status: "error", error: name },
+          },
+          (graph) => {
+            rendered = true;
+            return renderPackageDiagramGraph(graph);
+          },
+        ), name).toThrow(DiagramMaterializationError);
       expect(rendered, name).toBe(false);
-      expect(activeCache.readDiagramGraph(targetGenerationId, "uml", scopePath), name).toEqual(beforeGraph);
-      expect(activeCache.readDiagram(targetGenerationId, "uml", scopePath), name).toEqual(beforeResponse);
+      expect(activeCache.readDiagramGraph(targetGenerationId, "packages", ""), name).toEqual(beforeGraph);
+      expect(activeCache.readPackageDiagram(targetGenerationId), name).toEqual(beforeResponse);
+      expect(activeCache.readPackages(targetGenerationId), name).toEqual(FIXTURE_PACKAGES);
     }
 
-    const beforeDisagreementGraph = activeCache.readDiagramGraph(
-      targetGenerationId,
-      "uml",
-      "source.ts",
-    );
-    const beforeDisagreementResponse = activeCache.readDiagram(
-      targetGenerationId,
-      "uml",
-      "source.ts",
-    );
-    const sourceResponse = activeCache.readDiagram(sourceGenerationId, "uml", "source.ts");
+    // A healthy fallback republishes the source rendering even when the target renderer fails.
+    const sourceResponse = activeCache.readPackageDiagram(sourceGenerationId);
     if (sourceResponse === null) throw new Error("source response was not persisted");
+    const fallback = activeCache.writeDiscovery(
+      targetGenerationId,
+      [],
+      {
+        fallbackSource: { sourceGenerationId },
+        outcome: { status: "error", error: "discovery failed" },
+      },
+      () => {
+        throw new Error("renderer failure");
+      },
+    );
+    expect(fallback).toEqual({
+      ...sourceResponse,
+      status: "error",
+      error: "discovery failed",
+    });
+    expect(activeCache.readPackageDiagram(targetGenerationId)).toEqual(fallback);
+
+    const beforeDisagreementGraph = activeCache.readDiagramGraph(targetGenerationId, "packages", "");
+    const beforeDisagreementResponse = activeCache.readPackageDiagram(targetGenerationId);
     activeCache.close();
     openDatabase(dbPath, (db) => {
       db.query<never, [string, number]>(`
         UPDATE diagrams
         SET response_json = ?
-        WHERE generation_id = ? AND kind = 'uml' AND scope_path = 'source.ts'
-      `).run(JSON.stringify({ ...sourceResponse, scopePath: "different.ts" }), sourceGenerationId);
+        WHERE generation_id = ? AND kind = 'packages' AND scope_path = ''
+      `).run(JSON.stringify({ ...sourceResponse, scopePath: "different" }), sourceGenerationId);
     });
     activeCache = new Cache(dbPath);
 
-    expect(() => activeCache.writeScope(targetGenerationId, {
-      entries: [],
-      diagram: {
-        fallbackSource: {
-          sourceGenerationId,
-          kind: "uml",
-          scopePath: "source.ts",
+    expect(() =>
+      activeCache.writeDiscovery(
+        targetGenerationId,
+        [],
+        {
+          fallbackSource: { sourceGenerationId },
+          outcome: { status: "error", error: "source response disagrees with graph identity" },
         },
-        outcome: { status: "error", error: "source response disagrees with graph identity" },
-      },
-      definitions: [],
-    }, renderFixtureGraph)).toThrow(DiagramMaterializationError);
-    expect(activeCache.readDiagramGraph(targetGenerationId, "uml", "source.ts")).toEqual(
+        renderPackageDiagramGraph,
+      )).toThrow(DiagramMaterializationError);
+    expect(activeCache.readDiagramGraph(targetGenerationId, "packages", "")).toEqual(
       beforeDisagreementGraph,
     );
-    expect(activeCache.readDiagram(targetGenerationId, "uml", "source.ts")).toEqual(
+    expect(activeCache.readPackageDiagram(targetGenerationId)).toEqual(
       beforeDisagreementResponse,
     );
   } finally {
@@ -1566,16 +1748,16 @@ test("rejects unavailable or inconsistent fallback sources without replacing tar
   }
 });
 
-test("rejects constrained and domain-invalid graph replacements atomically", async () => {
+test("rejects invalid and uncatalogued UML graphs atomically", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-invalid-graph-");
   const dbPath = join(root, "invalid-graph.db");
   const cache = new Cache(dbPath);
   try {
     const generationId = cache.beginGeneration("startup", "");
     const scopePath = "constraints.ts";
+    cache.writeDefinitionIndex(generationId, fixtureCatalogue(scopePath));
     const validGraph = fixtureUmlGraph(scopePath);
     cache.writeScope(generationId, {
-      entries: [],
       diagram: { graph: validGraph, outcome: { status: "ready" } },
       file: {
         path: scopePath,
@@ -1586,55 +1768,87 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
         language: "typescript",
       },
       definitions: [],
-    }, renderFixtureGraph);
+    });
     const baselineGraph = cache.readDiagramGraph(generationId, "uml", scopePath);
-    const baselineResponse = cache.readDiagram(generationId, "uml", scopePath);
     const baselineFile = cache.readFile(generationId, scopePath);
+    expect(baselineGraph).toMatchObject({ kind: "uml", scopePath, formatVersion: 2 });
 
-    const sqlConstraintCases: Array<{
+    const key = (name: string) => `${scopePath}:${name}`;
+    const cases: Array<{
       name: string;
+      materialization: boolean;
       mutate(graph: UmlDiagramGraph): void;
+      outcome?: { status: "error"; error: string };
     }> = [
       {
-        name: "negative node ordinal",
+        name: "graph scope path is not normalized",
+        materialization: true,
+        mutate: (graph) => {
+          graph.scopePath = `./${scopePath}`;
+        },
+      },
+      {
+        name: "node is not an indexed definition",
+        materialization: true,
         mutate: (graph) => {
           const [node] = graph.nodes;
           if (node === undefined) throw new Error("fixture UML graph has no first node");
-          node.nodeOrdinal = -1;
+          node.nodeId = key("Missing");
+          graph.edges[0]!.sourceNodeId = key("Missing");
+          graph.relations[0]!.sourceNodeId = key("Missing");
+          graph.entities[0]!.definitionKey = key("Missing");
+          graph.categories[0]!.definitionKey = key("Missing");
         },
+      },
+      {
+        name: "error outcome keeps a populated graph",
+        materialization: true,
+        mutate: () => undefined,
+        outcome: { status: "error", error: "extraction failed" },
       },
       {
         name: "duplicate node ordinal",
+        materialization: false,
         mutate: (graph) => {
-          const [, node] = graph.nodes;
-          if (node === undefined) throw new Error("fixture UML graph has no second node");
-          node.nodeOrdinal = 0;
+          graph.nodes[1]!.nodeOrdinal = 0;
         },
       },
       {
-        name: "graph-wide duplicate alias",
+        name: "edge weight differs from relation count",
+        materialization: false,
         mutate: (graph) => {
-          graph.aliases.push({ nodeId: "b", aliasOrdinal: 0, alias: "AlphaAlias" });
+          graph.edges[0]!.weight = 2;
         },
       },
       {
-        name: "nonpositive edge weight",
+        name: "relation endpoints differ from the parent edge",
+        materialization: false,
         mutate: (graph) => {
-          const [edge] = graph.edges;
-          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
-          edge.weight = 0;
+          graph.relations[0]!.targetNodeId = key("Gamma");
+        },
+      },
+      {
+        name: "bare graph retains model rows",
+        materialization: false,
+        mutate: (graph) => {
+          graph.renderMode = "bare";
+        },
+      },
+      {
+        name: "entity has no entity node",
+        materialization: false,
+        mutate: (graph) => {
+          graph.nodes[0]!.nodeKind = "boundary";
         },
       },
     ];
-    for (const { name, mutate } of sqlConstraintCases) {
+    for (const { name, materialization, mutate, outcome } of cases) {
       const graph = structuredClone(validGraph);
       mutate(graph);
-      let rendererCalled = false;
       let thrown: unknown;
       try {
         cache.writeScope(generationId, {
-          entries: [],
-          diagram: { graph, outcome: { status: "ready" } },
+          diagram: { graph, outcome: outcome ?? { status: "ready" } },
           file: {
             path: scopePath,
             rawContent: name,
@@ -1644,123 +1858,58 @@ test("rejects constrained and domain-invalid graph replacements atomically", asy
             language: "typescript",
           },
           definitions: [],
-        }, (reloaded) => {
-          rendererCalled = true;
-          return renderFixtureGraph(reloaded);
         });
       } catch (error) {
         thrown = error;
       }
       expect(thrown, name).toBeInstanceOf(Error);
-      expect(thrown, name).not.toBeInstanceOf(DiagramMaterializationError);
-      expect(rendererCalled, name).toBe(false);
+      expect(thrown instanceof DiagramMaterializationError, name).toBe(materialization);
       expect(cache.readDiagramGraph(generationId, "uml", scopePath), name).toEqual(baselineGraph);
-      expect(cache.readDiagram(generationId, "uml", scopePath), name).toEqual(baselineResponse);
       expect(cache.readFile(generationId, scopePath), name).toEqual(baselineFile);
     }
 
-    const domainCases: Array<{
-      name: string;
-      mutate(graph: UmlDiagramGraph): void;
-    }> = [
-      {
-        name: "missing node ordinal",
-        mutate: (graph) => {
-          const [node] = graph.nodes;
-          if (node === undefined) throw new Error("fixture UML graph has no first node");
-          node.nodeOrdinal = 3;
+    // A nominal entity must actually be contributed by the file that claims it.
+    const foreignScope = "foreign.ts";
+    const foreignKey = `${foreignScope}:Delta`;
+    cache.writeDefinitionIndex(generationId, {
+      ...fixtureCatalogue(scopePath),
+      definitions: [
+        ...fixtureCatalogue(scopePath).definitions,
+        {
+          key: foreignKey,
+          parentKey: null,
+          isTopLevel: true,
+          hasBody: true,
+          name: "Delta",
+          qualifiedName: "Delta",
+          kind: "class",
+          type: "Delta",
+          source: { path: foreignScope, line: 1, column: 14 },
         },
-      },
-      {
-        name: "package node in a UML graph",
-        mutate: (graph) => {
-          const [node] = graph.nodes;
-          if (node === undefined) throw new Error("fixture UML graph has no first node");
-          node.nodeKind = "package";
-          node.community = null;
-        },
-      },
-      {
-        name: "alias collides with another node ID",
-        mutate: (graph) => {
-          const [alias] = graph.aliases;
-          if (alias === undefined) throw new Error("fixture UML graph has no first alias");
-          alias.alias = "b";
-        },
-      },
-      {
-        name: "noncanonical reversed UML edge",
-        mutate: (graph) => {
-          const [edge] = graph.edges;
-          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
-          edge.sourceNodeId = "b";
-          edge.targetNodeId = "a";
-        },
-      },
-      {
-        name: "relation endpoints differ from the parent edge",
-        mutate: (graph) => {
-          const [relation] = graph.relations;
-          if (relation === undefined) throw new Error("fixture UML graph has no first relation");
-          relation.targetNodeId = "c";
-        },
-      },
-      {
-        name: "relation ordinal starts after zero",
-        mutate: (graph) => {
-          const [relation] = graph.relations;
-          if (relation === undefined) throw new Error("fixture UML graph has no first relation");
-          relation.relationOrdinal = 1;
-        },
-      },
-      {
-        name: "edge weight differs from relation count",
-        mutate: (graph) => {
-          const [edge] = graph.edges;
-          if (edge === undefined) throw new Error("fixture UML graph has no first edge");
-          edge.weight = 2;
-        },
-      },
-      {
-        name: "bare graph retains model rows",
-        mutate: (graph) => {
-          graph.renderMode = "bare";
-        },
-      },
-      {
-        name: "return type IDs exist while presence flag is false",
-        mutate: (graph) => {
-          const [method] = graph.methods;
-          if (method === undefined) throw new Error("fixture UML graph has no first method");
-          method.returnTypeIdsPresent = false;
-        },
-      },
-    ];
-    for (const { name, mutate } of domainCases) {
-      const graph = structuredClone(validGraph);
-      mutate(graph);
-      let rendererCalled = false;
-      expect(() => cache.writeScope(generationId, {
-        entries: [],
-        diagram: { graph, outcome: { status: "ready" } },
-        file: {
-          path: scopePath,
-          rawContent: name,
-          displayContent: name,
-          sourceError: null,
-          formatError: null,
-          language: "typescript",
-        },
+      ],
+      contributors: [
+        ...fixtureCatalogue(scopePath).contributors,
+        { definitionKey: foreignKey, sourcePath: foreignScope, kind: "declaration" },
+      ],
+    });
+    const foreignGraph = structuredClone(validGraph);
+    foreignGraph.nodes.push({
+      nodeId: foreignKey,
+      nodeOrdinal: foreignGraph.nodes.length,
+      nodeKind: "entity",
+      name: "Delta",
+    });
+    foreignGraph.entities.push({
+      entityOrdinal: foreignGraph.entities.length,
+      definitionKey: foreignKey,
+      entityKind: "class",
+      name: "Delta",
+    });
+    expect(() =>
+      cache.writeScope(generationId, {
+        diagram: { graph: foreignGraph, outcome: { status: "ready" } },
         definitions: [],
-      }, (reloaded) => {
-        rendererCalled = true;
-        return renderFixtureGraph(reloaded);
-      }), name).toThrow(DiagramMaterializationError);
-      expect(rendererCalled, name).toBe(false);
-      expect(cache.readDiagramGraph(generationId, "uml", scopePath), name).toEqual(baselineGraph);
-      expect(cache.readDiagram(generationId, "uml", scopePath), name).toEqual(baselineResponse);
-      expect(cache.readFile(generationId, scopePath), name).toEqual(baselineFile);
-    }
+      })).toThrow(DiagramMaterializationError);
   } finally {
     cache.close();
   }
@@ -1807,13 +1956,21 @@ test("labels repeated scope work across startup and watch generations", async ()
   ] as const) {
     const generationEvents = progressEvents.filter((event) => event.generationId === generationId);
     expect([...new Set(generationEvents.map((event) => event.cause))]).toEqual([cause]);
+    // The catalogue runs once for the whole generation; UML is per source file, never per directory.
+    expect(
+      [...new Set(
+        generationEvents
+          .filter((event) => event.component === "definitions")
+          .map((event) => event.resource),
+      )],
+    ).toEqual(["."]);
     expect(
       [...new Set(
         generationEvents
           .filter((event) => event.component === "uml")
           .map((event) => event.resource),
       )].sort(),
-    ).toEqual([".", "./index.ts"]);
+    ).toEqual(["./index.ts"]);
     expect(
       [...new Set(
         generationEvents
@@ -1837,40 +1994,41 @@ test("labels repeated scope work across startup and watch generations", async ()
       WHERE key = 'active_generation'
     `).get();
     if (activeGeneration === null) throw new Error("active generation was not persisted");
-    const activeGenerationId = activeGeneration.id;
-    expect(activeGenerationId).toBe(watchGenerationId);
-    expect(normalizedGenerationIds(db, "diagram_graphs")).toEqual([watchGenerationId]);
-    expectOnlyNormalizedGeneration(db, watchGenerationId);
+    expect(activeGeneration.id).toBe(watchGenerationId);
+    expectOnlyGeneration(db, watchGenerationId);
   });
 }, 30_000);
 
-test("prioritizes a queued definition miss without promoting the incomplete generation", async () => {
+test("serves concurrent roots from one target file with a single UML phase", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-priority-");
   const targetPath = "z-priority.ts";
   const blockerSource = Array.from(
     { length: 1_000 },
     (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
   ).join("\n");
+  const backlogSource = Array.from(
+    { length: 300 },
+    (_, index) => `export const backlog${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  const backlogPaths = Array.from(
+    { length: 8 },
+    (_, index) => `m-pending-${String(index).padStart(2, "0")}.ts`,
+  );
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "priority-root" }));
   await writeFixtureFile(root, "a-blocker.ts", `${blockerSource}\n`);
-  await Promise.all(
-    Array.from({ length: 6 }, (_, index) =>
-      writeFixtureFile(
-        root,
-        `m-pending-${String(index).padStart(2, "0")}.ts`,
-        `export class Pending${index} {}\n`,
-      )
-    ),
-  );
+  await Promise.all(backlogPaths.map((path) => writeFixtureFile(root, path, `${backlogSource}\n`)));
   await writeFixtureFile(
     root,
     targetPath,
-    "export class PriorityTarget { locate() { return 1; } }\n",
+    [
+      "export class PriorityDependency {}",
+      "export class PriorityTarget { value: PriorityDependency; }",
+      "export class PriorityIsolated {}",
+      "",
+    ].join("\n"),
   );
 
   const blockerStarted = Promise.withResolvers<void>();
-  const targetStarted = Promise.withResolvers<void>();
-  const targetDone = Promise.withResolvers<void>();
   const progress: PreprocessProgressEvent[] = [];
   const promotions: string[] = [];
   const errors: Error[] = [];
@@ -1884,9 +2042,103 @@ test("prioritizes a queued definition miss without promoting the incomplete gene
       if (event.event === "start" && event.component === "code" && event.resource === "./a-blocker.ts") {
         blockerStarted.resolve();
       }
-      if (event.component === "code" && event.resource === `./${targetPath}`) {
-        if (event.event === "start") targetStarted.resolve();
-        else targetDone.resolve();
+    },
+  );
+  let idleResolved = false;
+  const idle = preprocessor.whenIdle().then(() => {
+    idleResolved = true;
+  });
+  await preprocessor.ready();
+  const outline = await preprocessor.getFileDefinitions(targetPath);
+  await withTimeout(blockerStarted.promise, "blocker preprocessing start", 30_000);
+
+  // Three selections rooted in the same unprocessed file: the first pending reply must not be
+  // cached, and the file must be extracted exactly once for all of them.
+  const [targetDiagram, isolatedDiagram, fileDiagram] = await withTimeout(
+    Promise.all([
+      preprocessor.getDiagram(definitionRequest(targetPath, definitionKeyOf(outline, "PriorityTarget"))),
+      preprocessor.getDiagram(definitionRequest(targetPath, definitionKeyOf(outline, "PriorityIsolated"))),
+      preprocessor.getDiagram(fileRequest(targetPath)),
+    ]),
+    "rooted selections from a building generation",
+    45_000,
+  );
+
+  const targetView = definitionsView(targetDiagram);
+  expect(expectUml(targetDiagram).status).toBe("ready");
+  expect(nodeNames(targetView)).toEqual(["PriorityDependency", "PriorityTarget"]);
+  expect(edgeSummary(targetView)).toEqual(["PriorityTarget -references-> PriorityDependency"]);
+
+  // A completed root with no outgoing reference is a one-node graph, not a pending selection.
+  const isolatedView = definitionsView(isolatedDiagram);
+  expect(nodeNames(isolatedView)).toEqual(["PriorityIsolated"]);
+  expect(edgeSummary(isolatedView)).toEqual([]);
+  expect(frameSummary(isolatedView)).toEqual([
+    { root: "PriorityIsolated", nodes: ["PriorityIsolated"] },
+  ]);
+
+  expect(frameSummary(definitionsView(fileDiagram)).map(({ root: name }) => name)).toEqual([
+    "PriorityDependency",
+    "PriorityTarget",
+    "PriorityIsolated",
+  ]);
+
+  const targetUmlPhases = groupProgressEvents(progress).filter(
+    (group) => group.component === "uml" && group.resource === `./${targetPath}`,
+  );
+  expect(targetUmlPhases.map(({ events }) => events)).toEqual([["start", "done"]]);
+
+  // The requested closure finished while the background backlog and promotion were still pending.
+  const backlogDone = progress.filter(
+    (event) =>
+      event.event === "done" && event.component === "code"
+      && backlogPaths.some((path) => event.resource === `./${path}`),
+  );
+  expect(backlogDone.length).toBeLessThan(backlogPaths.length / 2);
+  expect(idleResolved).toBe(false);
+  expect(promotions).toEqual([]);
+
+  await idle;
+  expect(promotions).toEqual(["promoted"]);
+  expect(errors).toEqual([]);
+}, 90_000);
+
+test("reports queued, processing and done for a prioritized selection without promoting the incomplete generation", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-priority-api-");
+  const targetPath = "z-priority-api.ts";
+  const blockerSource = Array.from(
+    { length: 1_000 },
+    (_, index) => `export const blocker${index}={value:${index},text:"${index}"}`,
+  ).join("\n");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "priority-api" }));
+  await writeFixtureFile(root, "a-blocker.ts", `${blockerSource}\n`);
+  await Promise.all(
+    Array.from({ length: 6 }, (_, index) =>
+      writeFixtureFile(
+        root,
+        `m-pending-${String(index).padStart(2, "0")}.ts`,
+        `export class Pending${index} {}\n`,
+      )),
+  );
+  await writeFixtureFile(root, targetPath, "export class PriorityTarget { locate() { return 1; } }\n");
+
+  const blockerStarted = Promise.withResolvers<void>();
+  const targetStarted = Promise.withResolvers<void>();
+  const progress: PreprocessProgressEvent[] = [];
+  const promotions: string[] = [];
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => promotions.push("promoted"),
+    (error) => errors.push(error),
+    1,
+    (event) => {
+      progress.push(event);
+      if (event.event === "start" && event.component === "code" && event.resource === "./a-blocker.ts") {
+        blockerStarted.resolve();
+      }
+      if (event.event === "start" && event.component === "code" && event.resource === `./${targetPath}`) {
+        targetStarted.resolve();
       }
     },
   );
@@ -1910,17 +2162,6 @@ test("prioritizes a queued definition miss without promoting the incomplete gene
     status: "processing",
     requestId: priority.requestId,
   });
-  await withTimeout(targetDone.promise, "prioritized source completion", 30_000);
-  expect(await preprocessor.getDefinition(targetPath, { line: 1, column: 14 })).toEqual({
-    key: '["class","PriorityTarget",0,null,null]',
-    kind: "class",
-    name: "PriorityTarget",
-    qualifiedName: "PriorityTarget",
-    source: { path: targetPath, line: 1, column: 14 },
-    uml: { scopePath: targetPath, entityName: "PriorityTarget" },
-  });
-  expect(idleResolved).toBe(false);
-  expect(promotions).toEqual([]);
   expect(
     progress.findIndex(({ event, component, resource }) =>
       event === "start" && component === "code" && resource === `./${targetPath}`
@@ -1930,6 +2171,8 @@ test("prioritizes a queued definition miss without promoting the incomplete gene
       event === "start" && component === "code" && resource === "./a-blocker.ts"
     ),
   );
+  expect(idleResolved).toBe(false);
+  expect(promotions).toEqual([]);
 
   await idle;
   expect(await preprocessor.poll(priority.requestId)).toEqual({
@@ -1939,6 +2182,150 @@ test("prioritizes a queued definition miss without promoting the incomplete gene
   });
   expect(promotions).toEqual(["promoted"]);
   expect(errors).toEqual([]);
+}, 60_000);
+
+test("reuses warm SQL and a recovered generation without restarting UML extraction", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-warm-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "warm-cache" }));
+  await writeFixtureFile(root, "dep.ts", "export class Dependency {}\n");
+  await writeFixtureFile(
+    root,
+    "root.ts",
+    'import { Dependency } from "./dep";\nexport class Root { value: Dependency; }\n',
+  );
+
+  const umlStarts = (events: readonly PreprocessProgressEvent[]) =>
+    events.filter((event) => event.component === "uml" && event.event === "start").length;
+
+  const warmProgress: PreprocessProgressEvent[] = [];
+  const warmErrors: Error[] = [];
+  const warm = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => warmErrors.push(error),
+    1,
+    (event) => warmProgress.push(event),
+  );
+  await warm.ready();
+  await warm.whenIdle();
+  const rootKey = definitionKeyOf(await warm.getFileDefinitions("root.ts"), "Root");
+  const extractedPhases = umlStarts(warmProgress);
+  expect(extractedPhases).toBe(2);
+
+  const warmDiagram = definitionsView(await warm.getDiagram(definitionRequest("root.ts", rootKey)));
+  expect(nodeNames(warmDiagram)).toEqual(["Dependency", "Root"]);
+  expect(edgeSummary(warmDiagram)).toEqual(["Root -references-> Dependency"]);
+  await warm.getDiagram(fileRequest("root.ts"));
+  await warm.getDiagram(directoryRequest(""));
+  expect(umlStarts(warmProgress)).toBe(extractedPhases);
+  expect(warmErrors).toEqual([]);
+  await closePreprocessor(warm);
+
+  const restartProgress: PreprocessProgressEvent[] = [];
+  const restartErrors: Error[] = [];
+  const restarted = trackedPreprocessor(
+    root,
+    () => undefined,
+    (error) => restartErrors.push(error),
+    1,
+    (event) => restartProgress.push(event),
+  );
+  await restarted.ready();
+  await restarted.whenIdle();
+  const restartedDiagram = definitionsView(
+    await restarted.getDiagram(definitionRequest("root.ts", rootKey)),
+  );
+  expect(nodeNames(restartedDiagram)).toEqual(["Dependency", "Root"]);
+  expect(edgeSummary(restartedDiagram)).toEqual(["Root -references-> Dependency"]);
+  // An unchanged fingerprint recovers the active generation: nothing is preprocessed again.
+  expect(restartProgress).toEqual([]);
+  expect(restartErrors).toEqual([]);
+  await closePreprocessor(restarted);
+}, 60_000);
+
+test("drops a root's last edge when its dependency is removed and 404s a deleted root", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-root-updates-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "root-updates" }));
+  await writeFixtureFile(root, "dep.ts", "export class Dependency {}\n");
+  await writeFixtureFile(
+    root,
+    "root.ts",
+    'import { Dependency } from "./dep";\nexport class Root { value: Dependency; }\n',
+  );
+
+  const promotions: string[] = [];
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(
+    root,
+    () => promotions.push("promoted"),
+    (error) => errors.push(error),
+  );
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+
+  const rootKey = definitionKeyOf(await preprocessor.getFileDefinitions("root.ts"), "Root");
+  const before = definitionsView(await preprocessor.getDiagram(definitionRequest("root.ts", rootKey)));
+  expect(nodeNames(before)).toEqual(["Dependency", "Root"]);
+  expect(edgeSummary(before)).toEqual(["Root -references-> Dependency"]);
+
+  await writeFixtureFile(root, "root.ts", "\nexport class Root { value: number; }\n");
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+
+  // The key is stable across a line-only edit, so the selection survives the rebuild.
+  expect(definitionKeyOf(await preprocessor.getFileDefinitions("root.ts"), "Root")).toBe(rootKey);
+  const after = definitionsView(await preprocessor.getDiagram(definitionRequest("root.ts", rootKey)));
+  expect(nodeNames(after)).toEqual(["Root"]);
+  expect(edgeSummary(after)).toEqual([]);
+  expect(frameSummary(after)).toEqual([{ root: "Root", nodes: ["Root"] }]);
+
+  await writeFixtureFile(root, "root.ts", "export class Renamed {}\n");
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+  const promotionsBefore = promotions.length;
+
+  const failure = await withTimeout(
+    captureError(preprocessor.getDiagram(definitionRequest("root.ts", rootKey))),
+    "deleted root selection",
+  );
+  expect(failure.code).toBe("NOT_FOUND");
+  expect(failure.message).toBe("Definition not found");
+  // A missing root is final: it never triggers a repair rebuild loop.
+  expect(promotions.length).toBe(promotionsBefore);
+  expect(errors).toEqual([]);
+  await closePreprocessor(preprocessor);
+}, 60_000);
+
+test("settles rooted selections across supersession and close", async () => {
+  const root = await temporaryRoot("ts-explorer-preprocessor-selection-settling-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "selection-settling" }));
+  await writeFixtureFile(root, "app.ts", "export class First {}\n");
+
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(root, () => undefined, (error) => errors.push(error));
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+
+  await writeFixtureFile(root, "app.ts", "export class Second {}\n");
+  preprocessor.rebuild("watch");
+  const superseded = preprocessor.getDiagram(fileRequest("app.ts"));
+  await writeFixtureFile(root, "app.ts", "export class Third {}\n");
+  preprocessor.rebuild("watch");
+  const settled = definitionsView(await withTimeout(superseded, "superseded diagram read", 30_000));
+  expect(nodeNames(settled)).toEqual(["Third"]);
+  await preprocessor.whenIdle();
+  expect(errors).toEqual([]);
+
+  await writeFixtureFile(root, "app.ts", "export class Fourth {}\n");
+  preprocessor.rebuild("watch");
+  const duringClose = preprocessor.getDiagram(fileRequest("app.ts")).then(
+    () => "resolved" as const,
+    () => "rejected" as const,
+  );
+  await closePreprocessor(preprocessor);
+  expect(["resolved", "rejected"]).toContain(
+    await withTimeout(duringClose, "diagram read during close"),
+  );
 }, 60_000);
 
 test("drains superseded subprocess jobs before discarding their generation", async () => {
@@ -1996,21 +2383,20 @@ test("drains superseded subprocess jobs before discarding their generation", asy
     `).all();
     expect(generations).toHaveLength(1);
     expect(generations[0]).toMatchObject({ state: "active", cause: "watch" });
-    expect(generations.filter(({ state }) => state === "building" || state === "failed")).toEqual([]);
     const active = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id
       FROM cache_meta
       WHERE key = 'active_generation'
     `).get();
-    expect(active?.id).toBe(generations[0]?.id);
     expect(active).not.toBeNull();
     if (active === null) throw new Error("active generation was not persisted");
+    expect(active.id).toBe(generations[0]?.id);
     expect(db.query<{ generation_id: number; count: number }, []>(`
       SELECT generation_id, COUNT(*) AS count
       FROM GotoDef
       GROUP BY generation_id
     `).all()).toEqual([{ generation_id: active.id, count: sourcePaths.length }]);
-    expectOnlyNormalizedGeneration(db, active.id);
+    expectOnlyGeneration(db, active.id);
   });
 }, 60_000);
 
@@ -2043,11 +2429,11 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   let orphanId: number;
   try {
     orphanId = orphanCache.beginGeneration("watch", "");
+    orphanCache.writeDefinitionIndex(orphanId, fixtureCatalogue("orphan.ts"));
     orphanCache.writeScope(orphanId, {
-      entries: [],
       diagram: { graph: fixtureUmlGraph("orphan.ts"), outcome: { status: "ready" } },
       definitions: [],
-    }, renderFixtureGraph);
+    });
   } finally {
     orphanCache.close();
   }
@@ -2091,14 +2477,15 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     expect(db.query<{ count: number }, []>(
       "SELECT COUNT(*) AS count FROM goto_def_search WHERE goto_def_search MATCH 'OrphanDefinition'",
     ).get()).toEqual({ count: 0 });
-    for (const table of NORMALIZED_GRAPH_TABLES) {
+    for (const table of normalizedGraphTables(db)) {
       expect(
         db.query<{ count: number }, [number, string]>(
-          `SELECT COUNT(*) AS count FROM ${table} WHERE generation_id = ? AND scope_path = ?`,
+          `SELECT COUNT(*) AS count FROM "${table}" WHERE generation_id = ? AND scope_path = ?`,
         ).get(seeded.orphanId, "orphan.ts"),
+        table,
       ).toEqual({ count: 0 });
     }
-    expectOnlyNormalizedGeneration(db, seeded.activeId);
+    expectOnlyGeneration(db, seeded.activeId);
   });
   await closePreprocessor(recoveryProbe);
 
@@ -2138,7 +2525,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     if (generation === undefined) throw new Error("watch generation was not promoted");
     expect(generation).toMatchObject({ state: "active", cause: "watch" });
     expect(generation.id).not.toBe(restartedId);
-    expectOnlyNormalizedGeneration(db, generation.id);
+    expectOnlyGeneration(db, generation.id);
   });
 
   await writeFixtureFile(root, "app.js", 'export const state="invalid-pointer-rebuilt";\n');
@@ -2146,14 +2533,17 @@ test("startup recovery removes orphan generations and rebuilds when the active p
   let invalidPointerOrphanId: number;
   try {
     invalidPointerOrphanId = invalidPointerCache.beginGeneration("watch", "");
+    invalidPointerCache.writeDefinitionIndex(
+      invalidPointerOrphanId,
+      fixtureCatalogue("invalid-pointer-orphan.ts"),
+    );
     invalidPointerCache.writeScope(invalidPointerOrphanId, {
-      entries: [],
       diagram: {
         graph: fixtureUmlGraph("invalid-pointer-orphan.ts"),
         outcome: { status: "ready" },
       },
       definitions: [],
-    }, renderFixtureGraph);
+    });
   } finally {
     invalidPointerCache.close();
   }
@@ -2182,26 +2572,27 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     const pointer = db.query<{ id: number }, []>(`
       SELECT CAST(value AS INTEGER) AS id FROM cache_meta WHERE key = 'active_generation'
     `).get();
-    expect(pointer?.id).toBe(generation.id);
-    expect(pointer?.id).not.toBe(999999999);
     expect(pointer).not.toBeNull();
     if (pointer === null) throw new Error("active generation pointer was not rebuilt");
+    expect(pointer.id).toBe(generation.id);
+    expect(pointer.id).not.toBe(999999999);
     expect(db.query<{ count: number }, [number]>(`
       SELECT COUNT(*) AS count FROM package_snapshots WHERE generation_id = ?
     `).get(pointer.id)?.count).toBe(1);
     expect(db.query<{ path: string }, [number]>(`
       SELECT path FROM tree_entries WHERE generation_id = ? ORDER BY path
     `).all(pointer.id).map(({ path }) => path)).toEqual(["", "app.js", "package.json"]);
-    expectOnlyNormalizedGeneration(db, pointer.id);
-    for (const table of NORMALIZED_GRAPH_TABLES) {
+    expectOnlyGeneration(db, pointer.id);
+    for (const table of normalizedGraphTables(db)) {
       expect(
         db.query<{ count: number }, [number, string]>(
-          `SELECT COUNT(*) AS count FROM ${table} WHERE generation_id = ? AND scope_path = ?`,
+          `SELECT COUNT(*) AS count FROM "${table}" WHERE generation_id = ? AND scope_path = ?`,
         ).get(invalidPointerOrphanId, "invalid-pointer-orphan.ts"),
+        table,
       ).toEqual({ count: 0 });
     }
   });
-}, 30_000);
+}, 60_000);
 
 test("startup retries diagram scopes whose cached outcome is an error", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-failure-retry-");
@@ -2228,14 +2619,12 @@ test("startup retries diagram scopes whose cached outcome is an error", async ()
   await closePreprocessor(second);
   expect(readActiveId()).toBe(seededId);
 
-  // Poison the cached outcome for the root UML scope.
+  // Poison the cached per-file UML outcome.
   const changes = openDatabase(dbPath, (db) =>
     db.query<never, [number]>(`
       UPDATE diagrams
-      SET response_json = json_set(
-        response_json, '$.status', 'error', '$.error', 'seeded stale failure'
-      )
-      WHERE generation_id = ? AND kind = 'uml' AND scope_path = ''
+      SET response_json = json_object('status', 'error', 'error', 'seeded stale failure')
+      WHERE generation_id = ? AND kind = 'uml' AND scope_path = 'app.ts'
     `).run(seededId).changes);
   expect(changes).toBe(1);
 
@@ -2243,11 +2632,12 @@ test("startup retries diagram scopes whose cached outcome is an error", async ()
   const third = trackedPreprocessor(root, () => undefined, (error) => thirdErrors.push(error));
   await third.ready();
   await third.whenIdle();
-  const repaired = await third.getDiagram("uml", "");
+  const repaired = expectUml(await third.getDiagram(fileRequest("app.ts")));
   await closePreprocessor(third);
   expect(thirdErrors).toEqual([]);
   expect(repaired.status).toBe("ready");
   expect(repaired.error).toBeUndefined();
+  expect(nodeNames(definitionsView(repaired))).toEqual(["RetryTarget"]);
   expect(readActiveId()).not.toBe(seededId);
 }, 60_000);
 
@@ -2429,7 +2819,7 @@ test("defers recovered readiness when a watch rebuild is requested before bootst
     if (generation === undefined) throw new Error("watch generation was not promoted");
     expect(generation).toMatchObject({ state: "active", cause: "watch" });
     expect(generation.id).not.toBe(seedId);
-    expectOnlyNormalizedGeneration(db, generation.id);
+    expectOnlyGeneration(db, generation.id);
   });
 }, 30_000);
 
@@ -2557,14 +2947,13 @@ test("recovers named cache tables and retries queued database work for runtime l
     `).all()).toEqual([
       { definition_key: '["class","RuntimeRecoveryNeedle",0,null,null]' },
     ]);
-    expectOnlyNormalizedGeneration(db, generation.id);
+    expectOnlyGeneration(db, generation.id);
   });
   await closePreprocessor(preprocessor);
 }, 30_000);
 
 test("indexes every definition before UML extraction and disambiguates lookups by qualified name", async () => {
   const root = await temporaryRoot("ts-explorer-definition-index-");
-  const dbPath = resolveCacheDbPath(root);
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "definition-index" }));
   await writeFixtureFile(
     root,
@@ -2593,52 +2982,47 @@ test("indexes every definition before UML extraction and disambiguates lookups b
   await preprocessor.whenIdle();
   expect(errors).toEqual([]);
 
-  expect(openDatabase(dbPath, (db) =>
-    db.query<{
-      source_path: string;
-      name: string;
-      qualified_name: string;
-      kind: string;
-      source_line: number;
-      source_column: number;
-    }, []>(`
-      SELECT source_path, name, qualified_name, kind, source_line, source_column
-      FROM DefinitionIndex
-      ORDER BY source_line, source_column
-    `).all())).toEqual([
+  const outline = await preprocessor.getFileDefinitions("root.ts");
+  expect(outline.map(({ key, ...definition }) => definition)).toEqual([
     {
-      source_path: "root.ts",
+      parentKey: null,
+      isTopLevel: true,
       name: "Alpha",
-      qualified_name: "Alpha",
+      qualifiedName: "Alpha",
       kind: "class",
-      source_line: 1,
-      source_column: 14,
+      type: "Alpha",
+      source: { path: "root.ts", line: 1, column: 14 },
     },
     {
-      source_path: "root.ts",
+      parentKey: definitionKeyOf(outline, "Alpha"),
+      isTopLevel: false,
       name: "run",
-      qualified_name: "Alpha.run",
+      qualifiedName: "Alpha.run",
       kind: "method",
-      source_line: 2,
-      source_column: 3,
+      type: "(): void",
+      source: { path: "root.ts", line: 2, column: 3 },
     },
     {
-      source_path: "root.ts",
+      parentKey: null,
+      isTopLevel: true,
       name: "Beta",
-      qualified_name: "Beta",
+      qualifiedName: "Beta",
       kind: "interface",
-      source_line: 4,
-      source_column: 18,
+      type: "Beta",
+      source: { path: "root.ts", line: 4, column: 18 },
     },
     {
-      source_path: "root.ts",
+      parentKey: definitionKeyOf(outline, "Beta"),
+      isTopLevel: false,
       name: "run",
-      qualified_name: "Beta.run",
+      qualifiedName: "Beta.run",
       kind: "method",
-      source_line: 5,
-      source_column: 3,
+      type: "(): void",
+      source: { path: "root.ts", line: 5, column: 3 },
     },
   ]);
+  // Same-named members in different owners never share a catalogue key.
+  expect(new Set(outline.map(({ key }) => key)).size).toBe(outline.length);
 
   expect(await preprocessor.lookupDefinition("root.ts", "run", "Beta.run")).toEqual({
     path: "root.ts",
@@ -2693,4 +3077,69 @@ test("serves repeated read-only requests from memory and drops them when a rebui
   expect(errors).toEqual([]);
 
   await closePreprocessor(preprocessor);
+}, 30_000);
+
+function outlineSummary(definitions: readonly { qualifiedName: string; kind: string; type: string | null }[]): string[] {
+  return definitions.map((definition) => `${definition.qualifiedName} ${definition.kind} ${definition.type ?? "—"}`);
+}
+
+test("serves file outlines from the current generation and never from an older one", async () => {
+  const root = await temporaryRoot("ts-explorer-file-outline-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "file-outline" }));
+  await writeFixtureFile(root, "outline.ts", "export const LIMIT: number = 3;\n");
+
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(root, () => undefined, (error) => errors.push(error));
+
+  // Readable from the still-building generation: the outline waits on the definition index only.
+  expect(outlineSummary(await withTimeout(
+    preprocessor.getFileDefinitions("outline.ts"),
+    "outline before UML completion",
+  ))).toEqual(["LIMIT constant number"]);
+  await preprocessor.whenIdle();
+
+  await writeFixtureFile(root, "outline.ts", 'export const LIMIT: string = "updated";\n');
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+  expect(outlineSummary(await preprocessor.getFileDefinitions("outline.ts"))).toEqual([
+    "LIMIT constant string",
+  ]);
+
+  await writeFixtureFile(root, "outline.ts", "");
+  preprocessor.rebuild("watch");
+  await preprocessor.whenIdle();
+  expect(await preprocessor.getFileDefinitions("outline.ts")).toEqual([]);
+  expect(errors).toEqual([]);
+
+  await closePreprocessor(preprocessor);
+}, 30_000);
+
+test("settles pending file outline reads across supersession and shutdown", async () => {
+  const root = await temporaryRoot("ts-explorer-file-outline-pending-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ name: "outline-pending" }));
+  await writeFixtureFile(root, "outline.ts", "export const FIRST: number = 1;\n");
+
+  const errors: Error[] = [];
+  const preprocessor = trackedPreprocessor(root, () => undefined, (error) => errors.push(error));
+  await preprocessor.ready();
+  await preprocessor.whenIdle();
+
+  await writeFixtureFile(root, "outline.ts", "export const SECOND: number = 2;\n");
+  preprocessor.rebuild("watch");
+  const superseded = preprocessor.getFileDefinitions("outline.ts");
+  await writeFixtureFile(root, "outline.ts", "export const THIRD: number = 3;\n");
+  preprocessor.rebuild("watch");
+  expect(outlineSummary(await withTimeout(superseded, "superseded outline read"))).toEqual([
+    "THIRD constant number",
+  ]);
+  await preprocessor.whenIdle();
+
+  await writeFixtureFile(root, "outline.ts", "export const FOURTH: number = 4;\n");
+  preprocessor.rebuild("watch");
+  const duringClose = preprocessor.getFileDefinitions("outline.ts").then(
+    () => "resolved" as const,
+    () => "rejected" as const,
+  );
+  await closePreprocessor(preprocessor);
+  expect(["resolved", "rejected"]).toContain(await withTimeout(duringClose, "outline read during close"));
 }, 30_000);

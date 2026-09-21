@@ -1,4 +1,4 @@
-import { relative, sep } from "node:path";
+import { sep } from "node:path";
 
 export function posix(path: string): string {
   return path.split(sep).join("/");
@@ -7,24 +7,4 @@ export function posix(path: string): string {
 export function isTestPath(path: string): boolean {
   return /(^|[\\/])(test|tests|__tests__)([\\/]|$)|\.(test|spec)\.[cm]?[tj]sx?$|(^|[\\/])tests\.rs$/
     .test(path);
-}
-
-export function umlEntityKey(fileName: string, name: string): string {
-  return `${umlFileKey(fileName)}\0${name}`;
-}
-
-export function umlFileKey(fileName: string): string {
-  const path = posix(fileName);
-  return process.platform === "win32" ? path.toLowerCase() : path;
-}
-
-export function scopeRelativePath(sourceDir: string, path: string): string {
-  return posix(relative(sourceDir, path));
-}
-
-export function syntheticTypeId(filePath: string, renderedName: string): string {
-  const normalized = posix(filePath);
-  const extension = normalized.lastIndexOf(".");
-  const withoutExtension = extension < 0 ? normalized : normalized.slice(0, extension);
-  return `"${withoutExtension}".${renderedName}`;
 }

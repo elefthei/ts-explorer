@@ -156,7 +156,6 @@ export function extractPackageDiagramGraph(
     formatVersion: DIAGRAM_GRAPH_FORMAT_VERSION,
     renderMode,
     nodes: [],
-    aliases: [],
     edges: [],
     relations: [],
     packageNodes: [],
@@ -169,7 +168,6 @@ export function extractPackageDiagramGraph(
       nodeOrdinal: 0,
       nodeKind: "placeholder",
       name: "No workspace packages",
-      community: null,
     });
     graph.packageNodes.push({ nodeId: "source", packagePath: null });
     return graph;
@@ -184,7 +182,6 @@ export function extractPackageDiagramGraph(
       nodeOrdinal,
       nodeKind: "package",
       name: pkg.name,
-      community: null,
     });
     graph.packageNodes.push({ nodeId, packagePath: pkg.path });
   }
@@ -231,7 +228,6 @@ export function validatePackageDiagramGraph(
   if (graph.renderMode !== "normal" && graph.renderMode !== "bare") {
     invalidPackageGraph(`unexpected render mode ${String(graph.renderMode)}`);
   }
-  if (graph.aliases.length) invalidPackageGraph("package graphs cannot contain aliases");
 
   const nodes = new Map<string, PackageDiagramGraph["nodes"][number]>();
   for (const [index, node] of graph.nodes.entries()) {
@@ -242,7 +238,6 @@ export function validatePackageDiagramGraph(
     if (node.nodeKind !== "package" && node.nodeKind !== "placeholder") {
       invalidPackageGraph(`unexpected node kind ${String(node.nodeKind)}`);
     }
-    if (node.community !== null) invalidPackageGraph(`package node ${node.nodeId} has a community`);
     nodes.set(node.nodeId, node);
   }
 

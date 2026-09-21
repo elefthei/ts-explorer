@@ -1,30 +1,25 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { resolveCacheDbPath, resolveSourceDir } from "../src/paths.ts";
 import { ExplorerServer } from "../src/server.ts";
 import { ExplorerStore } from "../src/store.ts";
 import { createFixtureTracker, removeFixtureRoot } from "./support/fixtures.ts";
-import {
-  expectSnapshotResponse,
-  readNormalizedGraphSnapshot,
-  type NormalizedGraphSnapshot,
-  type NormalizedSnapshotRecord,
-} from "./support/normalized-sql.ts";
 import type {
   DiagramResponse,
+  FileDefinition,
   FileResponse,
   GotoDefinition,
   PackageDiagramNode,
+  PackageDiagramPayload,
   SearchResponse,
   TreeNode,
   WatchEventName,
   WatchMessage,
 } from "../src/types.ts";
-import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
-import { renderUmlView } from "../src/uml/view.ts";
+import type { UmlViewModel } from "../src/uml/view.ts";
 
 type WatchClient = {
   waitFor(predicate: (message: WatchMessage) => boolean): Promise<WatchMessage>;
@@ -73,75 +68,179 @@ function openDatabase<Value>(dbPath: string, operation: (db: Database) => Value)
   }
 }
 
-function readActiveNormalizedSnapshot(
-  dbPath: string,
-  kind: NormalizedGraphSnapshot["kind"],
-  scopePath: string,
-): NormalizedGraphSnapshot {
+type PackageGraphRows = {
+  generationId: number;
+  nodes: { node_id: string; node_ordinal: number; node_kind: string; name: string }[];
+  edges: {
+    edge_ordinal: number;
+    source_node_id: string;
+    target_node_id: string;
+    edge_kind: string;
+    directed: number;
+    weight: number;
+  }[];
+  relations: {
+    edge_ordinal: number;
+    relation_ordinal: number;
+    relation_kind: string;
+    source_node_id: string;
+    target_node_id: string;
+  }[];
+  packageNodes: { node_id: string; package_path: string | null }[];
+};
+
+function activeGenerationId(db: Database): number {
+  const active = queryOne<{ generation_id: number }>(
+    db,
+    `
+      SELECT CAST(value AS INTEGER) AS generation_id
+      FROM cache_meta
+      WHERE key = 'active_generation'
+    `,
+  );
+  if (!active) throw new Error("active generation is missing");
+  return active.generation_id;
+}
+
+/** The promoted package topology exactly as the active generation stores it. */
+function readActivePackageGraph(dbPath: string): PackageGraphRows {
   return openDatabase(dbPath, (db) => {
-    const active = queryOne<{ generation_id: number }>(
-      db,
-      `
-        SELECT CAST(value AS INTEGER) AS generation_id
-        FROM cache_meta
-        WHERE key = 'active_generation'
-      `,
-    );
-    if (!active) throw new Error("active generation is missing");
-    return readNormalizedGraphSnapshot(db, active.generation_id, kind, scopePath);
+    const generationId = activeGenerationId(db);
+    return {
+      generationId,
+      nodes: queryAll<PackageGraphRows["nodes"][number]>(
+        db,
+        `
+          SELECT node_id, node_ordinal, node_kind, name
+          FROM diagram_nodes
+          WHERE generation_id = ? AND kind = 'packages' AND scope_path = ''
+          ORDER BY node_ordinal
+        `,
+        generationId,
+      ),
+      edges: queryAll<PackageGraphRows["edges"][number]>(
+        db,
+        `
+          SELECT edge_ordinal, source_node_id, target_node_id, edge_kind, directed, weight
+          FROM diagram_edges
+          WHERE generation_id = ? AND kind = 'packages' AND scope_path = ''
+          ORDER BY edge_ordinal
+        `,
+        generationId,
+      ),
+      relations: queryAll<PackageGraphRows["relations"][number]>(
+        db,
+        `
+          SELECT edge_ordinal, relation_ordinal, relation_kind, source_node_id, target_node_id
+          FROM diagram_edge_relations
+          WHERE generation_id = ? AND kind = 'packages' AND scope_path = ''
+          ORDER BY edge_ordinal, relation_ordinal
+        `,
+        generationId,
+      ),
+      packageNodes: queryAll<PackageGraphRows["packageNodes"][number]>(
+        db,
+        `
+          SELECT node_id, package_path
+          FROM package_graph_nodes
+          WHERE generation_id = ? AND kind = 'packages' AND scope_path = ''
+          ORDER BY node_id
+        `,
+        generationId,
+      ),
+    };
   });
 }
 
-function umlDsl(response: DiagramResponse): string {
-  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
-  return renderUmlView(response.view, FULL_UML_VISIBILITY).dsl;
-}
+type DefinitionsView = Extract<UmlViewModel, { kind: "definitions" }>;
+type FilesView = Extract<UmlViewModel, { kind: "files" }>;
 
-function packagesDsl(response: DiagramResponse): string {
+function packagesPayload(response: DiagramResponse): PackageDiagramPayload {
   if (response.kind !== "packages") throw new Error("expected a packages diagram response");
-  return response.dsl;
+  return response;
 }
 
-function expectPromotedFallback(
-  before: NormalizedGraphSnapshot,
-  after: NormalizedGraphSnapshot,
-  readyResponse: DiagramResponse,
-  errorResponse: DiagramResponse,
-  assertKindRows: (records: readonly NormalizedSnapshotRecord[]) => void,
-): void {
-  expect(readyResponse.status).toBe("ready");
-  expect(errorResponse.status).toBe("error");
-  expect(after.generationId).not.toBe(before.generationId);
-  expect({ kind: after.kind, scopePath: after.scopePath }).toEqual({
-    kind: before.kind,
-    scopePath: before.scopePath,
-  });
-  expect(before.header).toEqual({ format_version: 1, render_mode: "normal" });
-  expect(after.header).toEqual(before.header);
-  expect(after.records).toEqual(before.records);
-  expectSnapshotResponse(before, readyResponse);
-  expectSnapshotResponse(after, errorResponse);
-  expect(errorResponse.kind).toBe(readyResponse.kind);
-  const errorPayload = errorResponse.kind === "uml"
-    ? { view: errorResponse.view }
-    : { dsl: errorResponse.dsl, dsls: errorResponse.dsls };
-  const readyPayload = readyResponse.kind === "uml"
-    ? { view: readyResponse.view }
-    : { dsl: readyResponse.dsl, dsls: readyResponse.dsls };
-  expect({
-    ...errorPayload,
-    packageNodes: errorResponse.packageNodes,
-    definitions: errorResponse.definitions,
-    externalUsers: errorResponse.externalUsers,
-    localUsers: errorResponse.localUsers,
-  }).toEqual({
-    ...readyPayload,
-    packageNodes: readyResponse.packageNodes,
-    definitions: readyResponse.definitions,
-    externalUsers: readyResponse.externalUsers,
-    localUsers: readyResponse.localUsers,
-  });
-  assertKindRows(before.records);
+function definitionsView(response: DiagramResponse): DefinitionsView {
+  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
+  if (response.view.kind !== "definitions") throw new Error("expected a definitions view");
+  return response.view;
+}
+
+function filesView(response: DiagramResponse): FilesView {
+  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
+  if (response.view.kind !== "files") throw new Error("expected a files view");
+  return response.view;
+}
+
+// Identities are asserted by qualified name and source path; the catalogue key serialization is
+// an implementation detail that tests must not pin.
+function label(definition: FileDefinition): string {
+  return `${definition.qualifiedName}@${definition.source.path}`;
+}
+
+function labelsByKey(view: DefinitionsView): Map<string, string> {
+  return new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
+}
+
+function definitionLabels(view: DefinitionsView): string[] {
+  return view.nodes.map((node) => label(node.definition));
+}
+
+function edgeLabels(view: DefinitionsView): string[] {
+  const names = labelsByKey(view);
+  return view.edges.map((edge) =>
+    `${names.get(edge.sourceKey) ?? edge.sourceKey} -${edge.kind}-> `
+    + `${names.get(edge.targetKey) ?? edge.targetKey}`
+  );
+}
+
+function frameLabels(view: DefinitionsView): { root: string; nodes: string[] }[] {
+  const names = labelsByKey(view);
+  return view.frames.map((frame) => ({
+    root: names.get(frame.rootKey) ?? frame.rootKey,
+    nodes: frame.nodeKeys.map((key) => names.get(key) ?? key).sort(),
+  }));
+}
+
+async function fetchDiagram(base: string, query: string): Promise<DiagramResponse> {
+  const response = await fetch(`${base}/api/diagram?${query}`);
+  expect(response.status, query).toBe(200);
+  return await response.json() as DiagramResponse;
+}
+
+/** The outline key of one declaration, obtained the way the browser obtains it. */
+async function definitionKey(base: string, path: string, qualifiedName: string): Promise<string> {
+  const response = await fetch(`${base}/api/file-definitions?path=${encodeURIComponent(path)}`);
+  expect(response.status, path).toBe(200);
+  const body = await response.json() as { definitions: FileDefinition[] };
+  const match = body.definitions.find((definition) => definition.qualifiedName === qualifiedName);
+  if (!match) throw new Error(`${path} declares no ${qualifiedName}`);
+  return match.key;
+}
+
+/**
+ * Outline identity without the opaque catalogue key: `parentKey` is resolved back to the owner's
+ * qualified name so ownership is asserted by meaning, not by key serialization.
+ */
+function outlineShape(definitions: readonly FileDefinition[]): {
+  qualifiedName: string;
+  kind: string;
+  type: string | null;
+  at: string;
+  parent: string | null;
+  isTopLevel: boolean;
+}[] {
+  const byKey = new Map(definitions.map((definition) => [definition.key, definition]));
+  return definitions.map((definition) => ({
+    qualifiedName: definition.qualifiedName,
+    kind: definition.kind,
+    type: definition.type,
+    at: `${definition.source.line}:${definition.source.column}`,
+    parent: definition.parentKey === null
+      ? null
+      : byKey.get(definition.parentKey)?.qualifiedName ?? `unresolved:${definition.parentKey}`,
+    isTopLevel: definition.isTopLevel,
+  }));
 }
 function createPromotionGate(): {
   first: Promise<void>;
@@ -165,72 +264,6 @@ function createPromotionGate(): {
 }
 
 
-function readActiveRootUmlFootprint(
-  dbPath: string,
-  entityNames: readonly [string, string],
-): {
-  nodes: Array<{ name: string }>;
-  edges: Array<{ source_name: string; target_name: string }>;
-} {
-  return openDatabase(dbPath, (db) => {
-    const active = queryOne<{ generation_id: number }>(
-      db,
-      `
-        SELECT CAST(value AS INTEGER) AS generation_id
-        FROM cache_meta
-        WHERE key = 'active_generation'
-      `,
-    );
-    if (!active) throw new Error("active generation is missing");
-    return {
-      nodes: queryAll<{ name: string }>(
-        db,
-        `
-          SELECT name
-          FROM diagram_nodes
-          WHERE generation_id = ?
-            AND kind = 'uml'
-            AND scope_path = ''
-            AND name IN (?, ?)
-          ORDER BY node_ordinal
-        `,
-        active.generation_id,
-        entityNames[0],
-        entityNames[1],
-      ),
-      edges: queryAll<{ source_name: string; target_name: string }>(
-        db,
-        `
-          SELECT source.name AS source_name, target.name AS target_name
-          FROM diagram_edges AS edge
-          JOIN diagram_nodes AS source
-            ON source.generation_id = edge.generation_id
-            AND source.kind = edge.kind
-            AND source.scope_path = edge.scope_path
-            AND source.node_id = edge.source_node_id
-          JOIN diagram_nodes AS target
-            ON target.generation_id = edge.generation_id
-            AND target.kind = edge.kind
-            AND target.scope_path = edge.scope_path
-            AND target.node_id = edge.target_node_id
-          WHERE edge.generation_id = ?
-            AND edge.kind = 'uml'
-            AND edge.scope_path = ''
-            AND (
-              source.name IN (?, ?)
-              OR target.name IN (?, ?)
-            )
-          ORDER BY edge.edge_ordinal
-        `,
-        active.generation_id,
-        entityNames[0],
-        entityNames[1],
-        entityNames[0],
-        entityNames[1],
-      ),
-    };
-  });
-}
 
 function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
   return new Promise<Value>((resolve, reject) => {
@@ -354,6 +387,13 @@ async function createServerFixture(): Promise<{ outerRoot: string; root: string;
     root,
     "packages/demo/src/consumer.ts",
     'import { Widget } from "./target/widget";\nexport class Consumer { build(): Widget { return new Widget(); } }\n',
+  );
+  await writeFixtureFile(
+    root,
+    "packages/demo/src/pair.ts",
+    'import { Widget } from "./target/widget";\n'
+      + "export class PairFirst { widget!: Widget; }\n"
+      + "export function pairSecond(): void {}\n",
   );
 
   const literal = "-Needle.[x]*$";
@@ -612,95 +652,118 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       error: "caseInsensitive must be true or false",
     });
 
-    const packageDiagram = await (
-      await fetch(`${base}/api/diagram?kind=packages&path=`)
-    ).json() as DiagramResponse;
+    const packageDiagram = await fetchDiagram(base, "kind=packages&path=");
     expect(packageDiagram.scopePath).toBe("");
-    expect(packagesDsl(packageDiagram)).toContain("flowchart LR");
-    expect(packageDiagram.packageNodes).toEqual([
+    expect(packagesPayload(packageDiagram).dsl).toContain("flowchart LR");
+    expect(packagesPayload(packageDiagram).packageNodes).toEqual([
       { nodeId: "p0", name: "demo", path: "packages/demo" },
     ] satisfies PackageDiagramNode[]);
 
-    const rootUml = await (
-      await fetch(`${base}/api/diagram?kind=uml&path=`)
-    ).json() as DiagramResponse;
-    expect(rootUml.scopePath).toBe("");
-    expect(umlDsl(rootUml)).toContain("classDiagram");
-
-    const packageUml = await (
-      await fetch(`${base}/api/diagram?kind=uml&path=packages%2Fdemo`)
-    ).json() as DiagramResponse;
-    expect(packageUml.scopePath).toBe("packages/demo");
-    expect(umlDsl(packageUml)).toMatch(
-      /^[ \t]*DataflowRuntime[ \t]*-->[ \t]*AbstractStateMachine[ \t]*\r?$/m,
+    // A definition selection is exactly one frame rooted at the requested key. `getMachine` is a
+    // member of the nominal root, so it supplies the dependency without becoming its own node.
+    const runtimePath = "packages/demo/src/runtime.ts";
+    const machinePath = "packages/demo/src/machine.ts";
+    const runtimeKey = await definitionKey(base, runtimePath, "DataflowRuntime");
+    const rootDefinition = await fetchDiagram(
+      base,
+      `kind=uml&target=definition&path=${encodeURIComponent(runtimePath)}`
+        + `&definition=${encodeURIComponent(runtimeKey)}`,
     );
-    expect(packageUml.definitions).toEqual(expect.arrayContaining([
-      indexedDefinitions[0],
+    expect(rootDefinition.status).toBe("ready");
+    expect(rootDefinition.scopePath).toBe(runtimePath);
+    expect(rootDefinition.kind === "uml" && rootDefinition.target).toEqual({
+      kind: "definition",
+      path: runtimePath,
+      definitionKey: runtimeKey,
+    });
+    const rootView = definitionsView(rootDefinition);
+    expect(definitionLabels(rootView)).toEqual([
+      `AbstractStateMachine@${machinePath}`,
+      `DataflowRuntime@${runtimePath}`,
+    ]);
+    expect(edgeLabels(rootView)).toEqual([
+      `DataflowRuntime@${runtimePath} -references-> AbstractStateMachine@${machinePath}`,
+    ]);
+    expect(frameLabels(rootView)).toEqual([
       {
-        key: '["class","AbstractStateMachine",0,null,null]',
-        kind: "class",
-        name: "AbstractStateMachine",
-        qualifiedName: "AbstractStateMachine",
-        source: {
-          path: "packages/demo/src/machine.ts",
-          line: 1,
-          column: 14,
-        },
-        uml: {
-          scopePath: "packages/demo/src/machine.ts",
-          entityName: "AbstractStateMachine",
-        },
+        root: `DataflowRuntime@${runtimePath}`,
+        nodes: [`AbstractStateMachine@${machinePath}`, `DataflowRuntime@${runtimePath}`],
       },
+    ]);
+    // UML navigation metadata now lives in the view nodes; the removed top-level arrays must not
+    // reappear on the wire.
+    for (const removed of ["packageNodes", "definitions", "localUsers", "externalUsers", "dsl"]) {
+      expect(Object.hasOwn(rootDefinition, removed), removed).toBe(false);
+    }
+
+    // A file selection is one frame per top-level definition, in source order; an isolated root is
+    // still a one-node frame.
+    const pairPath = "packages/demo/src/pair.ts";
+    const widgetPath = "packages/demo/src/target/widget.ts";
+    const pairFile = await fetchDiagram(
+      base,
+      `kind=uml&target=file&path=${encodeURIComponent(pairPath)}`,
+    );
+    expect(pairFile.status).toBe("ready");
+    expect(frameLabels(definitionsView(pairFile))).toEqual([
       {
-        key: '["class","DataflowRuntime",0,null,null]',
-        kind: "class",
-        name: "DataflowRuntime",
-        qualifiedName: "DataflowRuntime",
-        source: {
-          path: "packages/demo/src/runtime.ts",
-          line: 2,
-          column: 14,
-        },
-        uml: {
-          scopePath: "packages/demo/src/runtime.ts",
-          entityName: "DataflowRuntime",
-        },
+        root: `PairFirst@${pairPath}`,
+        nodes: [`PairFirst@${pairPath}`, `Widget@${widgetPath}`],
       },
+      { root: `pairSecond@${pairPath}`, nodes: [`pairSecond@${pairPath}`] },
+    ]);
+
+    // A directory selection is the file import graph: every visible regular file in the subtree,
+    // and only the edges whose source lies inside it. `consumer.ts` imports `widget.ts` from
+    // outside the subtree, so that incoming edge is absent.
+    const targetDir = "packages/demo/src/target";
+    const scopedDirectory = await fetchDiagram(
+      base,
+      `kind=uml&target=directory&path=${encodeURIComponent(targetDir)}`,
+    );
+    expect(scopedDirectory.scopePath).toBe(targetDir);
+    expect(filesView(scopedDirectory)).toEqual({
+      kind: "files",
+      nodes: [
+        { path: `${targetDir}/local-user.ts`, boundary: false, test: false },
+        { path: widgetPath, boundary: false, test: false },
+      ],
+      edges: [{ sourcePath: `${targetDir}/local-user.ts`, targetPath: widgetPath }],
+    });
+
+    const packageDirectory = await fetchDiagram(
+      base,
+      "kind=uml&target=directory&path=packages%2Fdemo",
+    );
+    expect(packageDirectory.scopePath).toBe("packages/demo");
+    const packageFiles = filesView(packageDirectory);
+    // Non-source and isolated files are nodes too.
+    expect(packageFiles.nodes.map((node) => node.path)).toEqual(expect.arrayContaining([
+      "packages/demo/package.json",
+      "packages/demo/src/literal.txt",
+      "packages/demo/src/index.ts",
+      runtimePath,
     ]));
-    expect(Object.hasOwn(packageUml, "sources")).toBe(false);
-    expect(packageUml.packageNodes).toEqual([]);
-    expect(Object.hasOwn(packageUml, "graph")).toBe(false);
+    expect(packageFiles.nodes.some((node) => node.boundary)).toBe(false);
+    expect(packageFiles.edges).toEqual([
+      { sourcePath: "packages/demo/src/consumer.ts", targetPath: widgetPath },
+      { sourcePath: pairPath, targetPath: widgetPath },
+      { sourcePath: runtimePath, targetPath: machinePath },
+      { sourcePath: `${targetDir}/local-user.ts`, targetPath: widgetPath },
+    ]);
 
-    const scopedUml = await (
-      await fetch(`${base}/api/diagram?kind=uml&path=packages%2Fdemo%2Fsrc%2Ftarget`)
-    ).json() as DiagramResponse;
-    expect(scopedUml.localUsers).toEqual([
-      {
-        nodeId: "local0",
-        label: "local: packages/demo/src/target/local-user.ts: acceptWidget(Widget)",
-        kind: "function",
-        path: "packages/demo/src/target/local-user.ts",
-        line: 2,
-        column: 17,
-      },
-    ]);
-    expect(scopedUml.externalUsers).toEqual([
-      {
-        nodeId: "extern0",
-        label: "extern: packages/demo/src/consumer.ts: Consumer.build()",
-        scopePath: "packages/demo/src/consumer.ts",
-        kind: "method",
-      },
-    ]);
-    expect(umlDsl(scopedUml)).toContain(
-      'class local0["local: packages/demo/src/target/local-user.ts<br/>acceptWidget(Widget)"]',
-    );
-    expect(umlDsl(scopedUml)).toContain(
-      'class extern0["extern: packages/demo/src/consumer.ts<br/>Consumer.build()"]',
-    );
+    const rootDirectory = await fetchDiagram(base, "kind=uml&target=directory&path=");
+    expect(rootDirectory.scopePath).toBe("");
+    const rootFiles = filesView(rootDirectory);
+    expect(rootFiles.nodes.map((node) => node.path)).toEqual(expect.arrayContaining([
+      "package.json",
+      "bulk/entry-000.ts",
+      runtimePath,
+    ]));
+    expect(rootFiles.edges).toEqual(packageFiles.edges);
 
     const missingScope = await fetch(
-      `${base}/api/diagram?kind=uml&path=packages%2Fdemo%2Fsrc%2Fmissing`,
+      `${base}/api/diagram?kind=uml&target=file&path=packages%2Fdemo%2Fsrc%2Fmissing.ts`,
     );
     expect(missingScope.status).toBe(404);
     // The active and building generations legitimately word this differently; only the contract holds.
@@ -1067,15 +1130,22 @@ test("serves live add and remove trees before separately promoted APIs", async (
       highlights: expect.any(Array),
     });
 
-    const graphDbPath = resolveCacheDbPath(root);
-    const entityNames = ["WatchedSource", "WatchedTarget"] as const;
-    const presentFootprint = readActiveRootUmlFootprint(graphDbPath, entityNames);
-    expect(presentFootprint.nodes.map(({ name }) => name).sort()).toEqual([...entityNames].sort());
-    expect(
-      presentFootprint.edges.map(({ source_name, target_name }) =>
-        [source_name, target_name].sort()
-      ),
-    ).toContainEqual([...entityNames].sort());
+    const deletedModelPath = "watched/deleted-model.ts";
+    const presentUml = await fetchDiagram(
+      base,
+      `kind=uml&target=file&path=${encodeURIComponent(deletedModelPath)}`,
+    );
+    expect(presentUml.status).toBe("ready");
+    expect(frameLabels(definitionsView(presentUml))).toEqual([
+      {
+        root: `WatchedTarget@${deletedModelPath}`,
+        nodes: [`WatchedTarget@${deletedModelPath}`],
+      },
+      {
+        root: `WatchedSource@${deletedModelPath}`,
+        nodes: [`WatchedSource@${deletedModelPath}`, `WatchedTarget@${deletedModelPath}`],
+      },
+    ]);
 
     const modelRemovedChanged = watch.waitFor(
       (message) =>
@@ -1090,10 +1160,11 @@ test("serves live add and remove trees before separately promoted APIs", async (
       (message) =>
         message.type === "cache-ready" && message.version === modelRemovedMessage.version,
     );
-    expect(readActiveRootUmlFootprint(graphDbPath, entityNames)).toEqual({
-      nodes: [],
-      edges: [],
-    });
+    const removedUml = await fetch(
+      `${base}/api/diagram?kind=uml&target=file&path=${encodeURIComponent(deletedModelPath)}`,
+    );
+    expect(removedUml.status).toBe(404);
+    await removedUml.json();
 
     const removedChanged = watch.waitFor(
       (message) =>
@@ -1177,80 +1248,54 @@ test("package diagram errors retain the last promoted snapshot", async () => {
   try {
     await store.ready();
     await withTimeout(promotions.first, "initial cache promotion");
-    const ready = await store.getDiagram("packages", "");
+    const ready = await store.getDiagram({ kind: "packages", scopePath: "" });
     expect(ready.status).toBe("ready");
     const graphDbPath = resolveCacheDbPath(root);
-    const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "packages", "");
+    const readyGraph = readActivePackageGraph(graphDbPath);
+    expect(readyGraph.nodes).toEqual([
+      { node_id: "p0", node_ordinal: 0, node_kind: "package", name: "a" },
+      { node_id: "p1", node_ordinal: 1, node_kind: "package", name: "b" },
+    ]);
+    expect(readyGraph.edges).toEqual([
+      {
+        edge_ordinal: 0,
+        source_node_id: "p0",
+        target_node_id: "p1",
+        edge_kind: "package-dependency",
+        directed: 1,
+        weight: 1,
+      },
+    ]);
+    expect(readyGraph.relations).toEqual([
+      {
+        edge_ordinal: 0,
+        relation_ordinal: 0,
+        relation_kind: "package-dependency",
+        source_node_id: "p0",
+        target_node_id: "p1",
+      },
+    ]);
+    expect(readyGraph.packageNodes).toEqual([
+      { node_id: "p0", package_path: "packages/a" },
+      { node_id: "p1", package_path: "packages/b" },
+    ]);
 
     await writeFile(join(root, "package.json"), "{ malformed");
     await withTimeout(promotions.second, "watch cache promotion");
-    const failed = await store.getDiagram("packages", "");
-    const failedSnapshot = readActiveNormalizedSnapshot(graphDbPath, "packages", "");
-    expectPromotedFallback(
-      readySnapshot,
-      failedSnapshot,
-      ready,
-      failed,
-      (records) => {
-        expect(records).toEqual([
-          {
-            table: "diagram_nodes",
-            kind: "packages",
-            scope_path: "",
-            node_id: "p0",
-            node_ordinal: 0,
-            node_kind: "package",
-            name: "a",
-            community: null,
-          },
-          {
-            table: "diagram_nodes",
-            kind: "packages",
-            scope_path: "",
-            node_id: "p1",
-            node_ordinal: 1,
-            node_kind: "package",
-            name: "b",
-            community: null,
-          },
-          {
-            table: "diagram_edges",
-            kind: "packages",
-            scope_path: "",
-            edge_ordinal: 0,
-            source_node_id: "p0",
-            target_node_id: "p1",
-            edge_kind: "package-dependency",
-            directed: 1,
-            weight: 1,
-          },
-          {
-            table: "diagram_edge_relations",
-            kind: "packages",
-            scope_path: "",
-            edge_ordinal: 0,
-            relation_ordinal: 0,
-            relation_kind: "package-dependency",
-            source_node_id: "p0",
-            target_node_id: "p1",
-          },
-          {
-            table: "package_graph_nodes",
-            kind: "packages",
-            scope_path: "",
-            node_id: "p0",
-            package_path: "packages/a",
-          },
-          {
-            table: "package_graph_nodes",
-            kind: "packages",
-            scope_path: "",
-            node_id: "p1",
-            package_path: "packages/b",
-          },
-        ]);
-      },
-    );
+    const failed = await store.getDiagram({ kind: "packages", scopePath: "" });
+    const failedGraph = readActivePackageGraph(graphDbPath);
+
+    expect(failed.status).toBe("error");
+    expect(failedGraph.generationId).not.toBe(readyGraph.generationId);
+    // The failed rebuild republishes the last good topology rather than an empty graph.
+    expect({ ...failedGraph, generationId: readyGraph.generationId }).toEqual(readyGraph);
+    if (ready.kind !== "packages" || failed.kind !== "packages") {
+      throw new Error("expected package diagram responses");
+    }
+    expect(failed.packageNodes).toEqual(ready.packageNodes);
+    expect(failed.dsl).toBe(ready.dsl);
+    expect(failed.dsls).toEqual(ready.dsls);
+    expect(failed.error).toEqual(expect.any(String));
   } finally {
     try {
       await store.close();
@@ -1260,7 +1305,7 @@ test("package diagram errors retain the last promoted snapshot", async () => {
   }
 }, 30_000);
 
-test("UML extraction errors retain the last promoted normalized graph and response", async () => {
+test("an undecodable source file reports its real error instead of a stale graph", async () => {
   const root = await mkdtemp(join(tmpdir(), "ts-explorer-uml-fallback-"));
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "uml-fallback" }));
   await writeFixtureFile(
@@ -1274,124 +1319,51 @@ test("UML extraction errors retain the last promoted normalized graph and respon
       "",
     ].join("\n"),
   );
+  // A binary asset is a normal subtree member; only a real source decode failure may fail a
+  // directory view.
+  await writeFixtureFile(root, "assets/blob.bin", Buffer.from("blob\0\n"));
 
   const promotions = createPromotionGate();
   const store = new ExplorerStore(root, () => undefined, promotions.notify);
   try {
     await store.ready();
     await withTimeout(promotions.first, "initial UML cache promotion");
-    const ready = await store.getDiagram("uml", "");
+    const target = { kind: "file", path: "model.ts" } as const;
+    const ready = await store.getDiagram({ kind: "uml", target });
     expect(ready.status).toBe("ready");
-    expect(umlDsl(ready)).toContain("FallbackSource");
-    expect(umlDsl(ready)).toContain("FallbackTarget");
-
-    const graphDbPath = resolveCacheDbPath(root);
-    const readySnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
+    expect(frameLabels(definitionsView(ready))).toEqual([
+      { root: "FallbackTarget@model.ts", nodes: ["FallbackTarget@model.ts"] },
+      {
+        root: "FallbackSource@model.ts",
+        nodes: ["FallbackSource@model.ts", "FallbackTarget@model.ts"],
+      },
+    ]);
+    const project = { kind: "directory", path: "" } as const;
+    const readyProject = await store.getDiagram({ kind: "uml", target: project });
+    expect(readyProject.status).toBe("ready");
+    expect(filesView(readyProject).nodes.map((node) => node.path)).toEqual([
+      "assets/blob.bin",
+      "model.ts",
+      "package.json",
+    ]);
 
     // The parser rejects invalid UTF-8, which is the only source-level failure it can observe.
     await writeFile(join(root, "model.ts"), Buffer.from([0x65, 0x78, 0x70, 0xff, 0xfe]));
     await withTimeout(promotions.second, "failed UML cache promotion");
-    const failed = await store.getDiagram("uml", "");
-    await store.close();
-
-    const failedSnapshot = readActiveNormalizedSnapshot(graphDbPath, "uml", "");
-    expectPromotedFallback(
-      readySnapshot,
-      failedSnapshot,
-      ready,
-      failed,
-      (records) => {
-        const nodes = records.filter((record) => record.table === "diagram_nodes");
-        expect(
-          nodes.map(({ node_ordinal, node_kind, name, community }) => ({
-            node_ordinal,
-            node_kind,
-            name,
-            community,
-          })),
-        ).toEqual([
-          { node_ordinal: 1, node_kind: "entity", name: "FallbackSource", community: 0 },
-          { node_ordinal: 0, node_kind: "entity", name: "FallbackTarget", community: 0 },
-        ]);
-        const nodeNames = new Map(nodes.map(({ node_id, name }) => [node_id, name]));
-        expect(
-          records
-            .filter((record) => record.table === "diagram_edges")
-            .map(({
-              edge_ordinal,
-              source_node_id,
-              target_node_id,
-              edge_kind,
-              directed,
-              weight,
-            }) => ({
-              edge_ordinal,
-              source_name: nodeNames.get(source_node_id),
-              target_name: nodeNames.get(target_node_id),
-              edge_kind,
-              directed,
-              weight,
-            })),
-        ).toEqual([
-          {
-            edge_ordinal: 0,
-            source_name: "FallbackSource",
-            target_name: "FallbackTarget",
-            edge_kind: "uml-relation",
-            directed: 0,
-            weight: 1,
-          },
-        ]);
-        expect(
-          records
-            .filter((record) => record.table === "uml_declarations")
-            .map(({
-              kind,
-              scope_path,
-              declaration_ordinal,
-              file_name,
-              member_associations_present,
-            }) => ({
-              kind,
-              scope_path,
-              declaration_ordinal,
-              file_name: file_name.replace(/^.*[\\/]/, ""),
-              member_associations_present,
-            })),
-        ).toEqual([
-          {
-            kind: "uml",
-            scope_path: "",
-            declaration_ordinal: 0,
-            file_name: "model.ts",
-            member_associations_present: 1,
-          },
-        ]);
-        expect(
-          records
-            .filter((record) => record.table === "uml_entities")
-            .map(({ declaration_ordinal, entity_kind, entity_ordinal, node_id }) => ({
-              declaration_ordinal,
-              entity_kind,
-              entity_ordinal,
-              name: nodeNames.get(node_id),
-            })),
-        ).toEqual([
-          {
-            declaration_ordinal: 0,
-            entity_kind: "class",
-            entity_ordinal: 0,
-            name: "FallbackTarget",
-          },
-          {
-            declaration_ordinal: 0,
-            entity_kind: "class",
-            entity_ordinal: 1,
-            name: "FallbackSource",
-          },
-        ]);
-      },
-    );
+    const failed = await store.getDiagram({ kind: "uml", target });
+    expect(failed.status).toBe("error");
+    expect(failed.error).toEqual(expect.any(String));
+    // Keys and edges from the previous generation are never republished under the new catalogue.
+    expect(definitionsView(failed)).toEqual({
+      kind: "definitions",
+      nodes: [],
+      edges: [],
+      frames: [],
+    });
+    const failedProject = await store.getDiagram({ kind: "uml", target: project });
+    expect(failedProject.status).toBe("error");
+    expect(failedProject.error).toContain("model.ts");
+    expect(filesView(failedProject)).toEqual({ kind: "files", nodes: [], edges: [] });
   } finally {
     try {
       await store.close();
@@ -1407,7 +1379,7 @@ test("a malformed root manifest produces the stable empty package error", async 
   const store = new ExplorerStore(root);
   try {
     await store.ready();
-    const response = await store.getDiagram("packages", "");
+    const response = await store.getDiagram({ kind: "packages", scopePath: "" });
     expect(response.status).toBe("error");
     if (response.kind !== "packages") throw new Error("expected a packages diagram response");
     expect(response.dsl).toBe("flowchart LR");
@@ -1446,11 +1418,11 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     const firstDiagram = await (
       await fetch(`${firstBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(firstDiagram.packageNodes).toEqual([
+    expect(packagesPayload(firstDiagram).packageNodes).toEqual([
       { nodeId: "p0", name: "a", path: "packages/a" },
     ]);
     const dbPath = resolveCacheDbPath(root);
-    const recoveredId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
+    const recoveredId = readActivePackageGraph(dbPath).generationId;
     const recoveredStartedAt = openDatabase(dbPath, (db) =>
       queryAll<{ started_at: number }>(db, "SELECT started_at FROM generations ORDER BY id")
     );
@@ -1473,7 +1445,7 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
       await fetch(`${untouchedBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
     expect(untouchedDiagram).toEqual(firstDiagram);
-    expect(readActiveNormalizedSnapshot(dbPath, "packages", "").generationId).toBe(recoveredId);
+    expect(readActivePackageGraph(dbPath).generationId).toBe(recoveredId);
     expect(openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string }>(
         db,
@@ -1499,11 +1471,11 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     const restartedDiagram = await (
       await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(restartedDiagram.packageNodes).toEqual([
+    expect(packagesPayload(restartedDiagram).packageNodes).toEqual([
       { nodeId: "p0", name: "a", path: "packages/a" },
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
-    expect(packagesDsl(restartedDiagram)).toContain("p0 --> p1");
+    expect(packagesPayload(restartedDiagram).dsl).toContain("p0 --> p1");
     const restartedGenerations = openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string; started_at: number }>(
         db,
@@ -1537,13 +1509,13 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     const rebuiltDiagram = await (
       await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(rebuiltDiagram.packageNodes).toEqual([
+    expect(packagesPayload(rebuiltDiagram).packageNodes).toEqual([
       { nodeId: "p0", name: "a", path: "packages/a" },
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
-    expect(packagesDsl(rebuiltDiagram)).toContain("p0 --> p1");
-    expect(packagesDsl(rebuiltDiagram)).not.toBe(packagesDsl(firstDiagram));
-    const rebuiltId = readActiveNormalizedSnapshot(dbPath, "packages", "").generationId;
+    expect(packagesPayload(rebuiltDiagram).dsl).toContain("p0 --> p1");
+    expect(packagesPayload(rebuiltDiagram).dsl).not.toBe(packagesPayload(firstDiagram).dsl);
+    const rebuiltId = readActivePackageGraph(dbPath).generationId;
     expect(rebuiltId).not.toBe(restartedId);
     expect(openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string }>(
@@ -1610,6 +1582,258 @@ test("warm restart serves file content edited while the server was stopped", asy
       await server?.stop();
     } finally {
       await removeFixtureRoot(root);
+    }
+  }
+}, 60_000);
+
+test("serves real file outlines and rejects unusable paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ts-explorer-file-outline-"));
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "file-outline" }));
+  await writeFile(
+    join(root, "outline.ts"),
+    [
+      "export const LIMIT: number = 3;",
+      "export function greet(name: string): string { const local = name; return local; }",
+      "export interface Greeter { greet(name: string): string; }",
+      "export class Box<T> { value!: T; get(): T { return this.value; } }",
+      "export namespace Tools { export const FLAG: boolean = true; export function run(): void {} }",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    join(root, "outline.rs"),
+    [
+      "pub const LIMIT: i32 = 3;",
+      "pub fn greet(name: &str) -> String { let local = name; local.to_owned() }",
+      "pub trait Greeter { fn greet(&self) -> String; }",
+      "pub struct Boxed { pub value: i32 }",
+      "impl Boxed { pub fn read(&self) -> i32 { self.value } }",
+      "pub mod tools { pub const FLAG: bool = true; }",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(join(root, "empty.ts"), "");
+  await writeFile(join(root, "notes.txt"), "plain text\n");
+  let server: ExplorerServer | undefined;
+  try {
+    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const base = `http://127.0.0.1:${server.port}`;
+    const outline = async (path: string) => {
+      const response = await fetch(`${base}/api/file-definitions?path=${encodeURIComponent(path)}`);
+      return { status: response.status, body: await response.json() as { definitions?: FileDefinition[]; error?: string } };
+    };
+
+    const script = await outline("outline.ts");
+    expect(script.status).toBe(200);
+    expect(outlineShape(script.body.definitions ?? [])).toEqual([
+      { qualifiedName: "LIMIT", kind: "constant", type: "number", at: "1:14", parent: null, isTopLevel: true },
+      { qualifiedName: "greet", kind: "function", type: "(name: string): string", at: "2:17", parent: null, isTopLevel: true },
+      { qualifiedName: "Greeter", kind: "interface", type: "Greeter", at: "3:18", parent: null, isTopLevel: true },
+      { qualifiedName: "Greeter.greet", kind: "method", type: "(name: string): string", at: "3:28", parent: "Greeter", isTopLevel: false },
+      { qualifiedName: "Box", kind: "class", type: "Box<T>", at: "4:14", parent: null, isTopLevel: true },
+      { qualifiedName: "Box.value", kind: "property", type: "T", at: "4:23", parent: "Box", isTopLevel: false },
+      { qualifiedName: "Box.get", kind: "method", type: "(): T", at: "4:34", parent: "Box", isTopLevel: false },
+      { qualifiedName: "Tools", kind: "namespace", type: null, at: "5:18", parent: null, isTopLevel: true },
+      { qualifiedName: "Tools.FLAG", kind: "constant", type: "boolean", at: "5:39", parent: "Tools", isTopLevel: false },
+      { qualifiedName: "Tools.run", kind: "function", type: "(): void", at: "5:77", parent: "Tools", isTopLevel: false },
+    ]);
+    expect(script.body.definitions?.every((definition) => definition.source.path === "outline.ts"))
+      .toBe(true);
+
+    const rust = await outline("outline.rs");
+    expect(rust.status).toBe(200);
+    // A Rust `impl` member is owned by the implemented type, never promoted to a file root.
+    expect(outlineShape(rust.body.definitions ?? [])).toEqual([
+      { qualifiedName: "LIMIT", kind: "constant", type: "i32", at: "1:11", parent: null, isTopLevel: true },
+      { qualifiedName: "greet", kind: "function", type: "(name: &str) -> String", at: "2:8", parent: null, isTopLevel: true },
+      { qualifiedName: "Greeter", kind: "trait", type: "Greeter", at: "3:11", parent: null, isTopLevel: true },
+      { qualifiedName: "Greeter.greet", kind: "method", type: "(&self) -> String", at: "3:24", parent: "Greeter", isTopLevel: false },
+      { qualifiedName: "Boxed", kind: "struct", type: "Boxed", at: "4:12", parent: null, isTopLevel: true },
+      { qualifiedName: "Boxed.value", kind: "property", type: "i32", at: "4:24", parent: "Boxed", isTopLevel: false },
+      { qualifiedName: "Boxed.read", kind: "method", type: "(&self) -> i32", at: "5:21", parent: "Boxed", isTopLevel: false },
+      { qualifiedName: "tools", kind: "module", type: null, at: "6:9", parent: null, isTopLevel: true },
+      { qualifiedName: "tools.FLAG", kind: "constant", type: "bool", at: "6:27", parent: "tools", isTopLevel: false },
+    ]);
+
+    // A valid path with no indexed declarations is an empty outline, not an error.
+    for (const path of ["empty.ts", "notes.txt", "missing.ts"]) {
+      const empty = await outline(path);
+      expect(empty.status, path).toBe(200);
+      expect(empty.body.definitions, path).toEqual([]);
+    }
+
+    const missingPath = await fetch(`${base}/api/file-definitions`);
+    expect(missingPath.status).toBe(422);
+    expect(await missingPath.json()).toEqual({ error: "path is required" });
+    const emptyPath = await outline("");
+    expect(emptyPath.status).toBe(422);
+    expect(emptyPath.body).toEqual({ error: "path is required" });
+    const escaping = await outline("../outside.ts");
+    expect(escaping.status).toBe(403);
+    expect(escaping.body).toEqual({ error: "path escapes the source root" });
+  } finally {
+    try {
+      await server?.stop();
+    } finally {
+      await removeFixtureRoot(root);
+    }
+  }
+}, 60_000);
+
+test("the diagram route enforces its typed target contract", async () => {
+  const outerRoot = await mkdtemp(join(tmpdir(), "ts-explorer-diagram-contract-"));
+  const root = join(outerRoot, "project");
+  await mkdir(join(root, "lib"), { recursive: true });
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "diagram-contract" }));
+  await writeFile(join(root, "lib", "leaf.ts"), "export class Leaf {}\n");
+  await writeFile(
+    join(root, "lib", "root.ts"),
+    'import { Leaf } from "./leaf";\nexport class Root { leaf!: Leaf; }\n',
+  );
+  await writeFile(join(root, "empty.ts"), "");
+  await writeFile(join(outerRoot, "outside.ts"), "export class Outside {}\n");
+  await symlink(join(outerRoot, "outside.ts"), join(root, "escape.ts"));
+
+  let server: ExplorerServer | undefined;
+  try {
+    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    const base = `http://127.0.0.1:${server.port}`;
+    const rootKey = await definitionKey(base, "lib/root.ts", "Root");
+    const leafKey = await definitionKey(base, "lib/leaf.ts", "Leaf");
+    const encodedRootKey = encodeURIComponent(rootKey);
+
+    const definition = await fetchDiagram(
+      base,
+      `kind=uml&target=definition&path=lib%2Froot.ts&definition=${encodedRootKey}`,
+    );
+    expect(definition.status).toBe("ready");
+    expect(frameLabels(definitionsView(definition))).toEqual([
+      { root: "Root@lib/root.ts", nodes: ["Leaf@lib/leaf.ts", "Root@lib/root.ts"] },
+    ]);
+
+    // A syntactically valid empty source file is a completed selection with no frames.
+    const empty = await fetchDiagram(base, "kind=uml&target=file&path=empty.ts");
+    expect(empty.status).toBe("ready");
+    expect(definitionsView(empty)).toEqual({
+      kind: "definitions",
+      nodes: [],
+      edges: [],
+      frames: [],
+    });
+
+    for (const invalid of [
+      { name: "missing kind", query: "path=", error: "kind must be packages or uml" },
+      { name: "invalid kind", query: "kind=graph&path=", error: "kind must be packages or uml" },
+      {
+        name: "missing target",
+        query: "kind=uml&path=lib%2Froot.ts",
+        error: "target must be definition, file, or directory",
+      },
+      {
+        name: "invalid target",
+        query: "kind=uml&target=entity&path=lib%2Froot.ts",
+        error: "target must be definition, file, or directory",
+      },
+      { name: "empty file path", query: "kind=uml&target=file&path=", error: "path is required" },
+      {
+        name: "empty definition path",
+        query: `kind=uml&target=definition&path=&definition=${encodedRootKey}`,
+        error: "path is required",
+      },
+      {
+        name: "missing definition key",
+        query: "kind=uml&target=definition&path=lib%2Froot.ts",
+        error: "definition is required",
+      },
+      {
+        name: "empty definition key",
+        query: "kind=uml&target=definition&path=lib%2Froot.ts&definition=",
+        error: "definition is required",
+      },
+      {
+        name: "definition key on a file target",
+        query: `kind=uml&target=file&path=lib%2Froot.ts&definition=${encodedRootKey}`,
+        error: "definition is only valid for a definition target",
+      },
+      {
+        name: "definition key on a directory target",
+        query: `kind=uml&target=directory&path=lib&definition=${encodedRootKey}`,
+        error: "definition is only valid for a definition target",
+      },
+    ]) {
+      const response = await fetch(`${base}/api/diagram?${invalid.query}`);
+      expect(response.status, invalid.name).toBe(422);
+      expect(await response.json(), invalid.name).toEqual({ error: invalid.error });
+    }
+
+    for (const missing of [
+      { name: "missing file", query: "kind=uml&target=file&path=lib%2Fabsent.ts" },
+      { name: "missing directory", query: "kind=uml&target=directory&path=absent" },
+      {
+        name: "unknown definition key",
+        query: "kind=uml&target=definition&path=lib%2Froot.ts"
+          + `&definition=${encodeURIComponent('["lib/root.ts","class","Absent",0]')}`,
+      },
+      {
+        // A real key belonging to another file is not a key of the requested path.
+        name: "definition key from another file",
+        query: `kind=uml&target=definition&path=lib%2Froot.ts&definition=${
+          encodeURIComponent(leafKey)
+        }`,
+      },
+    ]) {
+      const response = await fetch(`${base}/api/diagram?${missing.query}`);
+      expect(response.status, missing.name).toBe(404);
+      expect(await response.json(), missing.name).toEqual({ error: expect.any(String) });
+    }
+
+    for (const mismatch of [
+      { name: "directory as file", query: "kind=uml&target=file&path=lib" },
+      { name: "file as directory", query: "kind=uml&target=directory&path=lib%2Froot.ts" },
+      {
+        name: "directory as definition",
+        query: `kind=uml&target=definition&path=lib&definition=${encodedRootKey}`,
+      },
+    ]) {
+      const response = await fetch(`${base}/api/diagram?${mismatch.query}`);
+      expect(response.status, mismatch.name).toBe(400);
+      expect(await response.json(), mismatch.name).toEqual({
+        error: "diagram target kind does not match path",
+      });
+    }
+
+    for (const forbidden of [
+      {
+        name: "traversing file target",
+        query: `kind=uml&target=file&path=${encodeURIComponent("../outside.ts")}`,
+        error: "path escapes the source root",
+      },
+      {
+        name: "traversing directory target",
+        query: `kind=uml&target=directory&path=${encodeURIComponent("lib/../..")}`,
+        error: "path escapes the source root",
+      },
+      {
+        name: "absolute file target",
+        query: `kind=uml&target=file&path=${encodeURIComponent("/etc/passwd")}`,
+        error: "path must be relative to the source root",
+      },
+      {
+        name: "symlinked file target",
+        query: "kind=uml&target=file&path=escape.ts",
+        error: "symbolic links are not allowed",
+      },
+    ]) {
+      const response = await fetch(`${base}/api/diagram?${forbidden.query}`);
+      expect(response.status, forbidden.name).toBe(403);
+      expect(await response.json(), forbidden.name).toEqual({ error: forbidden.error });
+    }
+  } finally {
+    try {
+      await server?.stop();
+    } finally {
+      await removeFixtureRoot(root);
+      await rm(outerRoot, { recursive: true, force: true });
     }
   }
 }, 60_000);

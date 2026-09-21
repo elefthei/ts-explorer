@@ -9,7 +9,6 @@ import {
 } from "../src/packages.ts";
 import type { PackageInfo } from "../src/types.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { renderDiagramGraph } from "./support/normalized-graph.ts";
 
 const fixtures = createFixtureTracker();
 
@@ -34,13 +33,13 @@ async function materializePackageDiagram(
       generationId,
       packages,
       { graph: extracted, outcome },
-      renderDiagramGraph,
+      renderPackageDiagramGraph,
     );
     const reloaded = cache.readDiagramGraph(generationId, "packages", "");
     if (reloaded?.kind !== "packages") {
       throw new Error("materialized package diagram graph was not found");
     }
-    const rendered = renderDiagramGraph(reloaded);
+    const rendered = renderPackageDiagramGraph(reloaded);
     if (rendered.kind !== "packages") throw new Error("expected a package rendering");
     return {
       extracted,
@@ -83,20 +82,8 @@ test("discovers workspace packages and only workspace dependency edges", async (
   const { extracted, reloaded, rendered, cached } = await materializePackageDiagram(packages);
   expect(reloaded).toEqual(extracted);
   expect(reloaded.nodes).toEqual([
-    {
-      nodeId: "p0",
-      nodeOrdinal: 0,
-      nodeKind: "package",
-      name: "a",
-      community: null,
-    },
-    {
-      nodeId: "p1",
-      nodeOrdinal: 1,
-      nodeKind: "package",
-      name: "b",
-      community: null,
-    },
+    { nodeId: "p0", nodeOrdinal: 0, nodeKind: "package", name: "a" },
+    { nodeId: "p1", nodeOrdinal: 1, nodeKind: "package", name: "b" },
   ]);
   expect(reloaded.packageNodes).toEqual([
     { nodeId: "p0", packagePath: "packages/a" },
@@ -141,7 +128,7 @@ test("discovers workspace packages and only workspace dependency edges", async (
       { nodeId: "p1", name: "b", path: "packages/b" },
     ],
   });
-  expect(rendered).toEqual(renderDiagramGraph(extracted));
+  expect(rendered).toEqual(renderPackageDiagramGraph(extracted));
   expect(cached).toEqual({
     ...rendered,
     scopePath: "",
@@ -168,7 +155,6 @@ test("omits malformed child manifests without crashing", async () => {
       nodeOrdinal: 0,
       nodeKind: "placeholder",
       name: "No workspace packages",
-      community: null,
     },
   ]);
   expect(reloaded.packageNodes).toEqual([{ nodeId: "source", packagePath: null }]);
@@ -185,7 +171,7 @@ test("omits malformed child manifests without crashing", async () => {
     ].join("\n"),
     packageNodes: [],
   });
-  expect(rendered).toEqual(renderDiagramGraph(extracted));
+  expect(rendered).toEqual(renderPackageDiagramGraph(extracted));
 });
  
 test("materializes a bare package error graph without topology rows", async () => {
@@ -194,7 +180,6 @@ test("materializes a bare package error graph without topology rows", async () =
   expect(reloaded).toEqual(extracted);
   expect(reloaded.renderMode).toBe("bare");
   expect(reloaded.nodes).toEqual([]);
-  expect(reloaded.aliases).toEqual([]);
   expect(reloaded.edges).toEqual([]);
   expect(reloaded.relations).toEqual([]);
   expect(reloaded.packageNodes).toEqual([]);
@@ -328,5 +313,5 @@ test("preserves ordered directed dependencies including package self-edges", asy
     "  class p0 package",
     "  class p1 package",
   ].join("\n"));
-  expect(rendered).toEqual(renderDiagramGraph(extracted));
+  expect(rendered).toEqual(renderPackageDiagramGraph(extracted));
 });

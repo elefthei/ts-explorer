@@ -1,19 +1,61 @@
 import { afterEach, expect, test } from "bun:test";
 import { computeHighlightSpans } from "../src/highlight.ts";
-import { parseDefinitionSpans } from "../src/goto-definition.ts";
+import { parseDefinitionSpans, parseFileDefinitions } from "../src/goto-definition.ts";
 import { discoverPackages } from "../src/packages.ts";
+import type { FileDefinition, UmlTarget } from "../src/types.ts";
 import { HIGHLIGHT_TOKENS } from "../src/types.ts";
-import { extractUmlDiagramGraph } from "../src/uml.ts";
-import { validateUmlDiagramGraph } from "../src/uml/render.ts";
+import { validateUmlDiagramGraph } from "../src/uml/graph.ts";
+import type { UmlDefinitionNode } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { expectNormalizedUmlRoundTrip, materializeUmlGraph } from "./support/normalized-graph.ts";
-import { contractFile, extractContract, normalizeRoot } from "./support/uml-contract.ts";
+import { expectFileGraphRoundTrips } from "./support/normalized-graph.ts";
+import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
+const projects: UmlProject[] = [];
 
 afterEach(async () => {
+  for (const project of projects.splice(0)) project.close();
   await fixtures.cleanup();
 });
+
+async function umlProject(prefix: string, files: Record<string, string>): Promise<UmlProject> {
+  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
+  projects.push(project);
+  return project;
+}
+
+/** `qualifiedName@path`: stable across runs and independent of the opaque catalogue key. */
+function label(definition: FileDefinition): string {
+  return `${definition.qualifiedName}@${definition.source.path}`;
+}
+
+/** Node identities, directed edges and frames of one rooted selection. */
+function definitionView(project: UmlProject, target: UmlTarget) {
+  const diagram = readCompleteUml(project, target);
+  const view = diagram.view;
+  if (view.kind !== "definitions") {
+    throw new Error(`expected a definition view for ${JSON.stringify(target)}`);
+  }
+  const names = new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
+  const named = (key: string): string => names.get(key) ?? `<outside the view: ${key}>`;
+  return {
+    status: diagram.status,
+    error: diagram.error,
+    nodes: view.nodes.map((node) => label(node.definition)),
+    kinds: view.nodes.map((node) => `${label(node.definition)} ${node.definition.kind}`),
+    edges: view.edges.map((edge) =>
+      `${named(edge.sourceKey)} -${edge.kind}-> ${named(edge.targetKey)}`
+    ),
+    frames: view.frames.map((frame) =>
+      `${named(frame.rootKey)} => ${frame.nodeKeys.map(named).join(", ")}`
+    ),
+    node(wanted: string): UmlDefinitionNode {
+      const found = view.nodes.find((node) => label(node.definition) === wanted);
+      if (!found) throw new Error(`no node ${wanted} in ${view.nodes.map((n) => label(n.definition)).join(", ")}`);
+      return found;
+    },
+  };
+}
 
 const RUST_SOURCE = `use std::fmt;
 
@@ -47,6 +89,48 @@ impl<'a, T> Widget<'a, T> {
     }
 }
 `;
+
+/**
+ * The declaring file, the trait, the marker implementation, the method implementation and the
+ * leaf are deliberately five separate files, so cross-file ownership and empty `impl` blocks are
+ * exercised independently.
+ */
+const ROOTED_FIXTURE: Record<string, string> = {
+  "lib.rs": `mod root;
+mod contracts;
+mod marker_impl;
+mod methods;
+mod leaf;
+mod child;
+`,
+  "root.rs": "pub struct Root;\n",
+  "contracts.rs": "pub trait LocalTrait {}\n",
+  "marker_impl.rs": `use crate::root::Root;
+use crate::contracts::LocalTrait;
+
+impl LocalTrait for Root {}
+`,
+  "methods.rs": `use crate::root::Root;
+use crate::leaf::Leaf;
+
+impl Root {
+    pub fn make(&self) -> Leaf {
+        Leaf
+    }
+}
+`,
+  "leaf.rs": "pub struct Leaf;\n",
+  "child.rs": `use crate::leaf::Leaf;
+
+pub fn make() -> Leaf {
+    Leaf
+}
+`,
+};
+
+function rootedProject(): Promise<UmlProject> {
+  return umlProject("ts-explorer-rust-rooted-", ROOTED_FIXTURE);
+}
 
 test("highlights Rust with the shared token vocabulary", () => {
   const spans = computeHighlightSpans("lib.rs", RUST_SOURCE);
@@ -142,91 +226,235 @@ test("parses Rust definition spans for entities and impl-contributed methods", (
     .toEqual(spans.map(({ from, to }) => ({ from, to })));
 });
 
-test("resolves Rust entities, heritage and cross-file usage into the shared model", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-rust-model-", {
-    "src/lib.rs": `mod model;
+test("a Rust type reaches its cross-file trait implementation and method dependencies", async () => {
+  const project = await rootedProject();
 
-pub use model::Widget;
+  // `impl LocalTrait for Root {}` declares no member at all, so the type's closure can only be
+  // complete if that file's own graph was processed.
+  expect(project.definitions("marker_impl.rs")).toEqual([]);
+  const markerGraph = project.fileGraph("marker_impl.rs");
+  validateUmlDiagramGraph(markerGraph);
+  expect(markerGraph.relations.map(({ relationKind }) => relationKind)).toEqual(["implements"]);
 
-pub fn build() -> Widget {
-    Widget::new()
+  const view = definitionView(project, {
+    kind: "definition",
+    path: "root.rs",
+    definitionKey: project.key("root.rs", "Root"),
+  });
+
+  expect(view.status).toBe("ready");
+  expect(view.nodes).toEqual(["LocalTrait@contracts.rs", "Leaf@leaf.rs", "Root@root.rs"]);
+  expect(view.edges).toEqual([
+    "Root@root.rs -implements-> LocalTrait@contracts.rs",
+    "Root@root.rs -references-> Leaf@leaf.rs",
+  ]);
+  expect(view.frames).toEqual([
+    "Root@root.rs => LocalTrait@contracts.rs, Leaf@leaf.rs, Root@root.rs",
+  ]);
+});
+
+test("selecting an implemented trait excludes the types that implement it", async () => {
+  const project = await rootedProject();
+
+  const view = definitionView(project, {
+    kind: "definition",
+    path: "contracts.rs",
+    definitionKey: project.key("contracts.rs", "LocalTrait"),
+  });
+
+  // Closures follow outgoing references only; `Root` implements `LocalTrait`, not the reverse.
+  expect(view.nodes).toEqual(["LocalTrait@contracts.rs"]);
+  expect(view.edges).toEqual([]);
+  expect(view.frames).toEqual(["LocalTrait@contracts.rs => LocalTrait@contracts.rs"]);
+});
+
+test("the view keeps native Rust kinds instead of normalizing them to class and interface", async () => {
+  const project = await rootedProject();
+
+  const view = definitionView(project, {
+    kind: "definition",
+    path: "root.rs",
+    definitionKey: project.key("root.rs", "Root"),
+  });
+
+  expect(view.kinds).toEqual([
+    "LocalTrait@contracts.rs trait",
+    "Leaf@leaf.rs struct",
+    "Root@root.rs struct",
+  ]);
+  const trait = view.node("LocalTrait@contracts.rs");
+  expect(trait.detail?.kind).toBe("trait");
+  // The colour category is still the interface style; only the rendered kind label is native.
+  expect(trait.category).toBe("interface");
+  expect(view.node("Root@root.rs").detail?.kind).toBe("struct");
+  expect(view.node("Root@root.rs").category).toBe("concrete");
+});
+
+test("a displayed method row addresses the implementation that declares it", async () => {
+  const project = await rootedProject();
+
+  const view = definitionView(project, {
+    kind: "definition",
+    path: "root.rs",
+    definitionKey: project.key("root.rs", "Root"),
+  });
+  const root = view.node("Root@root.rs");
+  const makeKey = project.key("methods.rs", "Root.make");
+
+  expect(root.detail?.methods).toEqual([
+    { definitionKey: makeKey, modifiers: ["public"], name: "make", returnType: "Leaf" },
+  ]);
+  expect(root.detail?.properties).toEqual([]);
+  // The row navigates to `methods.rs`, not to the type declaration or `child.rs`'s free `make`.
+  expect(root.memberDefinitions.map((member) => ({
+    key: member.key,
+    source: member.source,
+  }))).toEqual([
+    { key: makeKey, source: { path: "methods.rs", line: 5, column: 12 } },
+  ]);
+});
+
+test("a Rust impl member is owned by its type and never becomes a file root", async () => {
+  const project = await rootedProject();
+
+  const [method, ...rest] = project.definitions("methods.rs");
+  expect(rest).toEqual([]);
+  expect(method?.qualifiedName).toBe("Root.make");
+  expect(method?.isTopLevel).toBe(false);
+  expect(method?.parentKey).toBe(project.key("root.rs", "Root"));
+
+  // The implementation file therefore contributes no root frame of its own …
+  const fileView = definitionView(project, { kind: "file", path: "methods.rs" });
+  expect(fileView.status).toBe("ready");
+  expect(fileView.frames).toEqual([]);
+  expect(fileView.nodes).toEqual([]);
+
+  // … while the method stays selectable on its own, with only its own dependencies.
+  const methodView = definitionView(project, {
+    kind: "definition",
+    path: "methods.rs",
+    definitionKey: project.key("methods.rs", "Root.make"),
+  });
+  expect(methodView.nodes).toEqual(["Leaf@leaf.rs", "Root.make@methods.rs"]);
+  expect(methodView.edges).toEqual(["Root.make@methods.rs -references-> Leaf@leaf.rs"]);
+});
+
+test("a module declaration reaches the dependencies of its body file", async () => {
+  const project = await rootedProject();
+
+  const moduleView = definitionView(project, {
+    kind: "definition",
+    path: "lib.rs",
+    definitionKey: project.key("lib.rs", "child"),
+  });
+
+  // `mod child;` has no body in `lib.rs`; its outgoing references come from `child.rs`.
+  expect(moduleView.nodes).toEqual(["Leaf@leaf.rs", "child@lib.rs"]);
+  expect(moduleView.edges).toEqual(["child@lib.rs -references-> Leaf@leaf.rs"]);
+
+  // Opening the body file itself still roots at its own top-level function.
+  const fileView = definitionView(project, { kind: "file", path: "child.rs" });
+  expect(fileView.frames).toEqual(["make@child.rs => make@child.rs, Leaf@leaf.rs"]);
+  expect(fileView.edges).toEqual(["make@child.rs -references-> Leaf@leaf.rs"]);
+});
+
+test("every top-level declaration of a Rust file gets its own frame in source order", async () => {
+  const project = await rootedProject();
+
+  const view = definitionView(project, { kind: "file", path: "lib.rs" });
+
+  expect(view.frames).toEqual([
+    "root@lib.rs => LocalTrait@contracts.rs, Leaf@leaf.rs, root@lib.rs",
+    "contracts@lib.rs => contracts@lib.rs",
+    "marker_impl@lib.rs => marker_impl@lib.rs",
+    "methods@lib.rs => Leaf@leaf.rs, methods@lib.rs",
+    "leaf@lib.rs => leaf@lib.rs",
+    "child@lib.rs => Leaf@leaf.rs, child@lib.rs",
+  ]);
+});
+
+test("use aliases, grouped uses, crate/self/super paths and wildcard modules resolve", async () => {
+  const project = await umlProject("ts-explorer-rust-paths-", {
+    "lib.rs": "pub mod shapes;\npub mod consumers;\npub struct Crate;\n",
+    "shapes.rs": "pub struct Circle;\npub struct Square;\npub struct Triangle;\n",
+    "consumers/mod.rs": `pub mod inner;
+
+pub struct Local;
+
+use self::inner::Consumer;
+
+pub struct Holder {
+    held: Consumer,
 }
 `,
-    "src/model.rs": `pub struct Widget {
-    pub name: String,
-    kind: Kind,
+    "consumers/inner/mod.rs": `pub mod deep;
+
+use crate::shapes::{Circle, Square as Boxy};
+use super::Local;
+use crate::shapes::*;
+
+pub struct Consumer {
+    circle: Circle,
+    aliased: Boxy,
+    parent: Local,
+    starred: Triangle,
 }
+`,
+    "consumers/inner/deep.rs": `use super::super::Local;
+use crate::Crate;
 
-pub enum Kind {
-    Simple,
-}
-
-pub trait Render {
-    fn render(&self) -> String;
-}
-
-impl Render for Widget {
-    fn render(&self) -> String {
-        self.name.clone()
-    }
-}
-
-impl Widget {
-    pub fn new() -> Widget {
-        Widget { name: String::new(), kind: Kind::Simple }
-    }
-
-    pub fn kind(&self) -> Kind {
-        Kind::Simple
-    }
+pub struct Deep {
+    local: Local,
+    root: Crate,
 }
 `,
   });
 
-  const { contract } = await extractContract(root);
-
-  expect(contract.entities.map(({ kind, name, file }) => ({ kind, name, file }))).toEqual([
-    { kind: "class", name: "Widget", file: "src/model.rs" },
-    { kind: "interface", name: "Render", file: "src/model.rs" },
-    { kind: "enum", name: "Kind", file: "src/model.rs" },
+  const consumer = definitionView(project, {
+    kind: "definition",
+    path: "consumers/inner/mod.rs",
+    definitionKey: project.key("consumers/inner/mod.rs", "Consumer"),
+  });
+  expect(consumer.edges).toEqual([
+    "Consumer@consumers/inner/mod.rs -references-> Local@consumers/mod.rs",
+    "Consumer@consumers/inner/mod.rs -references-> Circle@shapes.rs",
+    "Consumer@consumers/inner/mod.rs -references-> Square@shapes.rs",
+    "Consumer@consumers/inner/mod.rs -references-> Triangle@shapes.rs",
   ]);
 
-  const widget = contract.entities[0];
-  expect(widget?.properties).toEqual([
-    { name: "name", type: "String", optional: false, modifiers: ["public"] },
-    { name: "kind", type: "Kind", optional: false, modifiers: ["private"] },
+  // `use self::inner::Consumer;` names the current module's own child module.
+  const holder = definitionView(project, {
+    kind: "definition",
+    path: "consumers/mod.rs",
+    definitionKey: project.key("consumers/mod.rs", "Holder"),
+  });
+  expect(holder.edges).toContain(
+    "Holder@consumers/mod.rs -references-> Consumer@consumers/inner/mod.rs",
+  );
+  // The closure is transitive, so the alias and wildcard targets are reached through `Consumer`.
+  expect(holder.nodes).toEqual([
+    "Consumer@consumers/inner/mod.rs",
+    "Local@consumers/mod.rs",
+    "Holder@consumers/mod.rs",
+    "Circle@shapes.rs",
+    "Square@shapes.rs",
+    "Triangle@shapes.rs",
   ]);
-  // A trait implementation is public through the trait; an inherent `impl` keeps its own `pub`.
-  expect(widget?.methods.map(({ name, modifiers }) => ({ name, modifiers }))).toEqual([
-    { name: "render", modifiers: ["public"] },
-    { name: "new", modifiers: ["public", "static"] },
-    { name: "kind", modifiers: ["public"] },
-  ]);
-  expect(widget?.heritage).toEqual([
-    { kind: "implements", clause: "Render", className: "Widget" },
-  ]);
-  expect(contract.entities[1]?.methods).toEqual([
-    { name: "render", type: "\n§() String", modifiers: ["public", "abstract"] },
-  ]);
-  expect(contract.entities[2]?.enumItems).toEqual(["Simple"]);
 
-  // `Widget::new()` in lib.rs resolves through `mod model;` + `pub use model::Widget`.
-  expect(contract.localUsers).toEqual([
-    {
-      label: "local: src/lib.rs: build()",
-      path: "src/lib.rs",
-      line: 5,
-      column: 8,
-      kind: "function",
-      owner: null,
-      targets: ["Widget"],
-    },
+  // Repeated `super` climbs two module levels; `crate` addresses the crate root file.
+  const deep = definitionView(project, {
+    kind: "definition",
+    path: "consumers/inner/deep.rs",
+    definitionKey: project.key("consumers/inner/deep.rs", "Deep"),
+  });
+  expect(deep.edges).toEqual([
+    "Deep@consumers/inner/deep.rs -references-> Local@consumers/mod.rs",
+    "Deep@consumers/inner/deep.rs -references-> Crate@lib.rs",
   ]);
-  expect(contract.methodReturns).toEqual([{ source: "Widget", target: "Kind" }]);
 });
 
-test("an unresolvable external crate produces no usage edge and no boundary node", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-rust-external-", {
+test("an unresolvable external crate produces no node and no edge", async () => {
+  const project = await umlProject("ts-explorer-rust-external-", {
     "src/lib.rs": `use other_crate::Thing;
 
 pub struct Holder {
@@ -235,13 +463,15 @@ pub struct Holder {
 `,
   });
 
-  const { contract } = await extractContract(root);
+  const view = definitionView(project, {
+    kind: "definition",
+    path: "src/lib.rs",
+    definitionKey: project.key("src/lib.rs", "Holder"),
+  });
 
-  expect(contract.nodes).toEqual([{ name: "Holder", kind: "entity", community: 0 }]);
-  expect(contract.usage).toEqual([]);
-  expect(contract.localUsers).toEqual([]);
-  expect(contract.edges).toEqual([]);
-  expect(contract.relations).toEqual([]);
+  expect(view.nodes).toEqual(["Holder@src/lib.rs"]);
+  expect(view.edges).toEqual([]);
+  expect(view.frames).toEqual(["Holder@src/lib.rs => Holder@src/lib.rs"]);
 });
 
 test("discovers Cargo workspace members and their internal dependencies", async () => {
@@ -271,8 +501,8 @@ serde = "1"
   ]);
 });
 
-test("a mixed TypeScript and Rust scope yields one shared graph", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-mixed-", {
+test("a mixed TypeScript and Rust project keeps each language's closure separate", async () => {
+  const project = await umlProject("ts-explorer-mixed-", {
     "src/ts/model.ts": `export class TsPayload {}
 export class TsService {
   build(): TsPayload {
@@ -296,38 +526,73 @@ impl RsRender for RsPayload {
 `,
   });
 
-  const extracted = await extractUmlDiagramGraph(root, "", []);
-  validateUmlDiagramGraph(extracted);
-
-  const graph = await normalizeRoot(root, extracted);
-  expect(graph.declarations.map(({ fileName, language }) => ({
-    fileName: contractFile(fileName),
-    language,
-  }))).toEqual([
-    { fileName: "src/rs/model.rs", language: "rust" },
-    { fileName: "src/ts/model.ts", language: "typescript" },
+  const service = definitionView(project, {
+    kind: "definition",
+    path: "src/ts/model.ts",
+    definitionKey: project.key("src/ts/model.ts", "TsService"),
+  });
+  expect(service.nodes).toEqual(["TsPayload@src/ts/model.ts", "TsService@src/ts/model.ts"]);
+  expect(service.edges).toEqual([
+    "TsService@src/ts/model.ts -references-> TsPayload@src/ts/model.ts",
   ]);
 
-  const nodeNames = new Set(graph.nodes.map((node) => node.name));
-  expect(nodeNames.has("TsService")).toBe(true);
-  expect(nodeNames.has("TsPayload")).toBe(true);
-  expect(nodeNames.has("RsPayload")).toBe(true);
-  expect(nodeNames.has("RsRender")).toBe(true);
+  const payload = definitionView(project, {
+    kind: "definition",
+    path: "src/rs/model.rs",
+    definitionKey: project.key("src/rs/model.rs", "RsPayload"),
+  });
+  expect(payload.nodes).toEqual(["RsPayload@src/rs/model.rs", "RsRender@src/rs/model.rs"]);
+  // `RsRender::render` returns `RsPayload`, so the pair is a genuine cycle: both directions are
+  // real edges and each is preserved exactly once.
+  expect(payload.edges).toEqual([
+    "RsPayload@src/rs/model.rs -implements-> RsRender@src/rs/model.rs",
+    "RsRender@src/rs/model.rs -references-> RsPayload@src/rs/model.rs",
+  ]);
+  // A same-named declaration in the other language is never pulled in by name.
+  expect(payload.nodes.every((node) => node.endsWith(".rs"))).toBe(true);
+  expect(service.nodes.every((node) => node.endsWith(".ts"))).toBe(true);
 
-  expect(graph.nodes.map((node) => node.nodeOrdinal)).toEqual(
-    graph.nodes.map((_, index) => index),
-  );
+  // Both languages' per-file graphs survive the normalized tables unchanged, so a later
+  // selection read sees exactly what extraction produced.
+  expectFileGraphRoundTrips(project);
+});
 
-  const languageOf = (id: string): "rust" | "typescript" =>
-    id.includes("/rs/") ? "rust" : "typescript";
-  for (const edge of [...graph.usageEdges, ...graph.methodReturnDependencies]) {
-    expect(languageOf(edge.sourceId), edge.sourceId).toBe(languageOf(edge.targetId));
-  }
-  expect(graph.methodReturnDependencies.map(({ sourceName, targetName }) =>
-    `${sourceName}->${targetName}`
-  )).toEqual(["RsRender->RsPayload", "TsService->TsPayload"]);
-
-  const cacheRoot = await fixtures.temporaryRoot("ts-explorer-mixed-cache-");
-  const materialized = await materializeUmlGraph(cacheRoot, extracted);
-  expectNormalizedUmlRoundTrip(materialized.record as typeof extracted, extracted);
-}, 30_000);
+test("outlines Rust declarations with native kinds instead of the UML normalization", () => {
+  const source = [
+    "pub const LIMIT: i32 = 3;",
+    "pub fn greet(name: &str) -> String { let local = name; local.to_owned() }",
+    "pub trait Greeter { fn greet(&self) -> String; }",
+    "pub struct Boxed { pub value: i32 }",
+    "pub union Raw { bits: u32 }",
+    "pub struct Pair(pub i32, String);",
+    "impl Boxed { pub fn read(&self) -> i32 { self.value } }",
+    "pub mod tools { pub const FLAG: bool = true; }",
+    "",
+  ].join("\n");
+  // UML renders `struct`/`union` as `class` and `trait` as `interface`; the outline must not.
+  expect(
+    parseDefinitionSpans("outline.rs", source)
+      .filter((span) => span.kind !== "method")
+      .map((span) => `${span.name} ${span.kind}`),
+  ).toEqual(["Greeter interface", "Boxed class", "Raw class", "Pair class"]);
+  expect(
+    parseFileDefinitions("outline.rs", source).map((definition) =>
+      `${definition.qualifiedName} ${definition.kind} ${definition.type ?? "—"} ${definition.source.line}:${definition.source.column}`
+    ),
+  ).toEqual([
+    "LIMIT constant i32 1:11",
+    "greet function (name: &str) -> String 2:8",
+    "Greeter trait Greeter 3:11",
+    "Greeter.greet method (&self) -> String 3:24",
+    "Boxed struct Boxed 4:12",
+    "Boxed.value property i32 4:24",
+    "Raw union Raw 5:11",
+    "Raw.bits property u32 5:17",
+    "Pair struct Pair 6:12",
+    "Pair.0 property i32 6:21",
+    "Pair.1 property String 6:26",
+    "Boxed.read method (&self) -> i32 7:21",
+    "tools module — 8:9",
+    "tools.FLAG constant bool 8:27",
+  ]);
+});

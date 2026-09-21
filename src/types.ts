@@ -47,6 +47,57 @@ export type GotoDefinitionKind =
   | "type"
   | "method";
 
+/**
+ * Every declaration kind the file outline can surface. These are outline records for the Files
+ * explorer, deliberately wider than `GotoDefinitionKind`, which addresses UML entities only.
+ */
+export const FILE_DEFINITION_KINDS = [
+  "class",
+  "interface",
+  "trait",
+  "struct",
+  "union",
+  "enum",
+  "type",
+  "namespace",
+  "module",
+  "function",
+  "constant",
+  "variable",
+  "property",
+  "method",
+  "constructor",
+  "getter",
+  "setter",
+  "enum-member",
+  "macro",
+] as const;
+
+export type FileDefinitionKind = (typeof FILE_DEFINITION_KINDS)[number];
+
+export type FileDefinition = {
+  /**
+   * `JSON.stringify([path, kind, qualifiedName, occurrence])`. Stable across formatting and
+   * line moves, and distinct for overloads and merged declarations.
+   */
+  key: string;
+  /** Declaring namespace/module/type/member, or `null` for a file-scope declaration. */
+  parentKey: string | null;
+  /** A root the UML pane can select on its own; derived from AST scope, never from dots. */
+  isTopLevel: boolean;
+  name: string;
+  qualifiedName: string;
+  kind: FileDefinitionKind;
+  /** Declared source annotation or callable signature; never a compiler-inferred type. */
+  type: string | null;
+  source: UmlSourceLocation;
+};
+
+export type FileDefinitionsResponse = {
+  version: number;
+  definitions: FileDefinition[];
+};
+
 export type GotoDefinition = {
   key: string;
   kind: GotoDefinitionKind;
@@ -104,31 +155,7 @@ export type DefinitionLookupResponse = {
   definition: UmlSourceLocation | null;
 };
 
-
-export type UmlExternalUserKind =
-  | "method"
-  | "constructor"
-  | "property"
-  | "class"
-  | "function"
-  | "variable"
-  | "type"
-  | "export";
-
 export const UML_METHOD_RETURN_MARKER = "§";
-
-export type UmlExternalUser = {
-  nodeId: string;
-  label: string;
-  scopePath: string;
-  kind: UmlExternalUserKind;
-};
-
-export type UmlLocalUser = UmlSourceLocation & {
-  nodeId: string;
-  label: string;
-  kind: UmlExternalUserKind;
-};
 
 export type SearchResponse = {
   version: number;
@@ -140,19 +167,42 @@ export type SearchResponse = {
   renderDirs: string[];
 };
 
-type DiagramResponseBase = {
+/** What the explorer selection addresses; a definition target carries its outline key. */
+export type UmlTarget =
+  | { kind: "definition"; path: string; definitionKey: string }
+  | { kind: "file"; path: string }
+  | { kind: "directory"; path: string };
+
+export type DiagramRequest =
+  | { kind: "packages"; scopePath: "" }
+  | { kind: "uml"; target: UmlTarget };
+
+/** The manifest dependency graph; its JSON shape is unchanged by the rooted UML redesign. */
+export type PackageDiagramPayload = {
+  kind: "packages";
   scopePath: string;
   status: "ready" | "error";
+  dsl: string;
+  dsls: string[];
   packageNodes: PackageDiagramNode[];
-  definitions: GotoDefinition[];
-  externalUsers: UmlExternalUser[];
-  localUsers: UmlLocalUser[];
+  /** Package diagrams never carry UML navigation rows; the fields stay for wire stability. */
+  definitions: never[];
+  externalUsers: never[];
+  localUsers: never[];
   error?: string;
 };
 
-export type DiagramPayload =
-  | (DiagramResponseBase & { kind: "packages"; dsl: string; dsls: string[] })
-  | (DiagramResponseBase & { kind: "uml"; view: UmlViewModel });
+export type UmlDiagramPayload = {
+  kind: "uml";
+  /** Always `target.path`; kept so existing clients can key a response by scope. */
+  scopePath: string;
+  target: UmlTarget;
+  status: "ready" | "error";
+  view: UmlViewModel;
+  error?: string;
+};
+
+export type DiagramPayload = PackageDiagramPayload | UmlDiagramPayload;
 
 export type DiagramResponse = DiagramPayload & { version: number };
 
@@ -184,4 +234,3 @@ export type WatchMessage =
     type: "cache-ready";
     version: number;
   };
-

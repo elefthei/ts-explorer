@@ -26,11 +26,6 @@ export function highlightLanguageForPath(path: string): LanguageId | undefined {
   return dot < 0 ? undefined : HIGHLIGHT_LANGUAGE_BY_EXTENSION[path.slice(dot)];
 }
 
-export function definitionLanguageForPath(path: string): "typescript" | "tsx" | undefined {
-  const id = highlightLanguageForPath(path);
-  return id === "typescript" || id === "tsx" ? id : undefined;
-}
-
 /** The language whose UML/definition extractor owns `path`, or `undefined` when none does. */
 export function analysisLanguageForPath(
   path: string,
