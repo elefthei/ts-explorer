@@ -36,6 +36,7 @@ import {
 } from "./types.ts";
 import { isTestPath } from "./uml/keys.ts";
 import type {
+  DefinitionBindingKind,
   DefinitionBindingSpace,
   DefinitionBindingTarget,
   DefinitionIndexSnapshot,
@@ -1984,13 +1985,13 @@ export class Cache {
         const cacheKey = JSON.stringify([path, scopeKey, name, space, exported]);
         const cached = bindingCache.get(cacheKey);
         if (cached) return cached;
-        const rows = exported
-          ? this.query.selectExportBindings.all(generationId, path, scopeKey, name, space)
-          : this.query.selectLocalBindings.all(generationId, path, scopeKey, name, space);
+        const rows = this.query.selectBindings.all(
+          generationId, path, scopeKey, name, space, exported ? "export" : "local",
+        );
         let targets = toBindingTargets(rows);
         if (!exported && !targets.length) {
           targets = toBindingTargets(
-            this.query.selectImportBindings.all(generationId, path, scopeKey, name, space),
+            this.query.selectBindings.all(generationId, path, scopeKey, name, space, "import"),
           );
         }
         bindingCache.set(cacheKey, targets);
@@ -2651,34 +2652,14 @@ function prepareQueries(db: Database) {
       WHERE generation_id = ? AND source_node_id = ? AND kind = 'uml'
       ORDER BY target_node_id, relation_kind
     `),
-    selectLocalBindings: db.query<
+    selectBindings: db.query<
       BindingRow,
-      [number, string, string, string, DefinitionBindingSpace]
+      [number, string, string, string, DefinitionBindingSpace, DefinitionBindingKind]
     >(`
       SELECT target_key, target_module_path
       FROM definition_bindings
       WHERE generation_id = ? AND source_path = ? AND scope_key = ?
-        AND name = ? AND space = ? AND binding_kind = 'local'
-      ORDER BY ordinal
-    `),
-    selectImportBindings: db.query<
-      BindingRow,
-      [number, string, string, string, DefinitionBindingSpace]
-    >(`
-      SELECT target_key, target_module_path
-      FROM definition_bindings
-      WHERE generation_id = ? AND source_path = ? AND scope_key = ?
-        AND name = ? AND space = ? AND binding_kind = 'import'
-      ORDER BY ordinal
-    `),
-    selectExportBindings: db.query<
-      BindingRow,
-      [number, string, string, string, DefinitionBindingSpace]
-    >(`
-      SELECT target_key, target_module_path
-      FROM definition_bindings
-      WHERE generation_id = ? AND source_path = ? AND scope_key = ?
-        AND name = ? AND space = ? AND binding_kind = 'export'
+        AND name = ? AND space = ? AND binding_kind = ?
       ORDER BY ordinal
     `),
     selectTreeEntries: db.query<TreeRow, [number]>(`
