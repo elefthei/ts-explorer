@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname, posix } from "node:path";
-import { Database, type Statement } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type DiagramGraph,
@@ -1393,7 +1393,7 @@ export class Cache {
   private readonly db!: Database;
   private readonly graphStore!: PreparedGraphStore;
   private readonly statements!: Array<{ finalize(): void }>;
-  private readonly query!: CacheQueries;
+  private readonly query!: ReturnType<typeof prepareQueries>;
   private readonly recoveryTransaction!: ImmediateTransaction<[number | null]>;
   private readonly discoveryTransaction!: ImmediateTransaction<
     [number, readonly PackageInfo[], CachePackageDiagramInput, PackageDiagramRenderer],
@@ -2256,7 +2256,7 @@ class UmlSelectionReader {
   private readonly definitions = new Map<string, IndexedFileDefinition | undefined>();
 
   constructor(
-    private readonly query: CacheQueries,
+    private readonly query: ReturnType<typeof prepareQueries>,
     private readonly graphStore: PreparedGraphStore,
     private readonly generationId: number,
   ) {}
@@ -2447,134 +2447,7 @@ class UmlSelectionReader {
   }
 }
 
-/** Every prepared statement the cache owns; finalized together on close. */
-type CacheQueries = {
-  selectActiveGeneration: Statement<ActiveGenerationRow, []>;
-  deleteActivePointer: Statement<never, []>;
-  deleteGenerationsExcept: Statement<never, [number]>;
-  deleteAllGenerations: Statement<never, []>;
-  insertGeneration: Statement<never, ["startup" | "watch", number, string]>;
-  upsertPackages: Statement<never, [number, string]>;
-  upsertTreeEntry: Statement<never, [number, string, string, string, "directory" | "file", number]>;
-  upsertDiagram: Statement<never, [number, DiagramKind, string, string]>;
-  upsertFile: Statement<
-    never,
-    [number, string, string | null, string | null, string | null, string | null, LanguageId | null]
-  >;
-  selectFileRaw: Statement<{ raw_content: string | null }, [number, string]>;
-  updateFileDisplay: Statement<
-    never,
-    [string | null, string | null, string | null, LanguageId | null, number, string]
-  >;
-  deleteScopeGotoDefs: Statement<never, [number, string]>;
-  insertGotoDefinition: Statement<
-    never,
-    [
-      number,
-      string,
-      GotoDefinitionKind,
-      string,
-      string,
-      string,
-      number,
-      number,
-      number,
-      number,
-      string,
-      string,
-      string | null,
-      number | null,
-    ]
-  >;
-  deleteGenerationDefinitionIndex: Statement<never, [number]>;
-  deleteGenerationBindings: Statement<never, [number]>;
-  deleteGenerationContributors: Statement<never, [number]>;
-  deleteGenerationImports: Statement<never, [number]>;
-  insertDefinitionIndex: Statement<
-    never,
-    [
-      number,
-      string,
-      string | null,
-      number,
-      number,
-      string,
-      string,
-      string,
-      FileDefinitionKind,
-      string | null,
-      number,
-      number,
-    ]
-  >;
-  insertDefinitionBinding: Statement<
-    never,
-    [
-      number,
-      string,
-      string,
-      string,
-      DefinitionBindingSpace,
-      "local" | "import" | "export",
-      number,
-      string | null,
-      string | null,
-    ]
-  >;
-  insertDefinitionContributor: Statement<
-    never,
-    [number, string, string, "declaration" | "implementation" | "module"]
-  >;
-  insertFileImport: Statement<never, [number, string, string]>;
-  selectDefinitionIndexEntry: Statement<DefinitionLocationRow, [string, string, string]>;
-  selectFileDefinitions: Statement<DefinitionIndexRow, [number, string]>;
-  selectTopLevelDefinitions: Statement<DefinitionIndexRow, [number, string]>;
-  selectDefinitionByKey: Statement<DefinitionIndexRow, [number, string]>;
-  selectDefinitionChildren: Statement<DefinitionIndexRow, [number, string]>;
-  selectContributors: Statement<ContributorRow, [number, string]>;
-  selectContributedKeys: Statement<{ definition_key: string }, [number, string]>;
-  selectOutgoingRelations: Statement<RelationRow, [number, string]>;
-  selectLocalBindings: Statement<
-    BindingRow,
-    [number, string, string, string, DefinitionBindingSpace]
-  >;
-  selectImportBindings: Statement<
-    BindingRow,
-    [number, string, string, string, DefinitionBindingSpace]
-  >;
-  selectExportBindings: Statement<
-    BindingRow,
-    [number, string, string, string, DefinitionBindingSpace]
-  >;
-  selectTreeEntries: Statement<TreeRow, [number]>;
-  selectTreeChildren: Statement<TreeRow, [number, string, string]>;
-  selectTreeEntry: Statement<TreeRow, [number, string]>;
-  selectDirectoryFiles: Statement<{ path: string }, [number, string, string]>;
-  selectAllFiles: Statement<{ path: string }, [number]>;
-  selectDirectoryImports: Statement<
-    { source_path: string; target_path: string },
-    [number, string, string]
-  >;
-  selectAllImports: Statement<{ source_path: string; target_path: string }, [number]>;
-  selectPackages: Statement<PackageRow, [number]>;
-  selectDiagram: Statement<DiagramRow, [number, DiagramKind, string]>;
-  selectFailedDiagram: Statement<{ scope_path: string }, [number]>;
-  selectFile: Statement<FileRow, [number, string]>;
-  selectDefinition: Statement<GotoDefinitionRow, [number, string, number, number]>;
-  selectDefinitions: Statement<GotoDefinitionRow, [number, string]>;
-  selectIndexedSearchCandidates: Statement<SearchCandidateRow, [number, string]>;
-  selectScanSearchCandidates: Statement<SearchCandidateRow, [number]>;
-  selectIndexedDefinitionCandidates: Statement<GotoDefinitionRow, [number, string, string]>;
-  selectScanDefinitionCandidates: Statement<GotoDefinitionRow, [number]>;
-  markGenerationActive: Statement<never, [number, number]>;
-  upsertActivePointer: Statement<never, [string]>;
-  deleteInactiveGeneration: Statement<never, [number]>;
-  markGenerationFailed: Statement<never, [number, number]>;
-  optimizeSearch: Statement<never, []>;
-  optimizeGotoDefinitionSearch: Statement<never, []>;
-};
-
-function prepareQueries(db: Database): CacheQueries {
+function prepareQueries(db: Database) {
   return {
     selectActiveGeneration: db.query<ActiveGenerationRow, []>(`
       SELECT generations.id AS id, generations.source_fingerprint AS source_fingerprint
