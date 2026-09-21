@@ -124,3 +124,14 @@ test("rendering the same model twice produces identical DSL", async () => {
   };
   expect(render(project, target).dsl).toBe(render(project, target).dsl);
 });
+
+test("a rooted selection is laid out top-down", async () => {
+  const project = await openFixture("ts-explorer-uml-bfs-direction-");
+  const frame = render(project, {
+    kind: "definition",
+    path: "src/root.ts",
+    definitionKey: project.key("src/root.ts", "Root"),
+  });
+  expect(frame.dsl.split("\n").slice(0, 2).map((line) => line.trim()))
+    .toEqual(["classDiagram", "direction TB"]);
+});

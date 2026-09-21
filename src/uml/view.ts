@@ -112,7 +112,7 @@ function renderDefinitionFrame(
     }
   }
 
-  const lines = ["classDiagram"];
+  const lines = ["classDiagram", "direction TB"];
   const labels: string[] = [];
   const classes: string[] = [];
   const definitionLinks: RenderedUmlFrame["definitionLinks"] = [];
