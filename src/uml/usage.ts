@@ -131,11 +131,8 @@ export class ReferenceContext {
       if (exported.length) {
         return [...new Set(exported.flatMap((target) => (target.kind === "definition" ? [target.key] : [])))];
       }
-      // An out-of-line Rust module exposes its body file's own top-level declarations.
-      return this.index.members(definition.key)
-        .filter((member) => member.name === name)
-        .map((member) => member.key);
     }
+    // Also handles an out-of-line Rust module's body-file declarations.
     return this.index.members(definition.key)
       .filter((member) => member.name === name)
       .map((member) => member.key);
