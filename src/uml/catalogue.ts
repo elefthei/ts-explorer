@@ -401,13 +401,10 @@ function joinModulePath(base: string, relativePath: string): string | undefined 
   return joined;
 }
 
-type Catalogue = {
-  readonly byPath: ReadonlyMap<string, FileFacts>;
-  readonly canonicalPaths: ReadonlySet<string>;
-};
+type Catalogue = ReadonlyMap<string, FileFacts>;
 
 function canonicalModule(catalogue: Catalogue, candidate: string | undefined): string | undefined {
-  return candidate !== undefined && catalogue.canonicalPaths.has(candidate) ? candidate : undefined;
+  return candidate !== undefined && catalogue.has(candidate) ? candidate : undefined;
 }
 
 /** Project-contained relative script specifiers only; anything else is intentionally unresolved. */
@@ -444,8 +441,8 @@ function crateRootDirectory(catalogue: Catalogue, path: string): string | undefi
   if (directory === ".") directory = "";
   for (;;) {
     if (
-      catalogue.canonicalPaths.has(directory ? `${directory}/lib.rs` : "lib.rs")
-      || catalogue.canonicalPaths.has(directory ? `${directory}/main.rs` : "main.rs")
+      catalogue.has(directory ? `${directory}/lib.rs` : "lib.rs")
+      || catalogue.has(directory ? `${directory}/main.rs` : "main.rs")
     ) return directory;
     if (!directory) return undefined;
     const parent = dirname(directory);
@@ -581,8 +578,7 @@ export function buildCatalogue(
   files: readonly FileFacts[],
   entries: readonly TreeNode[],
 ): DefinitionIndexSnapshot {
-  const byPath = new Map(files.map((facts) => [facts.path, facts] as const));
-  const catalogue: Catalogue = { byPath, canonicalPaths: new Set(byPath.keys()) };
+  const catalogue: Catalogue = new Map(files.map((facts) => [facts.path, facts] as const));
   const byKey = new Map<string, IndexedFileDefinition>();
   for (const facts of files) {
     for (const definition of facts.definitions) byKey.set(definition.key, definition);
@@ -629,7 +625,7 @@ export function buildCatalogue(
     const guard = `${path}\u0000${name}\u0000${space}`;
     if (visited.has(guard)) return [];
     visited.add(guard);
-    const facts = byPath.get(path);
+    const facts = catalogue.get(path);
     if (!facts) return [];
     const own = exportedTable(path).get(nameKey(name, space));
     if (own?.length) return own.map((key) => ({ kind: "definition", key } as const));
