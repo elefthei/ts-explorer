@@ -135,3 +135,52 @@ test("a rooted selection is laid out top-down", async () => {
   expect(frame.dsl.split("\n").slice(0, 2).map((line) => line.trim()))
     .toEqual(["classDiagram", "direction TB"]);
 });
+
+test("Attributes, Methods and Types change compartments, never the graph", async () => {
+  const project = await openFixture("ts-explorer-uml-bfs-compartments-");
+  const target: UmlTarget = {
+    kind: "definition",
+    path: "src/root.ts",
+    definitionKey: project.key("src/root.ts", "Root"),
+  };
+
+  const full = render(project, target);
+  const shape = relationRows(full.dsl);
+  for (const overrides of [{ attributes: false }, { methods: false }, { types: false }]) {
+    const label = JSON.stringify(overrides);
+    const frame = render(project, target, overrides);
+    expect(relationRows(frame.dsl), label).toEqual(shape);
+    expect(names(frame), label).toEqual(names(full));
+  }
+
+  // Attributes off really did drop the rows it owns.
+  expect(full.definitionLinks.some((link) => link.attributes.length > 0)).toBe(true);
+  expect(
+    render(project, target, { attributes: false })
+      .definitionLinks.every((link) => link.attributes.length === 0),
+  ).toBe(true);
+});
+
+test("the Tests checkbox removes test nodes and explains a hidden root", async () => {
+  const project = await openFixture("ts-explorer-uml-bfs-tests-");
+
+  const probeTarget: UmlTarget = {
+    kind: "definition",
+    path: "test/probe.test.ts",
+    definitionKey: project.key("test/probe.test.ts", "Probe"),
+  };
+  expect(names(render(project, probeTarget))).toEqual(["Probe", "Shared"]);
+
+  const hidden = render(project, probeTarget, { tests: false });
+  expect(hidden.emptyMessage).toBe("Selected definition is hidden by the Tests filter.");
+  expect(hidden.dsl).toBe("");
+
+  // A non-test root is untouched by the same switch.
+  const rootTarget: UmlTarget = {
+    kind: "definition",
+    path: "src/root.ts",
+    definitionKey: project.key("src/root.ts", "Root"),
+  };
+  expect(relationRows(render(project, rootTarget, { tests: false }).dsl))
+    .toEqual(relationRows(render(project, rootTarget).dsl));
+});
