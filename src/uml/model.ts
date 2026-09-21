@@ -1,8 +1,5 @@
-import type { Node } from "@vscode/tree-sitter-wasm";
 import type { UmlCategoryKind } from "../diagram-graph.ts";
 import type { FileDefinition, FileDefinitionKind, TreeNode } from "../types.ts";
-
-export type SourceUnit = { path: string; root: Node };
 
 /**
  * Canonical order: a member's modifiers are always emitted in this order, in every language.

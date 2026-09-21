@@ -34,13 +34,6 @@ export type UmlViewModel =
     edges: { sourcePath: string; targetPath: string }[];
   };
 
-export const EMPTY_UML_VIEW_MODEL: UmlViewModel = {
-  kind: "definitions",
-  nodes: [],
-  edges: [],
-  frames: [],
-};
-
 export type RenderedUmlFrame = {
   dsl: string;
   title: string;

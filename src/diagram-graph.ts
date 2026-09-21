@@ -1,8 +1,4 @@
-import type {
-  FileDefinitionKind,
-  PackageDiagramNode,
-  PackageDiagramPayload,
-} from "./types.ts";
+import type { FileDefinitionKind, PackageDiagramNode } from "./types.ts";
 import type { UmlModifier } from "./uml/model.ts";
 
 export const DIAGRAM_GRAPH_FORMAT_VERSION = 2 as const;
@@ -124,5 +120,3 @@ export type RenderedPackageDiagram = {
   externalUsers: never[];
   localUsers: never[];
 };
-
-export type { PackageDiagramPayload };

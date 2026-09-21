@@ -8,8 +8,6 @@ import type {
   UmlModifier,
 } from "./model.ts";
 
-export { validateUmlDiagramGraph };
-
 export type HydratedFileNominalModel = {
   entities: Map<string, UmlEntityModel>;
   categories: Map<string, { category: UmlCategoryKind; isTest: boolean }>;
