@@ -363,10 +363,6 @@ function targetForNode(node: TreeNode): UmlTarget {
     : { kind: "file", path: node.path };
 }
 
-function isSelectedTarget(target: UmlTarget): boolean {
-  return diagramKey(state.umlTarget) === diagramKey(target);
-}
-
 function definitionRowKey(definition: FileDefinition): string {
   return JSON.stringify(["definition", definition.key]);
 }
@@ -381,11 +377,9 @@ function desiredDefinitions(path: string): DesiredRow["definitions"] {
   return entry.definitions.map((definition) => ({
     key: definitionRowKey(definition),
     definition,
-    selected: isSelectedTarget({
-      kind: "definition",
-      path: definition.source.path,
-      definitionKey: definition.key,
-    }),
+    selected: state.umlTarget.kind === "definition"
+      && state.umlTarget.path === definition.source.path
+      && state.umlTarget.definitionKey === definition.key,
   }));
 }
 
@@ -410,7 +404,7 @@ function buildDesiredRow(node: TreeNode, filter: string): DesiredRow | null {
     node,
     expanded,
     searchMatch: hasSearchMatch,
-    selected: isSelectedTarget(targetForNode(node)),
+    selected: state.umlTarget.kind === node.kind && state.umlTarget.path === node.path,
     definitions: !isDir && expanded ? desiredDefinitions(node.path) : undefined,
     children,
   };

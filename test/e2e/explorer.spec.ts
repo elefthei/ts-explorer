@@ -957,6 +957,10 @@ test("tree labels select UML targets while chevrons only change expansion", asyn
     await rootRow.click();
     await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
     await expect(rootRow).toHaveAttribute("aria-current", "true");
+    await expect(definitionRow(page, "feature/root.ts", "Isolated"))
+      .not.toHaveAttribute("aria-current", "true");
+    await expect(definitionRow(page, "feature/root.ts", "Root.run"))
+      .not.toHaveAttribute("aria-current", "true");
     await expect(treeRow(page, "feature/root.ts")).not.toHaveAttribute("aria-current", "true");
     await expect(page.locator("#editor-panel")).toBeHidden();
     // Outgoing transitive closure only: Consumer imports Root, Isolated is a sibling root.
@@ -965,6 +969,9 @@ test("tree labels select UML targets while chevrons only change expansion", asyn
     // A method is its own root and carries only its own outgoing references.
     await definitionRow(page, "feature/root.ts", "Root.run").click();
     await expect(frameHeadings(page)).toHaveText(["Root.run · feature/root.ts"], { timeout: 60_000 });
+    await expect(definitionRow(page, "feature/root.ts", "Root.run"))
+      .toHaveAttribute("aria-current", "true");
+    await expect(rootRow).not.toHaveAttribute("aria-current", "true");
     expect(await diagramNodeNames(page)).toEqual(["B", "C", "run"]);
 
     // A directory label selects the file-import view for that subtree.
