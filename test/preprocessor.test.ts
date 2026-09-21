@@ -1583,6 +1583,9 @@ test("preprocesses each visible scope once and serves formatted files and litera
       ...renderPackageDiagramGraph(packageGraph),
       scopePath: "",
       status: "ready",
+      definitions: [],
+      externalUsers: [],
+      localUsers: [],
     });
 
     for (const scopePath of umlScopePaths) {

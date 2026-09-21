@@ -116,7 +116,4 @@ export type RenderedPackageDiagram = {
   dsl: string;
   dsls: string[];
   packageNodes: PackageDiagramNode[];
-  definitions: never[];
-  externalUsers: never[];
-  localUsers: never[];
 };

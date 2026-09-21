@@ -133,6 +133,9 @@ test("discovers workspace packages and only workspace dependency edges", async (
     ...rendered,
     scopePath: "",
     status: "ready",
+    definitions: [],
+    externalUsers: [],
+    localUsers: [],
   });
 });
 
@@ -188,14 +191,14 @@ test("materializes a bare package error graph without topology rows", async () =
     dsl: "flowchart LR",
     dsls: ["flowchart LR"],
     packageNodes: [],
-    definitions: [],
-    externalUsers: [],
-    localUsers: [],
   });
   expect(cached).toEqual({
     ...rendered,
     scopePath: "",
     status: "error",
+    definitions: [],
+    externalUsers: [],
+    localUsers: [],
     error: "package discovery failed",
   });
 });

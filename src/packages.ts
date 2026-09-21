@@ -336,9 +336,6 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedP
       dsl,
       dsls: [dsl],
       packageNodes: [],
-      definitions: [],
-      externalUsers: [],
-      localUsers: [],
     };
   }
 
@@ -370,9 +367,6 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedP
     dsl,
     dsls: [dsl],
     packageNodes,
-    definitions: [],
-    externalUsers: [],
-    localUsers: [],
   };
 }
 

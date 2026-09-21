@@ -100,6 +100,9 @@ export function materializePackageGraph(
       ...rendered,
       scopePath: "",
       status: outcome.status,
+      definitions: [],
+      externalUsers: [],
+      localUsers: [],
       ...(outcome.status === "error" ? { error: outcome.error } : {}),
     });
     return { extracted, reloaded, rendered, cached };
