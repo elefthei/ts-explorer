@@ -1589,6 +1589,139 @@ test("search results select definition roots and open their sources", async ({ b
   }
 });
 
+test("dismisses search results outside the search control", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    resource.context = await browser.newContext();
+    resource.page = await resource.context.newPage();
+    const page = resource.page;
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    const cli = resource.clis.at(-1);
+    if (!cli) throw new Error("managed CLI was not registered");
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "dismissal fixture cache-ready");
+
+    const isRootSearch = (url: URL): boolean =>
+      url.pathname === "/api/search" &&
+      url.searchParams.get("q") === "Root" &&
+      url.searchParams.get("caseInsensitive") === "false";
+    const searchInput = page.locator("#node-search");
+    const results = page.locator("#definition-results");
+    const rootResult = results
+      .locator(".definition-result", { hasText: "class · Root" })
+      .filter({ hasText: "feature/root.ts:2" });
+    const rootFile = treeRow(page, "feature/root.ts");
+    const filesHeading = page.locator(".sidebar-head h2");
+
+    const committed = page.waitForResponse((response) => isRootSearch(new URL(response.url())));
+    await searchInput.fill("Root");
+    await searchInput.press("Enter");
+    const committedResponse = await committed;
+    expect(committedResponse.status()).toBe(200);
+    let searchVersion = (await committedResponse.json() as SearchResponse).version;
+    await expect(rootResult).toBeVisible();
+    await expect(rootFile).toHaveClass(/\bsearch-match\b/);
+
+    const searchCalls = countRequests(page, (url) => url.pathname === "/api/search");
+    try {
+      // Dismissal is presentation-only: query, matches and highlight all survive it.
+      await searchInput.click();
+      await expect(rootResult).toBeVisible();
+      await filesHeading.click();
+      await expect(results).toBeHidden();
+      await expect(searchInput).toHaveValue("Root");
+      await expect(rootFile).toHaveClass(/\bsearch-match\b/);
+      await searchInput.click();
+      await expect(rootResult).toBeVisible();
+      await afterTwoAnimationFrames(page);
+      expect(searchCalls.count).toBe(0);
+
+      // A file chevron stops click propagation; it must still expand while dismissing.
+      await collapseTree(page, "feature/root.ts");
+      await searchInput.click();
+      await expect(rootResult).toBeVisible();
+      const rootToggle = treeToggle(page, "feature/root.ts");
+      await rootToggle.click();
+      await expect(results).toBeHidden();
+      await expect(rootToggle).toHaveAttribute("aria-expanded", "true");
+      expect(searchCalls.count).toBe(0);
+    } finally {
+      searchCalls.stop();
+    }
+
+    // A dismissal taken while the search is in flight survives the response landing.
+    const gate = createResponseGate(isRootSearch);
+    await page.route("**/api/search?*", gate.handler);
+    try {
+      const held = page.waitForResponse((response) => isRootSearch(new URL(response.url())));
+      await searchInput.click();
+      await searchInput.press("Enter");
+      await withBound(gate.captured, 30_000, "held Root search");
+      await expect(results.locator(".definition-result")).toHaveCount(0);
+      await filesHeading.click();
+      gate.release();
+      await withBound(gate.finished, 15_000, "released Root search");
+      const heldResponse = await held;
+      expect(heldResponse.status()).toBe(200);
+      await heldResponse.finished();
+      await afterTwoAnimationFrames(page);
+      await expect(rootFile).toHaveClass(/\bsearch-match\b/);
+      await expect(searchInput).toHaveValue("Root");
+      await expect(results).toBeHidden();
+      searchVersion = (await heldResponse.json() as SearchResponse).version;
+    } finally {
+      gate.release();
+      await page.unroute("**/api/search?*", gate.handler);
+    }
+
+    // The watcher-shared refresh re-runs the committed search; it must not reopen the popup.
+    const refreshed = page.waitForResponse(async (response) => {
+      if (!isRootSearch(new URL(response.url())) || response.status() !== 200) return false;
+      return (await response.json() as SearchResponse).version > searchVersion;
+    }, { timeout: 45_000 });
+    await writeFile(join(fixtureRoot, "unrelated.ts"), "export class Unrelated { value = 1; }\n");
+    await expect.poll(
+      () =>
+        watch.history
+          .filter((message) =>
+            message.type === "cache-ready" && message.version > searchVersion
+          )
+          .at(-1)?.version ?? searchVersion,
+      {
+        message: `a promoted cache-ready version after editing the dismissal fixture\n${describeCli(cli)}`,
+        timeout: 45_000,
+      },
+    ).toBeGreaterThan(searchVersion);
+    const refreshedResponse = await refreshed;
+    await refreshedResponse.finished();
+    await afterTwoAnimationFrames(page);
+    await expect(searchInput).toHaveValue("Root");
+    await expect(rootFile).toHaveClass(/\bsearch-match\b/);
+    await expect(results).toBeHidden();
+
+    const refreshCalls = countRequests(page, (url) => url.pathname === "/api/search");
+    try {
+      await searchInput.click();
+      await expect(rootResult).toBeVisible();
+      await afterTwoAnimationFrames(page);
+      expect(refreshCalls.count).toBe(0);
+    } finally {
+      refreshCalls.stop();
+    }
+
+    // Emptying the query clears what dismissal deliberately kept.
+    await searchInput.fill("");
+    await expect(results).toBeHidden();
+    // Clearing drops the search-forced expansion too, so assert on the highlight set itself.
+    await expect(page.locator("#tree .tree-row.search-match")).toHaveCount(0);
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
 test("pans and zooms the diagram viewport", async ({ browser }) => {
   test.setTimeout(150_000);
   const resource = registerResource();

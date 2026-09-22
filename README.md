@@ -91,7 +91,7 @@ switches to 1 s polling for those roots, because the redirector does not deliver
 - Double-click a file, a definition, a diagram box, or a search result to open its source in the read-only editor; `Ctrl`+`Enter` does the same from the keyboard. Files with no indexed declarations, including non-source files, expand to `No definitions`.
 - The editor shows the Prettier-formatted source produced during preprocessing (Rust is served exactly as written), syntax-highlighted from spans the server computes with tree-sitter. It is never editable, and the explorer never writes to the inspected project.
 - Class, interface, enum, type, and method names are underlined in the editor. Click one to jump straight to its declaration; the target comes from a definition index written at the start of every preprocessing generation, so the jump never waits on UML extraction of the target file.
-- Search matches file contents and definition names. Selecting a definition result roots the UML graph at that declaration; double-clicking it opens the source.
+- Search matches file contents and definition names. Selecting a definition result roots the UML graph at that declaration; double-clicking it opens the source. Clicking anywhere outside the search box hides the result list while keeping the query, the matches, and the tree highlighting; focusing or clicking the box shows them again without re-running the search.
 - The graph supports wheel zoom, pointer-drag panning, and reset-to-fit controls.
 - The browser receives filesystem changes over WebSocket and refreshes the tree and current diagram without polling.
 

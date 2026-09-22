@@ -63,6 +63,8 @@ const state = {
   searchFiles: new Set<string>(),
   searchDirs: new Set<string>(),
   searchDefinitions: [] as GotoDefinition[],
+  /** Presentation-only dropdown visibility; retained matches survive a dismissal. */
+  searchResultsOpen: false,
   version: 0,
   file: null as FileResponse | null,
   view: null as EditorView | null,
@@ -918,6 +920,12 @@ function restoreUmlView(): void {
 // Search
 // ---------------------------------------------------------------------------
 
+/** Toggles the definition-result popup; an empty result set always stays hidden. */
+function setSearchResultsOpen(open: boolean): void {
+  state.searchResultsOpen = open;
+  $("#definition-results").hidden = !open || state.searchDefinitions.length === 0;
+}
+
 function renderDefinitionResults(): void {
   const results = $("#definition-results");
   const keys = state.searchDefinitions.map((definition) =>
@@ -952,7 +960,7 @@ function renderDefinitionResults(): void {
       void openFile(definition.source.path, definition.source);
     };
   }
-  results.hidden = state.searchDefinitions.length === 0;
+  setSearchResultsOpen(state.searchResultsOpen);
 }
 
 /** Resolves a search hit to its outline key by exact source position, name and qualified name. */
@@ -983,6 +991,7 @@ async function selectSearchDefinition(definition: GotoDefinition): Promise<void>
 }
 
 function clearSearch(): void {
+  setSearchResultsOpen(false);
   definitionRequests.next();
   searchRequests.next();
   state.search = "";
@@ -1606,11 +1615,22 @@ function findTreeNode(root: TreeNode | null, path: string): TreeNode | undefined
 // ---------------------------------------------------------------------------
 
 const nodeSearch = $("#node-search");
+const definitionSearch = $<HTMLElement>(".definition-search");
+// Capture phase: tree disclosure buttons stop click propagation, so a bubbling
+// listener would never observe those dismissals.
+document.addEventListener("pointerdown", (event) => {
+  if (!(event.target instanceof Node) || definitionSearch.contains(event.target)) return;
+  setSearchResultsOpen(false);
+}, true);
 nodeSearch.onkeydown = (event) => {
   if (event.key !== "Enter") return;
   event.preventDefault();
+  setSearchResultsOpen(true);
   void commitSearch(nodeSearch.value.trim(), $("#search-case-insensitive").checked);
 };
+// Refocusing or clicking the input reveals retained matches without refetching.
+nodeSearch.onfocus = () => setSearchResultsOpen(true);
+nodeSearch.onclick = () => setSearchResultsOpen(true);
 nodeSearch.oninput = () => {
   if (nodeSearch.value !== "") return;
   clearSearch();
