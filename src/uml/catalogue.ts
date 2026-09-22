@@ -5,7 +5,7 @@ import { children, namedChildren } from "../lang/ast.ts";
 import { highlightLanguageForPath } from "../lang/registry.ts";
 import { rustVisibility } from "../lang/rust.ts";
 import { canonicalScopeKey } from "./keys.ts";
-import type { FileDefinitionKind, TreeNode } from "../types.ts";
+import type { FileDefinitionKind, PackageInfo, TreeNode } from "../types.ts";
 import type {
   DefinitionBinding,
   DefinitionBindingSpace,
@@ -44,7 +44,8 @@ const BINDING_SPACES: Record<FileDefinitionKind, readonly DefinitionBindingSpace
 
 type ScriptImportBinding = { local: string; imported: string };
 type ScriptImport = { specifier: string; bindings: ScriptImportBinding[] };
-type RustUseLeaf = { segments: string[]; local: string; exported: boolean };
+/** `scopeKey` is `""` for file scope, otherwise the enclosing inline module's definition key. */
+type RustUseLeaf = { segments: string[]; local: string; exported: boolean; scopeKey: string };
 type RustModuleDeclaration = { key: string; name: string; inline: boolean; pathAttribute?: string };
 
 /**
@@ -227,12 +228,13 @@ function rustUseLeaves(
   node: Node,
   prefix: readonly string[],
   exported: boolean,
+  scopeKey: string,
   out: RustUseLeaf[],
 ): void {
   if (node.type === "use_wildcard") {
     const path = node.namedChild(0);
     const segments = path ? rustPathSegments(path) : [];
-    if (segments) out.push({ segments: [...prefix, ...segments], local: "*", exported });
+    if (segments) out.push({ segments: [...prefix, ...segments], local: "*", exported, scopeKey });
     return;
   }
   if (node.type === "use_as_clause") {
@@ -240,7 +242,7 @@ function rustUseLeaves(
     const alias = node.childForFieldName("alias");
     const segments = path ? rustPathSegments(path) : undefined;
     if (!segments || !alias) return;
-    out.push({ segments: [...prefix, ...segments], local: alias.text, exported });
+    out.push({ segments: [...prefix, ...segments], local: alias.text, exported, scopeKey });
     return;
   }
   if (node.type === "scoped_use_list") {
@@ -249,18 +251,18 @@ function rustUseLeaves(
     const segments = path ? rustPathSegments(path) ?? [] : [];
     if (!list) return;
     for (const entry of namedChildren(list)) {
-      rustUseLeaves(entry, [...prefix, ...segments], exported, out);
+      rustUseLeaves(entry, [...prefix, ...segments], exported, scopeKey, out);
     }
     return;
   }
   if (node.type === "use_list") {
-    for (const entry of namedChildren(node)) rustUseLeaves(entry, prefix, exported, out);
+    for (const entry of namedChildren(node)) rustUseLeaves(entry, prefix, exported, scopeKey, out);
     return;
   }
   const segments = rustPathSegments(node);
   const local = segments?.[segments.length - 1];
   if (!segments?.length || local === undefined) return;
-  out.push({ segments: [...prefix, ...segments], local, exported });
+  out.push({ segments: [...prefix, ...segments], local, exported, scopeKey });
 }
 
 /** A literal `#[path = "..."]` attribute directly preceding `node`, if any. */
@@ -279,26 +281,30 @@ function collectRustFacts(
   facts: FileFacts,
   moduleKeyByNode: ReadonlyMap<number, string>,
 ): void {
-  const visit = (node: Node): void => {
+  const visit = (node: Node, scopeKey: string): void => {
     if (node.type === "use_declaration") {
       const exported = children(node).some((child) =>
         child.type === "visibility_modifier" && child.text.startsWith("pub")
       );
       const argument = node.childForFieldName("argument");
-      if (argument) rustUseLeaves(argument, [], exported, facts.rustUses);
+      if (argument) rustUseLeaves(argument, [], exported, scopeKey, facts.rustUses);
       return;
     }
+    let childScope = scopeKey;
     if (node.type === "mod_item") {
       const key = moduleKeyByNode.get(node.id);
       const name = node.childForFieldName("name")?.text;
+      const inline = node.childForFieldName("body") !== null;
       if (key !== undefined && name !== undefined) {
         const pathAttribute = rustPathAttribute(node);
         facts.rustModules.push({
           key,
           name,
-          inline: node.childForFieldName("body") !== null,
+          inline,
           ...(pathAttribute === undefined ? {} : { pathAttribute }),
         });
+        // A `use` inside `mod m { … }` binds in `m`'s scope, not the file's.
+        if (inline) childScope = key;
       }
     } else if (node.type === "impl_item") {
       const target = node.childForFieldName("type");
@@ -307,9 +313,9 @@ function collectRustFacts(
         if (targetName !== undefined) facts.implBlocks.push({ targetName });
       }
     }
-    for (const child of namedChildren(node)) visit(child);
+    for (const child of namedChildren(node)) visit(child, childScope);
   };
-  visit(root);
+  visit(root, "");
 }
 
 function rustBareTypeName(node: Node): string | undefined {
@@ -479,11 +485,16 @@ function rustModuleBodyFile(
   facts: FileFacts,
   declaration: RustModuleDeclaration,
 ): string | undefined {
-  const base = rustModuleDirectory(facts.path);
   if (declaration.pathAttribute !== undefined) {
-    return canonicalModule(catalogue, joinModulePath(base, declaration.pathAttribute));
+    // A `path` attribute outside an inline module block is relative to the file's own directory,
+    // not to the module directory `<stem>/` that a bare `mod name;` would search.
+    const directory = dirname(facts.path);
+    return canonicalModule(
+      catalogue,
+      joinModulePath(directory === "." ? "" : directory, declaration.pathAttribute),
+    );
   }
-  return rustModuleFile(catalogue, base, [declaration.name]);
+  return rustModuleFile(catalogue, rustModuleDirectory(facts.path), [declaration.name]);
 }
 
 type NameTable = Map<string, string[]>;
@@ -577,8 +588,18 @@ function dedupeTargets(targets: readonly DefinitionBindingTarget[]): DefinitionB
 export function buildCatalogue(
   files: readonly FileFacts[],
   entries: readonly TreeNode[],
+  packages: readonly PackageInfo[],
 ): DefinitionIndexSnapshot {
   const catalogue: Catalogue = new Map(files.map((facts) => [facts.path, facts] as const));
+  // `use rmux_server::io::Foo` — a workspace crate name roots a path at that crate's lib target.
+  // Cargo replaces `-` with `_` in the crate identifier; a package with no `src/lib.rs` (a
+  // binary-only crate, or an npm package sharing the directory) is not addressable this way.
+  const crateRoots = new Map<string, string>();
+  for (const pkg of packages) {
+    const directory = pkg.path ? `${pkg.path}/src` : "src";
+    if (!catalogue.has(`${directory}/lib.rs`)) continue;
+    crateRoots.set(pkg.name.replaceAll("-", "_"), directory);
+  }
   const byKey = new Map<string, IndexedFileDefinition>();
   for (const facts of files) {
     for (const definition of facts.definitions) byKey.set(definition.key, definition);
@@ -613,6 +634,8 @@ export function buildCatalogue(
     if (facts.rustModules.some((module) => module.name === root)) {
       return { base: rustModuleDirectory(facts.path), rest: [...segments] };
     }
+    const crate = crateRoots.get(root);
+    if (crate !== undefined) return { base: crate, rest };
     return undefined;
   };
 
@@ -787,6 +810,8 @@ export function buildCatalogue(
       for (const leaf of facts.rustUses) {
         const base = resolveRustBase(facts, leaf.segments);
         if (!base) continue;
+        const importScope = leaf.scopeKey;
+        const exportScope = leaf.scopeKey === "" ? "" : canonicalScopeKey(leaf.scopeKey);
         if (leaf.local === "*") {
           const target = rustModuleFile(catalogue, base.base, base.rest);
           if (!target) continue;
@@ -796,10 +821,10 @@ export function buildCatalogue(
             const name = key.slice(0, separator);
             const space = key.slice(separator + 1) as DefinitionBindingSpace;
             for (const definitionKey of definitionKeys) {
-              addBinding(facts.path, "", name, space, "import", {
-                kind: "definition",
-                key: definitionKey,
-              });
+              const bound = { kind: "definition", key: definitionKey } as const;
+              addBinding(facts.path, importScope, name, space, "import", bound);
+              // `pub use` is both an in-file binding and part of the module's public surface.
+              if (leaf.exported) addBinding(facts.path, exportScope, name, space, "export", bound);
             }
           }
           continue;
@@ -808,7 +833,10 @@ export function buildCatalogue(
         if (moduleTarget) importEdges.add(JSON.stringify([facts.path, moduleTarget]));
         for (const space of ["type", "value"] as const) {
           for (const target of resolveRustUse(facts, leaf, leaf.local, space, new Set())) {
-            addBinding(facts.path, "", leaf.local, space, "import", target);
+            addBinding(facts.path, importScope, leaf.local, space, "import", target);
+            if (leaf.exported) {
+              addBinding(facts.path, exportScope, leaf.local, space, "export", target);
+            }
           }
         }
       }

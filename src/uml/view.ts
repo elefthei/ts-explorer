@@ -1,7 +1,13 @@
 import type { UmlCategoryKind } from "../diagram-graph.ts";
 import type { FileDefinition, UmlTarget } from "../types.ts";
 import { emitMermaidClassBlock } from "./emit.ts";
-import { FILE_STYLE_DEFS, STYLE_DEFS, escapeMermaidLabel } from "./mermaid.ts";
+import {
+  escapeMermaidLabel,
+  FILE_STYLE_DEFS,
+  INK_CLASS_BY_KIND,
+  KIND_INK_DEFS,
+  STYLE_DEFS,
+} from "./mermaid.ts";
 import type { UmlEntityModel, UmlVisibility } from "./model.ts";
 
 export type UmlDefinitionEdge = {
@@ -67,7 +73,9 @@ function categoryClass(node: UmlDefinitionNode): string {
 }
 
 function styleBlock(): string {
-  return STYLE_DEFS.map(([name, style]) => `classDef ${name} ${style}`).join("\n");
+  return [...STYLE_DEFS, ...KIND_INK_DEFS]
+    .map(([name, style]) => `classDef ${name} ${style}`)
+    .join("\n");
 }
 
 function renderDefinitionFrame(
@@ -129,6 +137,8 @@ function renderDefinitionFrame(
     lines.push(block.dsl);
     labels.push(`class ${nodeId}["${block.label}"]`);
     classes.push(`cssClass "${nodeId}" ${categoryClass(node)}`);
+    const ink = INK_CLASS_BY_KIND[node.detail?.kind ?? node.definition.kind];
+    if (ink !== undefined) classes.push(`cssClass "${nodeId}" ${ink}`);
     if (node.definition.key === frame.rootKey) classes.push(`cssClass "${nodeId}" rootNode`);
     const memberByKey = new Map(node.memberDefinitions.map((member) => [member.key, member]));
     definitionLinks.push({

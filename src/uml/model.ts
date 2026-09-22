@@ -149,4 +149,11 @@ export type DefinitionResolutionIndex = {
     space: DefinitionBindingSpace,
     exported: boolean,
   ): readonly DefinitionBindingTarget[];
+  /** Module definition keys whose out-of-line body is `path`. */
+  moduleOwners(path: string): readonly string[];
+  /**
+   * What a module or namespace re-exports with `pub use`: its own lexical scope, plus the file
+   * scope of its out-of-line body file. Deduplicated by exported name.
+   */
+  moduleExports(definitionKey: string): readonly { name: string; key: string }[];
 };

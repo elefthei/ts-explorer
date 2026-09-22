@@ -346,6 +346,17 @@ async function indexDefinitions(
     kind: "directory",
   };
   const files = entries.filter((entry) => entry.kind === "file" && isSourcePath(entry.path));
+  // Discovery also runs as its own job, where a malformed manifest becomes the package diagram's
+  // error; here it only means no crate name roots a Rust path, so it must not fail indexing.
+  let packages: PackageInfo[] = [];
+  try {
+    packages = (await discoverPackages(preprocessState.sourceDir)).map((pkg) => ({
+      ...pkg,
+      path: normalizeRelativePath(pkg.path),
+    }));
+  } catch {
+    packages = [];
+  }
   const facts: FileFacts[] = [];
   for (let start = 0; start < files.length; start += DEFINITION_INDEX_READ_BATCH) {
     const batch = files.slice(start, start + DEFINITION_INDEX_READ_BATCH);
@@ -399,7 +410,7 @@ async function indexDefinitions(
       }
     }
   }
-  const snapshot = buildCatalogue(facts, [rootEntry, ...entries]);
+  const snapshot = buildCatalogue(facts, [rootEntry, ...entries], packages);
   preprocessState.cache.writeDefinitionIndex(generationId, snapshot);
   return { definitionCount: snapshot.definitions.length };
 }

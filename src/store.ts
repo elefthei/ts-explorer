@@ -38,7 +38,7 @@ export class ExplorerStore {
   ) => void;
   private readonly preprocessor: Preprocessor;
   private readonly watcherPromise: Promise<{ close(): Promise<void> }>;
-  private version = 0;
+  private version: number;
   private closed = false;
   private closePromise: Promise<void> | undefined;
   private treePromise: Promise<TreeNode> | undefined;
@@ -53,7 +53,13 @@ export class ExplorerStore {
       events: WatchEventName[],
       version: number,
     ) => void = () => undefined,
+    /**
+     * Where the watch counter starts. Clients only compare versions for equality, so the value is
+     * opaque; tests seed it randomly so no assertion can depend on the first version being zero.
+     */
+    initialVersion = 0,
   ) {
+    this.version = initialVersion;
     this.sourceDir = resolveSourceDir(sourceDir);
     this.onError = onError;
     this.onCacheReady = onCacheReady;

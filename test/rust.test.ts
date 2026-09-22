@@ -5,7 +5,8 @@ import { discoverPackages } from "../src/packages.ts";
 import type { FileDefinition, UmlTarget } from "../src/types.ts";
 import { HIGHLIGHT_TOKENS } from "../src/types.ts";
 import { validateUmlDiagramGraph } from "../src/uml/graph.ts";
-import type { UmlDefinitionNode } from "../src/uml/view.ts";
+import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
+import { renderUmlView, type UmlDefinitionNode } from "../src/uml/view.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
 import { expectFileGraphRoundTrips } from "./support/normalized-graph.ts";
 import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
@@ -54,6 +55,23 @@ function definitionView(project: UmlProject, target: UmlTarget) {
       if (!found) throw new Error(`no node ${wanted} in ${view.nodes.map((n) => label(n.definition)).join(", ")}`);
       return found;
     },
+  };
+}
+
+/** The compartment rows one box draws, by the label of the declaration each row navigates to. */
+function drawnBox(project: UmlProject, target: UmlTarget, box: string) {
+  const diagram = readCompleteUml(project, target);
+  if (diagram.view.kind !== "definitions") {
+    throw new Error(`expected a definition view for ${JSON.stringify(target)}`);
+  }
+  const frame = renderUmlView(diagram.view, FULL_UML_VISIBILITY, target).frames[0];
+  const drawn = frame?.definitionLinks.find((entry) => label(entry.definition) === box);
+  if (!frame || !drawn) throw new Error(`no box ${box} in ${JSON.stringify(target)}`);
+  return {
+    dsl: frame.dsl,
+    nodeId: drawn.nodeId,
+    attributes: drawn.attributes.map(label),
+    methods: drawn.methods.map(label),
   };
 }
 
@@ -356,6 +374,91 @@ test("a module declaration reaches the dependencies of its body file", async () 
   const fileView = definitionView(project, { kind: "file", path: "child.rs" });
   expect(fileView.frames).toEqual(["make@child.rs => make@child.rs, Leaf@leaf.rs"]);
   expect(fileView.edges).toEqual(["make@child.rs -references-> Leaf@leaf.rs"]);
+});
+
+test("a module box lists its body's declarations and what its `pub use` re-exports", async () => {
+  const project = await umlProject("ts-explorer-rust-module-members-", {
+    "Cargo.toml": `[workspace]
+members = ["crates/dep"]
+
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+dep-crate = { path = "crates/dep" }
+`,
+    "crates/dep/Cargo.toml": `[package]
+name = "dep-crate"
+version = "0.1.0"
+`,
+    "crates/dep/src/lib.rs": `pub struct Widget;
+
+pub fn build() -> Widget {
+    Widget
+}
+`,
+    "src/lib.rs": "pub mod outer;\n",
+    // `outer.rs` is not a module root, so `#[path]` resolves against `src/`, not `src/outer/`.
+    "src/outer.rs": `#[path = "nested/facade.rs"]
+pub mod facade;
+
+pub struct Holder {
+    widget: facade::Widget,
+}
+`,
+    "src/nested/facade.rs": `pub use dep_crate::{build, Widget};
+
+pub struct Local;
+
+pub mod inner {
+    pub use dep_crate::Widget;
+}
+`,
+  });
+
+  // The out-of-line body's own declarations plus the names it re-exports from the `dep-crate`
+  // workspace member; every row addresses the file the declaration actually lives in.
+  const facade = drawnBox(project, {
+    kind: "definition",
+    path: "src/outer.rs",
+    definitionKey: project.key("src/outer.rs", "facade"),
+  }, "facade@src/outer.rs");
+  expect(facade.attributes).toEqual([
+    "Widget@crates/dep/src/lib.rs",
+    "Local@src/nested/facade.rs",
+    "inner@src/nested/facade.rs",
+  ]);
+  expect(facade.methods).toEqual(["build@crates/dep/src/lib.rs"]);
+  // The box names its kind through its font colour, not through a `<<module>>` prefix row.
+  expect(facade.dsl).toContain(`cssClass "${facade.nodeId}" kindModule`);
+  expect(facade.dsl).not.toContain("<<module>>");
+
+  // A `pub use` inside an inline module is that module's surface, not the surrounding file's.
+  const inner = drawnBox(project, {
+    kind: "definition",
+    path: "src/nested/facade.rs",
+    definitionKey: project.key("src/nested/facade.rs", "inner"),
+  }, "inner@src/nested/facade.rs");
+  expect(inner.attributes).toEqual(["Widget@crates/dep/src/lib.rs"]);
+  expect(inner.methods).toEqual([]);
+
+  // `facade::Widget` names a re-export, so the reference lands on the declaring crate.
+  const holder = definitionView(project, {
+    kind: "definition",
+    path: "src/outer.rs",
+    definitionKey: project.key("src/outer.rs", "Holder"),
+  });
+  expect(holder.edges).toEqual([
+    "Holder@src/outer.rs -references-> Widget@crates/dep/src/lib.rs",
+  ]);
+
+  // The `#[path]` body is linked, and a workspace crate name roots a path at its lib target.
+  expect(project.snapshot.imports).toEqual([
+    { sourcePath: "src/lib.rs", targetPath: "src/outer.rs" },
+    { sourcePath: "src/nested/facade.rs", targetPath: "crates/dep/src/lib.rs" },
+    { sourcePath: "src/outer.rs", targetPath: "src/nested/facade.rs" },
+  ]);
 });
 
 test("every top-level declaration of a Rust file gets its own frame in source order", async () => {

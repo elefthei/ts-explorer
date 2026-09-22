@@ -131,6 +131,11 @@ export class ReferenceContext {
       if (exported.length) {
         return [...new Set(exported.flatMap((target) => (target.kind === "definition" ? [target.key] : [])))];
       }
+      // An out-of-line body's `pub use` is a member of the box; it must resolve like one.
+      const reexported = this.index.moduleExports(definition.key)
+        .filter((entry) => entry.name === name)
+        .map((entry) => entry.key);
+      if (reexported.length) return [...new Set(reexported)];
     }
     // Also handles an out-of-line Rust module's body-file declarations.
     return this.index.members(definition.key)

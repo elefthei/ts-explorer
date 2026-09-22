@@ -15,7 +15,10 @@ export type EmittedBlock = {
   methods: EmittedRow[];
 };
 
-/** Kinds Mermaid renders with their own stereotype; a plain class carries none. */
+/**
+ * Kinds Mermaid renders with their own stereotype. Every other kind — module, function, constant —
+ * carries none: a box names its kind through its font colour, not a `<<kind>>` prefix row.
+ */
 const STEREOTYPE_BY_KIND: Record<string, string | undefined> = {
   interface: "interface",
   trait: "trait",
@@ -83,8 +86,7 @@ export function emitMermaidClassBlock(input: {
     });
   }
 
-  const kind = detail?.kind ?? definition.kind;
-  const stereotype = STEREOTYPE_BY_KIND[kind] ?? (detail ? undefined : kind);
+  const stereotype = STEREOTYPE_BY_KIND[detail?.kind ?? definition.kind];
   const body = [
     ...(stereotype ? [`<<${stereotype}>>`] : []),
     ...attributes.map((row) => row.text),

@@ -133,6 +133,20 @@ export function extractFileUmlGraph(
       const indexed = index.definition(entity.id);
       contributed.set(entity.id, { name: indexed?.qualifiedName ?? entity.name, entity: true });
     }
+    // A re-exported member is declared elsewhere; it still has to be a node of this graph so the
+    // row validates and stays double-clickable.
+    for (const entity of nominal.entities) {
+      const memberKeys = [
+        ...entity.properties.map((row) => row.definitionKey),
+        ...entity.methods.map((row) => row.definitionKey),
+        ...entity.items.map((row) => row.definitionKey),
+      ];
+      for (const key of memberKeys) {
+        if (contributed.has(key)) continue;
+        const indexed = index.definition(key);
+        if (indexed) contributed.set(key, { name: indexed.qualifiedName, entity: false });
+      }
+    }
     const boundaries = new Map<string, string>();
     for (const reference of references) {
       for (const key of [reference.ownerKey, reference.targetKey]) {

@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 import { resolveCacheDbPath, resolveSourceDir } from "../src/paths.ts";
 import { ExplorerServer } from "../src/server.ts";
 import { ExplorerStore } from "../src/store.ts";
-import { createFixtureTracker, removeFixtureRoot } from "./support/fixtures.ts";
+import { createFixtureTracker, randomVersionSeed, removeFixtureRoot } from "./support/fixtures.ts";
 import type {
   DiagramResponse,
   FileDefinition,
@@ -89,7 +89,7 @@ type PackageGraphRows = {
   packageNodes: { node_id: string; package_path: string | null }[];
 };
 
-function activeGenerationId(db: Database): number {
+function findActiveGenerationId(db: Database): number | undefined {
   const active = queryOne<{ generation_id: number }>(
     db,
     `
@@ -98,8 +98,13 @@ function activeGenerationId(db: Database): number {
       WHERE key = 'active_generation'
     `,
   );
-  if (!active) throw new Error("active generation is missing");
-  return active.generation_id;
+  return active?.generation_id;
+}
+
+function activeGenerationId(db: Database): number {
+  const generationId = findActiveGenerationId(db);
+  if (generationId === undefined) throw new Error("active generation is missing");
+  return generationId;
 }
 
 /** The promoted package topology exactly as the active generation stores it. */
@@ -242,28 +247,37 @@ function outlineShape(definitions: readonly FileDefinition[]): {
     isTopLevel: definition.isTopLevel,
   }));
 }
-function createPromotionGate(): {
-  first: Promise<void>;
-  second: Promise<void>;
-  notify(): void;
-} {
-  let count = 0;
-  let resolveFirst!: () => void;
-  let resolveSecond!: () => void;
-  const first = new Promise<void>((resolve) => { resolveFirst = resolve; });
-  const second = new Promise<void>((resolve) => { resolveSecond = resolve; });
-  return {
-    first,
-    second,
-    notify() {
-      count += 1;
-      if (count === 1) resolveFirst();
-      if (count === 2) resolveSecond();
-    },
-  };
+
+type ServerStartOptions = Parameters<typeof ExplorerServer.start>[0];
+
+/** Every server here starts on a random watch version, so no assertion can pin a literal one. */
+function startServer(
+  options: Omit<ServerStartOptions, "initialVersion">,
+): Promise<ExplorerServer> {
+  return ExplorerServer.start({ ...options, initialVersion: randomVersionSeed() });
 }
 
-
+/**
+ * Polls `read` until `accept` holds; an unrelated rebuild only delays the answer, never breaks it.
+ *
+ * The condition is produced by a real filesystem watcher feeding a preprocessor subprocess, so no
+ * in-process clock can drive it: the retry cadence below is a bounded poll interval, not a guess at
+ * how long the rebuild takes. Correctness depends only on `accept`, never on the delay.
+ */
+async function until<Value>(
+  read: () => Promise<Value>,
+  accept: (value: Value) => boolean,
+  description: string,
+  timeout = 30_000,
+): Promise<Value> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const value = await read();
+    if (accept(value)) return value;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    await Bun.sleep(25);
+  }
+}
 
 function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
   return new Promise<Value>((resolve, reject) => {
@@ -450,11 +464,11 @@ test("failed startup on an occupied port cleans up before the port is reused", a
     const port = blocker.port;
     if (port === undefined) throw new Error("Bun.serve did not assign a port");
     await expect(
-      ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port }),
+      startServer({ sourceDir: root, host: "127.0.0.1", port }),
     ).rejects.toThrow();
     blocker.stop(true);
     blockerStopped = true;
-    replacement = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port });
+    replacement = await startServer({ sourceDir: root, host: "127.0.0.1", port });
     await replacement.stop();
     replacement = undefined;
   } finally {
@@ -473,7 +487,7 @@ test("concurrent stop calls share one promise and release the port", async () =>
   let server: ExplorerServer | undefined;
   let replacement: ExplorerServer | undefined;
   try {
-    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const port = server.port;
     const firstStop = server.stop();
     const secondStop = server.stop();
@@ -481,7 +495,7 @@ test("concurrent stop calls share one promise and release the port", async () =>
     await Promise.all([firstStop, secondStop]);
     server = undefined;
 
-    replacement = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port });
+    replacement = await startServer({ sourceDir: root, host: "127.0.0.1", port });
     await replacement.stop();
     replacement = undefined;
   } finally {
@@ -496,7 +510,7 @@ test("concurrent stop calls share one promise and release the port", async () =>
 
 test("serves the subprocess-backed read-only API and non-Git literal search", async () => {
   const { outerRoot, root, sourceFile } = await createServerFixture();
-  const server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+  const server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
   let watch: WatchClient | undefined;
   try {
     const base = `http://127.0.0.1:${server.port}`;
@@ -504,10 +518,9 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     // rather than racing startup readiness against it.
     watch = await openWatch(base);
     const promotion = await watch.waitFor(
-      (message) =>
-        (message.type === "cache-ready" && message.version === 0) || message.type === "watch-error",
+      (message) => message.type === "cache-ready" || message.type === "watch-error",
     );
-    expect(promotion).toEqual({ type: "cache-ready", version: 0 });
+    expect(promotion.type).toBe("cache-ready");
     await watch.close();
     watch = undefined;
 
@@ -1073,7 +1086,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
     ].join("\n"),
   );
   const watchBatches: Array<{ paths: string[]; events: string[]; version: number }> = [];
-  const server = await ExplorerServer.start({
+  const server = await startServer({
     sourceDir: sourceArgument,
     host: "127.0.0.1",
     port: 0,
@@ -1087,9 +1100,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
   try {
     const base = `http://127.0.0.1:${server.port}`;
     watch = await openWatch(base);
-    await watch.waitFor(
-      (message) => message.type === "cache-ready" && message.version === 0,
-    );
+    await watch.waitFor((message) => message.type === "cache-ready");
 
     const addedChanged = watch.waitFor(
       (message) => hasWatchEvent(message, "watched/added.ts", "add"),
@@ -1243,14 +1254,24 @@ test("package diagram errors retain the last promoted snapshot", async () => {
   );
   await writeFixtureFile(root, "packages/b/package.json", JSON.stringify({ name: "b" }));
 
-  const promotions = createPromotionGate();
-  const store = new ExplorerStore(root, () => undefined, promotions.notify);
+  const store = new ExplorerStore(root, undefined, undefined, undefined, undefined, randomVersionSeed());
   try {
     await store.ready();
-    await withTimeout(promotions.first, "initial cache promotion");
-    const ready = await store.getDiagram({ kind: "packages", scopePath: "" });
-    expect(ready.status).toBe("ready");
+    const ready = await until(
+      () => store.getDiagram({ kind: "packages", scopePath: "" }),
+      (diagram) => diagram.status === "ready",
+      "initial package diagram promotion",
+    );
     const graphDbPath = resolveCacheDbPath(root);
+    // A ready diagram does not imply a promoted generation: the meta row lands once the rebuild
+    // commits, so each graph read below waits for the generation it is about to inspect.
+    const promotedGeneration = async (): Promise<number | undefined> =>
+      openDatabase(graphDbPath, findActiveGenerationId);
+    await until(
+      promotedGeneration,
+      (generationId) => generationId !== undefined,
+      "the initial package graph generation to be promoted",
+    );
     const readyGraph = readActivePackageGraph(graphDbPath);
     expect(readyGraph.nodes).toEqual([
       { node_id: "p0", node_ordinal: 0, node_kind: "package", name: "a" },
@@ -1281,12 +1302,18 @@ test("package diagram errors retain the last promoted snapshot", async () => {
     ]);
 
     await writeFile(join(root, "package.json"), "{ malformed");
-    await withTimeout(promotions.second, "watch cache promotion");
-    const failed = await store.getDiagram({ kind: "packages", scopePath: "" });
+    const failed = await until(
+      () => store.getDiagram({ kind: "packages", scopePath: "" }),
+      (diagram) => diagram.status === "error",
+      "package diagram rebuild after the manifest was corrupted",
+    );
+    await until(
+      promotedGeneration,
+      (generationId) => generationId !== readyGraph.generationId,
+      "the failed rebuild to promote a new generation",
+    );
     const failedGraph = readActivePackageGraph(graphDbPath);
 
-    expect(failed.status).toBe("error");
-    expect(failedGraph.generationId).not.toBe(readyGraph.generationId);
     // The failed rebuild republishes the last good topology rather than an empty graph.
     expect({ ...failedGraph, generationId: readyGraph.generationId }).toEqual(readyGraph);
     if (ready.kind !== "packages" || failed.kind !== "packages") {
@@ -1323,14 +1350,15 @@ test("an undecodable source file reports its real error instead of a stale graph
   // directory view.
   await writeFixtureFile(root, "assets/blob.bin", Buffer.from("blob\0\n"));
 
-  const promotions = createPromotionGate();
-  const store = new ExplorerStore(root, () => undefined, promotions.notify);
+  const store = new ExplorerStore(root, undefined, undefined, undefined, undefined, randomVersionSeed());
   try {
     await store.ready();
-    await withTimeout(promotions.first, "initial UML cache promotion");
     const target = { kind: "file", path: "model.ts" } as const;
-    const ready = await store.getDiagram({ kind: "uml", target });
-    expect(ready.status).toBe("ready");
+    const ready = await until(
+      () => store.getDiagram({ kind: "uml", target }),
+      (diagram) => diagram.status === "ready",
+      "initial UML cache promotion",
+    );
     expect(frameLabels(definitionsView(ready))).toEqual([
       { root: "FallbackTarget@model.ts", nodes: ["FallbackTarget@model.ts"] },
       {
@@ -1349,9 +1377,11 @@ test("an undecodable source file reports its real error instead of a stale graph
 
     // The parser rejects invalid UTF-8, which is the only source-level failure it can observe.
     await writeFile(join(root, "model.ts"), Buffer.from([0x65, 0x78, 0x70, 0xff, 0xfe]));
-    await withTimeout(promotions.second, "failed UML cache promotion");
-    const failed = await store.getDiagram({ kind: "uml", target });
-    expect(failed.status).toBe("error");
+    const failed = await until(
+      () => store.getDiagram({ kind: "uml", target }),
+      (diagram) => diagram.status === "error",
+      "UML rebuild after the source became undecodable",
+    );
     expect(failed.error).toEqual(expect.any(String));
     // Keys and edges from the previous generation are never republished under the new catalogue.
     expect(definitionsView(failed)).toEqual({
@@ -1405,13 +1435,11 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
   let secondServer: RunningServer | undefined;
   let watch: WatchClient | undefined;
   try {
-    firstServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    firstServer = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const firstBase = `http://127.0.0.1:${firstServer.port}`;
     const firstWatch = await openWatch(firstBase);
     try {
-      await firstWatch.waitFor(
-        (message) => message.type === "cache-ready" && message.version === 0,
-      );
+      await firstWatch.waitFor((message) => message.type === "cache-ready");
     } finally {
       await firstWatch.close();
     }
@@ -1431,20 +1459,19 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     await firstServer.stop();
     firstServer = undefined;
 
-    firstServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    firstServer = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const untouchedBase = `http://127.0.0.1:${firstServer.port}`;
     const untouchedWatch = await openWatch(untouchedBase);
     try {
-      await untouchedWatch.waitFor(
-        (message) => message.type === "cache-ready" && message.version === 0,
-      );
+      await untouchedWatch.waitFor((message) => message.type === "cache-ready");
     } finally {
       await untouchedWatch.close();
     }
     const untouchedDiagram = await (
       await fetch(`${untouchedBase}/api/diagram?kind=packages&path=`)
     ).json() as DiagramResponse;
-    expect(untouchedDiagram).toEqual(firstDiagram);
+    // The ambient watch version differs per server; the served topology must not.
+    expect({ ...untouchedDiagram, version: firstDiagram.version }).toEqual(firstDiagram);
     expect(readActivePackageGraph(dbPath).generationId).toBe(recoveredId);
     expect(openDatabase(dbPath, (db) =>
       queryAll<{ id: number; state: string; cause: string }>(
@@ -1462,11 +1489,10 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
       JSON.stringify({ name: "a", dependencies: { b: "*" } }),
     );
 
-    secondServer = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    secondServer = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const secondBase = `http://127.0.0.1:${secondServer.port}`;
     watch = await openWatch(secondBase);
-    await watch.waitFor((message) => message.type === "cache-ready" && message.version === 0);
-    expect(watch.history()).toContainEqual({ type: "cache-ready", version: 0 });
+    await watch.waitFor((message) => message.type === "cache-ready");
 
     const restartedDiagram = await (
       await fetch(`${secondBase}/api/diagram?kind=packages&path=`)
@@ -1500,7 +1526,6 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     );
     const changedMessage = await changed;
     if (changedMessage.type !== "changed") throw new Error("expected package manifest change");
-    expect(changedMessage.version).toBe(1);
     await watch.waitFor(
       (message) =>
         message.type === "cache-ready" && message.version === changedMessage.version,
@@ -1543,13 +1568,11 @@ test("warm restart serves file content edited while the server was stopped", asy
 
   let server: RunningServer | undefined;
   try {
-    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const firstBase = `http://127.0.0.1:${server.port}`;
     const firstWatch = await openWatch(firstBase);
     try {
-      await firstWatch.waitFor(
-        (message) => message.type === "cache-ready" && message.version === 0,
-      );
+      await firstWatch.waitFor((message) => message.type === "cache-ready");
     } finally {
       await firstWatch.close();
     }
@@ -1562,13 +1585,11 @@ test("warm restart serves file content edited while the server was stopped", asy
 
     await writeFile(filePath, "export const kept = 2;\n");
 
-    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const secondBase = `http://127.0.0.1:${server.port}`;
     const secondWatch = await openWatch(secondBase);
     try {
-      await secondWatch.waitFor(
-        (message) => message.type === "cache-ready" && message.version === 0,
-      );
+      await secondWatch.waitFor((message) => message.type === "cache-ready");
     } finally {
       await secondWatch.close();
     }
@@ -1616,7 +1637,7 @@ test("serves real file outlines and rejects unusable paths", async () => {
   await writeFile(join(root, "notes.txt"), "plain text\n");
   let server: ExplorerServer | undefined;
   try {
-    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const base = `http://127.0.0.1:${server.port}`;
     const outline = async (path: string) => {
       const response = await fetch(`${base}/api/file-definitions?path=${encodeURIComponent(path)}`);
@@ -1696,7 +1717,7 @@ test("the diagram route enforces its typed target contract", async () => {
 
   let server: ExplorerServer | undefined;
   try {
-    server = await ExplorerServer.start({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
     const base = `http://127.0.0.1:${server.port}`;
     const rootKey = await definitionKey(base, "lib/root.ts", "Root");
     const leafKey = await definitionKey(base, "lib/leaf.ts", "Leaf");

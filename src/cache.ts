@@ -34,7 +34,7 @@ import {
   type UmlSourceLocation,
   type UmlTarget,
 } from "./types.ts";
-import { isTestPath } from "./uml/keys.ts";
+import { canonicalScopeKey, isTestPath } from "./uml/keys.ts";
 import { isNominalKind } from "./uml/usage.ts";
 import type {
   DefinitionBindingKind,
@@ -53,7 +53,7 @@ import type {
   UmlViewModel,
 } from "./uml/view.ts";
 
-const CACHE_SCHEMA_VERSION = 9;
+const CACHE_SCHEMA_VERSION = 10;
 
 type DiagramErrorOutcome = { status: "error"; error: string };
 
@@ -683,6 +683,12 @@ const CACHE_SCHEMA_OBJECTS = [
         REFERENCES DefinitionIndex(generation_id, definition_key)
         DEFERRABLE INITIALLY DEFERRED
     )`,
+  },
+  {
+    name: "definition_contributors_by_source",
+    kind: "index",
+    createSql: `CREATE INDEX definition_contributors_by_source
+      ON definition_contributors(generation_id, source_path, contribution_kind)`,
   },
 ] as const satisfies readonly CacheSchemaObject[];
 
@@ -1938,6 +1944,8 @@ export class Cache {
     const fileCache = new Map<string, IndexedFileDefinition[]>();
     const memberCache = new Map<string, IndexedFileDefinition[]>();
     const bindingCache = new Map<string, DefinitionBindingTarget[]>();
+    const ownerCache = new Map<string, string[]>();
+    const moduleExportCache = new Map<string, { name: string; key: string }[]>();
     const definition = (key: string): IndexedFileDefinition | undefined => {
       if (definitionCache.has(key)) return definitionCache.get(key);
       const row = this.query.selectDefinitionByKey.get(generationId, key);
@@ -1987,6 +1995,44 @@ export class Cache {
         }
         bindingCache.set(cacheKey, targets);
         return targets;
+      },
+      moduleOwners: (path) => {
+        const cached = ownerCache.get(path);
+        if (cached) return cached;
+        const keys = this.query.selectModuleOwners
+          .all(generationId, path)
+          .map((row) => row.definition_key);
+        ownerCache.set(path, keys);
+        return keys;
+      },
+      moduleExports: (definitionKey) => {
+        const cached = moduleExportCache.get(definitionKey);
+        if (cached) return cached;
+        const exported: { name: string; key: string }[] = [];
+        const seen = new Set<string>();
+        const collect = (path: string, scopeKey: string): void => {
+          for (const row of this.query.selectScopeExports.all(generationId, path, scopeKey)) {
+            // A module re-export binding always names a definition; a `module` target is a
+            // TypeScript `export * as ns` row and has nothing to list.
+            if (row.target_key === null || seen.has(row.name)) continue;
+            const target = definition(row.target_key);
+            if (!target) continue;
+            // A Rust `impl` member is file-scoped until the catalogue reparents it onto the
+            // implemented type; it is a row of that type's box, never of the enclosing module's.
+            const parent = target.parentKey === null ? undefined : definition(target.parentKey);
+            if (parent && isNominalKind(parent.kind)) continue;
+            seen.add(row.name);
+            exported.push({ name: row.name, key: row.target_key });
+          }
+        };
+        const own = definition(definitionKey);
+        if (own) collect(own.source.path, canonicalScopeKey(definitionKey));
+        for (const contributor of this.query.selectContributors.all(generationId, definitionKey)) {
+          if (contributor.contribution_kind !== "module") continue;
+          collect(contributor.source_path, "");
+        }
+        moduleExportCache.set(definitionKey, exported);
+        return exported;
       },
     };
   }
@@ -2636,6 +2682,18 @@ function prepareQueries(db: Database) {
       SELECT definition_key
       FROM definition_contributors
       WHERE generation_id = ? AND source_path = ?
+    `),
+    selectModuleOwners: db.query<{ definition_key: string }, [number, string]>(`
+      SELECT definition_key
+      FROM definition_contributors
+      WHERE generation_id = ? AND source_path = ? AND contribution_kind = 'module'
+      ORDER BY definition_key
+    `),
+    selectScopeExports: db.query<{ name: string; target_key: string | null }, [number, string, string]>(`
+      SELECT name, target_key
+      FROM definition_bindings
+      WHERE generation_id = ? AND source_path = ? AND scope_key = ? AND binding_kind = 'export'
+      ORDER BY name, space, ordinal
     `),
     selectOutgoingRelations: db.query<RelationRow, [number, string]>(`
       SELECT DISTINCT target_node_id, relation_kind

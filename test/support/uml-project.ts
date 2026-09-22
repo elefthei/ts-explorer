@@ -8,6 +8,7 @@ import { collectFileDefinitionNodes } from "../../src/goto-definition.ts";
 import { highlightLanguageForPath } from "../../src/lang/registry.ts";
 import { parseRustSource } from "../../src/lang/rust.ts";
 import { parseTypeScriptSource } from "../../src/lang/typescript.ts";
+import { discoverPackages } from "../../src/packages.ts";
 import { decodeSourceBytes, isSourcePath } from "../../src/source.ts";
 import { collectTreeEntries } from "../../src/tree.ts";
 import type { FileDefinition, TreeNode, UmlTarget } from "../../src/types.ts";
@@ -93,7 +94,7 @@ export async function buildUmlProject(root: string): Promise<UmlProject> {
       }
     }
     cache.writeSourceSnapshots(generationId, snapshots);
-    const snapshot = buildCatalogue(facts, [rootEntry, ...entries]);
+    const snapshot = buildCatalogue(facts, [rootEntry, ...entries], await discoverPackages(root));
     cache.writeDefinitionIndex(generationId, snapshot);
 
     const index = cache.createDefinitionResolutionIndex(generationId);

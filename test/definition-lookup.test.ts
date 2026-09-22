@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { ExplorerStore, InputError } from "../src/store.ts";
 import type { GotoDefinition } from "../src/types.ts";
-import { createFixtureTracker } from "./support/fixtures.ts";
+import { createFixtureTracker, randomVersionSeed } from "./support/fixtures.ts";
 
 const fixtures = createFixtureTracker();
 
@@ -106,7 +106,14 @@ async function withWorkspaceStore(
   const promoted = new Promise<void>((resolve) => {
     resolvePromotion = resolve;
   });
-  const store = new ExplorerStore(root, () => undefined, resolvePromotion);
+  const store = new ExplorerStore(
+    root,
+    () => undefined,
+    resolvePromotion,
+    undefined,
+    undefined,
+    randomVersionSeed(),
+  );
   try {
     await store.ready();
     await promoted;
@@ -118,29 +125,25 @@ async function withWorkspaceStore(
 
 test("duplicate definitions resolve to the earliest line then column", async () => {
   await withWorkspaceStore("ts-explorer-lookup-duplicates-", async (store) => {
-    // characterizes: ORDER BY source_line, source_column LIMIT 1 (src/cache.ts:3025-3034)
-    expect(await store.lookupDefinition("packages/a/src/dup.ts", "Twin", "Twin")).toEqual({
-      version: 0,
-      definition: { path: "packages/a/src/dup.ts", line: 1, column: 14 },
-    });
+    // characterizes: ORDER BY source_line, source_column LIMIT 1 (src/cache.ts)
+    const before = store.getVersion();
+    const response = await store.lookupDefinition("packages/a/src/dup.ts", "Twin", "Twin");
+    expect(response.definition).toEqual({ path: "packages/a/src/dup.ts", line: 1, column: 14 });
+    // The response reports the store's own version at request time, never a hardcoded zero.
+    expect(response.version).toBeGreaterThanOrEqual(before);
+    expect(response.version).toBeLessThanOrEqual(store.getVersion());
   });
 }, 60_000);
 
 test("definition lookup is path-exact across packages", async () => {
   await withWorkspaceStore("ts-explorer-lookup-packages-", async (store) => {
-    expect(await store.lookupDefinition("packages/a/src/index.ts", "Shared", "Shared")).toEqual({
-      version: 0,
-      definition: { path: "packages/a/src/index.ts", line: 1, column: 14 },
-    });
-    expect(await store.lookupDefinition("packages/b/src/index.ts", "Shared", "Shared")).toEqual({
-      version: 0,
-      definition: { path: "packages/b/src/index.ts", line: 1, column: 14 },
-    });
+    expect((await store.lookupDefinition("packages/a/src/index.ts", "Shared", "Shared")).definition)
+      .toEqual({ path: "packages/a/src/index.ts", line: 1, column: 14 });
+    expect((await store.lookupDefinition("packages/b/src/index.ts", "Shared", "Shared")).definition)
+      .toEqual({ path: "packages/b/src/index.ts", line: 1, column: 14 });
     // characterizes: a path that does not declare the name resolves to null, never to a sibling
-    expect(await store.lookupDefinition("packages/a/src/dup.ts", "Shared", "Shared")).toEqual({
-      version: 0,
-      definition: null,
-    });
+    expect((await store.lookupDefinition("packages/a/src/dup.ts", "Shared", "Shared")).definition)
+      .toBeNull();
   });
 }, 60_000);
 
@@ -196,16 +199,14 @@ test("search returns definitions from every package in path order", async () => 
 test("unknown, non-source and out-of-range requests", async () => {
   await withWorkspaceStore("ts-explorer-lookup-edges-", async (store) => {
     // characterizes: an unindexed path is a miss, not an error
-    expect(await store.getDefinition("packages/a/src/missing.ts", { line: 1, column: 1 })).toEqual({
-      version: 0,
-      definition: null,
-    });
+    expect(
+      (await store.getDefinition("packages/a/src/missing.ts", { line: 1, column: 1 })).definition,
+    ).toBeNull();
     // characterizes: getDefinition returns the stored definition without display offsets;
     // only readFile attaches displayFrom/displayTo to the definitions it returns
-    expect(await store.getDefinition("packages/a/src/index.ts", { line: 1, column: 14 })).toEqual({
-      version: 0,
-      definition: SHARED_A_DEFINITION,
-    });
+    expect(
+      (await store.getDefinition("packages/a/src/index.ts", { line: 1, column: 14 })).definition,
+    ).toEqual(SHARED_A_DEFINITION);
 
     const nonSource = await store.readFile("packages/a/src/notes.txt").then(
       () => undefined,
@@ -240,14 +241,12 @@ test("declaration files and node_modules contribute no definitions", async () =>
     expect(vendored.files).toEqual([]);
     expect(vendored.definitions).toEqual([]);
 
-    expect(await store.getDefinition("packages/a/src/types.d.ts", { line: 1, column: 22 })).toEqual({
-      version: 0,
-      definition: null,
-    });
-    expect(await store.getDefinition("node_modules/pkg/index.ts", { line: 1, column: 14 })).toEqual({
-      version: 0,
-      definition: null,
-    });
+    expect(
+      (await store.getDefinition("packages/a/src/types.d.ts", { line: 1, column: 22 })).definition,
+    ).toBeNull();
+    expect(
+      (await store.getDefinition("node_modules/pkg/index.ts", { line: 1, column: 14 })).definition,
+    ).toBeNull();
   });
 }, 60_000);
 

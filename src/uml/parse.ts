@@ -41,6 +41,25 @@ const PROPERTY_MEMBER_KINDS: Record<string, true> = {
   variable: true,
 };
 
+const SCOPE_ENTITY_KINDS: Record<string, true> = { module: true, namespace: true };
+
+const CALLABLE_MEMBER_KINDS: Record<string, true> = {
+  function: true,
+  method: true,
+  // `constructor` names `Object.prototype.constructor`, so its literal type needs pinning.
+  constructor: true as const,
+  getter: true,
+  setter: true,
+};
+
+/** A nominal member's declared `type` is just its own name, so only these rows show one. */
+const SCOPE_MEMBER_TYPED_KINDS: Record<string, true> = {
+  constant: true,
+  variable: true,
+  property: true,
+  type: true,
+};
+
 function scriptMemberModifiers(node: Node): UmlModifier[] {
   const collected: UmlModifier[] = [];
   if (node.type === "abstract_method_signature") collected.push("abstract");
@@ -115,6 +134,52 @@ function collapseOverloads(entries: readonly ParsedFileDefinition[]): ParsedFile
   return entries.filter((entry) => entry.hasBody || !implemented.has(entry.definition.name));
 }
 
+type ScopeMemberRows = { properties: PropertyDetails[]; methods: MethodDetails[] };
+
+/**
+ * A module or namespace lists what it holds: its declarations split into a callable and a
+ * non-callable compartment, followed by the names it re-exports. A declared name wins over a
+ * re-exported one, and a re-export carries no declaration node, so it renders untyped.
+ */
+function scopeMemberRows(
+  declared: readonly ParsedFileDefinition[],
+  reexported: readonly { name: string; key: string }[],
+  index: DefinitionResolutionIndex,
+  rust: boolean,
+): ScopeMemberRows {
+  const properties: PropertyDetails[] = [];
+  const methods: MethodDetails[] = [];
+  const seen = new Set<string>();
+  for (const member of declared) {
+    const { kind, name } = member.definition;
+    seen.add(name);
+    if (CALLABLE_MEMBER_KINDS[kind] === true) {
+      methods.push(methodDetails(member, rust));
+      continue;
+    }
+    const row = propertyDetails(member, rust);
+    if (SCOPE_MEMBER_TYPED_KINDS[kind] !== true) delete row.type;
+    properties.push(row);
+  }
+  for (const entry of reexported) {
+    if (seen.has(entry.name)) continue;
+    const indexed = index.definition(entry.key);
+    if (!indexed) continue;
+    seen.add(entry.name);
+    if (CALLABLE_MEMBER_KINDS[indexed.kind] === true) {
+      methods.push({ definitionKey: entry.key, modifiers: ["public"], name: entry.name });
+      continue;
+    }
+    properties.push({
+      definitionKey: entry.key,
+      modifiers: ["public"],
+      name: entry.name,
+      optional: false,
+    });
+  }
+  return { properties, methods };
+}
+
 /**
  * The nominal boxes one source file contributes. Cross-file Rust implementations produce a
  * fragment keyed by the implemented type's canonical definition key; the declaring file supplies
@@ -157,6 +222,44 @@ export function buildNominalModel(
     if (byKey.has(parentKey)) continue;
     const parent = index.definition(parentKey);
     if (parent && isNominalKind(parent.kind)) ownerKeys.add(parentKey);
+  }
+
+  // A module or namespace is not a nominal owner — it never absorbs its members' references — but
+  // its box still lists them. A memberless scope stays a plain box with no compartment.
+  for (const entry of parsed) {
+    const { kind, key, name } = entry.definition;
+    if (SCOPE_ENTITY_KINDS[kind] !== true) continue;
+    const { properties, methods } = scopeMemberRows(
+      membersByParent.get(key) ?? [],
+      // A TypeScript namespace's exports are already members; only Rust `pub use` adds rows.
+      rust ? index.moduleExports(key) : [],
+      index,
+      rust,
+    );
+    if (!properties.length && !methods.length) continue;
+    entities.push({ id: key, name, kind, properties, methods, items: [] });
+  }
+  if (rust) {
+    // An out-of-line `mod x;` body contributes its top level to the box `x` was declared in.
+    for (const ownerKey of index.moduleOwners(path)) {
+      const indexed = index.definition(ownerKey);
+      if (!indexed) continue;
+      const { properties, methods } = scopeMemberRows(
+        parsed.filter((entry) => entry.definition.isTopLevel),
+        index.moduleExports(ownerKey),
+        index,
+        rust,
+      );
+      if (!properties.length && !methods.length) continue;
+      entities.push({
+        id: ownerKey,
+        name: indexed.name,
+        kind: indexed.kind,
+        properties,
+        methods,
+        items: [],
+      });
+    }
   }
 
   for (const ownerKey of ownerKeys) {

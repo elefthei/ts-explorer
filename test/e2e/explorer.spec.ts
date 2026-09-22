@@ -541,7 +541,7 @@ function watchCacheReady(page: Page): {
     }
     if (!isWatchMessage(parsed)) return;
     history.push(parsed);
-    if (!settled && parsed.type === "cache-ready" && parsed.version === 0) {
+    if (!settled && parsed.type === "cache-ready") {
       settled = true;
       resolveReady(parsed);
     }
@@ -557,9 +557,7 @@ function watchCacheReady(page: Page): {
     socket.on("framereceived", (event) => acceptFrame(event.payload));
     socket.on("socketerror", (error) => rejectPrematurely(`watch websocket error: ${error}`));
     socket.on("close", () => rejectPrematurely("watch websocket closed before cache-ready"));
-    const retained = history.find(
-      (message) => message.type === "cache-ready" && message.version === 0,
-    );
+    const retained = history.find((message) => message.type === "cache-ready");
     if (!settled && retained) {
       settled = true;
       resolveReady(retained);
@@ -914,7 +912,7 @@ test("tree labels select UML targets while chevrons only change expansion", asyn
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
     await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
     await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
 
@@ -1013,7 +1011,7 @@ test("double-click opens the exact source while its diagram response is held", a
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "consumer.ts")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
 
     // A fast held response: the selection the first click started must not steal the editor.
     const fileGate = createResponseGate((url) => isUmlDiagramUrl(url, "file", "consumer.ts"));
@@ -1108,7 +1106,7 @@ test("a diagram double-tap opens the first pressed target", async ({ browser }) 
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
     await expandTree(page, "feature");
 
     const selectRootFile = async (): Promise<void> => {
@@ -1228,7 +1226,7 @@ test("a held root response never repaints over the next selection", async ({ bro
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
     await expandTree(page, "feature");
     await expandTree(page, "feature/root.ts");
     await expect(definitionRow(page, "feature/root.ts", "Isolated")).toHaveCount(1, {
@@ -1303,7 +1301,7 @@ test("renders root frames, directory imports and their detail controls", async (
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
     await expandTree(page, "feature");
 
     // A file selection shows exactly its root frames, each headed by its root and source path.
@@ -1444,7 +1442,7 @@ test("keyboard navigation selects UML and opens sources", async ({ browser }) =>
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
 
     // ArrowRight expands, ArrowDown walks rows, Enter selects.
     await treeRow(page, "feature").focus();
@@ -1521,7 +1519,7 @@ test("search results select definition roots and open their sources", async ({ b
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
 
     const searchInput = page.locator("#node-search");
     const runSearch = async (query: string): Promise<void> => {
@@ -1602,7 +1600,7 @@ test("pans and zooms the diagram viewport", async ({ browser }) => {
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
     await expandTree(page, "feature");
     await treeRow(page, "feature/root.ts").click();
     await expect(frameHeadings(page)).toHaveText(
@@ -1662,7 +1660,7 @@ test("directories select import graphs while the Packages tab keeps the manifest
     await Promise.all([
       expect(page.locator("#source-label")).not.toHaveText("Loading source…", { timeout: 15_000 }),
       expect(runtimeRow).toBeVisible({ timeout: 15_000 }),
-      withBound(watch.cacheReady, 60_000, "nested packages cache-ready version 0"),
+      withBound(watch.cacheReady, 60_000, "nested packages cache-ready"),
     ]);
     await expect(page.locator("#svg-holder")).toContainText("junco-runtime-demo", {
       timeout: 30_000,
@@ -1758,7 +1756,7 @@ test("a failed diagram shows the server error instead of mermaid output", async 
     try {
       await navigateToCli(page, fixtureRoot, resource);
       await expect(treeRow(page, "unrelated.ts")).toBeVisible({ timeout: 15_000 });
-      await withBound(watch.cacheReady, 60_000, "forced diagram failure cache-ready version 0");
+      await withBound(watch.cacheReady, 60_000, "forced diagram failure cache-ready");
 
       await treeRow(page, "unrelated.ts").click();
       await expect(page.locator("#error-panel")).toBeVisible({ timeout: 60_000 });
@@ -1802,7 +1800,7 @@ test("renders a live tree independently and observes cache completion", async ({
     await expect(treeRow(page, "bulk-23/generated-09.ts")).toBeVisible();
     await filter.fill("");
 
-    await withBound(watch.cacheReady, 60_000, "cache-ready version 0");
+    await withBound(watch.cacheReady, 60_000, "cache-ready");
 
     await openDefinitionSource(page, "marker.ts", "marker");
     await expect(page.locator("#editor-path")).toHaveText("marker.ts", { timeout: 30_000 });
@@ -1894,7 +1892,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     const initialReady = await withBound(
       watch.cacheReady,
       45_000,
-      "case-insensitive search cache-ready version 0",
+      "case-insensitive search cache-ready",
     );
     await expect(treeRow(page, "index.ts")).toBeVisible({ timeout: 10_000 });
 
@@ -2126,7 +2124,7 @@ test("prints the open file with light syntax colors", async ({ browser }) => {
     });
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
-    await withBound(watch.cacheReady, 45_000, "print fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 45_000, "print fixture cache-ready");
 
     await expect(page.locator("#editor-print")).toBeHidden();
     await expect(page.locator("#editor-empty")).toHaveText(
@@ -2186,7 +2184,7 @@ test("resolves concurrent file outlines independently and discards superseded on
     const page = resource.page;
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
-    await withBound(watch.cacheReady, 45_000, "outline fixture cache-ready version 0");
+    await withBound(watch.cacheReady, 45_000, "outline fixture cache-ready");
 
     const outlineRoute = "**/api/file-definitions?*";
 

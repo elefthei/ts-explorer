@@ -12,6 +12,15 @@ export async function removeFixtureRoot(root: string): Promise<void> {
   await rm(root, { recursive: true, force: true });
 }
 
+/**
+ * A non-zero starting watch version. Tests assert relative to the store's own version; the random
+ * seed makes any assertion that pins a literal version fail on its first run rather than on a
+ * loaded machine every few runs.
+ */
+export function randomVersionSeed(): number {
+  return 1_000 + Math.floor(Math.random() * 1_000_000);
+}
+
 export function createFixtureTracker(): {
   temporaryRoot(prefix: string): Promise<string>;
   writeFixtureFile(

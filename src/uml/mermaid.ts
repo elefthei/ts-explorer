@@ -16,6 +16,38 @@ export const STYLE_DEFS = [
   ["rootNode", "stroke:#f4f7fb,stroke-width:4px"],
 ] as const;
 
+/**
+ * Font colour per native outline kind: the box fill already separates the UML categories, so the
+ * ink separates what a category cannot — a module from a function, a struct from a union's alias.
+ * Deliberately warm; every diagram background in the app is blue.
+ */
+export const KIND_INK_DEFS = [
+  ["kindModule", "color:#ffd166"],
+  ["kindTrait", "color:#ff6b6b"],
+  ["kindStruct", "color:#f4f7fb"],
+  ["kindEnum", "color:#ff9f1c"],
+  ["kindType", "color:#ff8fd0"],
+  ["kindFunction", "color:#c9e265"],
+] as const;
+
+/** Which ink a kind draws its label and rows in; an unlisted kind keeps the default white. */
+export const INK_CLASS_BY_KIND: Record<string, string> = {
+  module: "kindModule",
+  namespace: "kindModule",
+  trait: "kindTrait",
+  interface: "kindTrait",
+  struct: "kindStruct",
+  class: "kindStruct",
+  union: "kindStruct",
+  enum: "kindEnum",
+  type: "kindType",
+  function: "kindFunction",
+  method: "kindFunction",
+  getter: "kindFunction",
+  setter: "kindFunction",
+  macro: "kindFunction",
+};
+
 export const FILE_STYLE_DEFS = [
   ["file", "fill:#1d4d3b,stroke:#58d68d,color:#f4f7fb"],
   ["testFile", "fill:#1d4d3b,stroke:#ff5c5c,color:#f4f7fb,stroke-dasharray: 6 4"],

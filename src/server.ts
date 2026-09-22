@@ -16,6 +16,7 @@ type ServerOptions = {
   port: number;
   onSyncProgress?: (event: PreprocessProgressEvent) => void;
   onWatchBatch?: (paths: readonly string[], events: readonly WatchEventName[], version: number) => void;
+  initialVersion?: number;
 };
 
 type Socket = ServerWebSocket<undefined>;
@@ -89,6 +90,7 @@ export class ExplorerServer {
           // Diagnostics must not interrupt watcher or client delivery.
         }
       },
+      options.initialVersion,
     );
   }
 

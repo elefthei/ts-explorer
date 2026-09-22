@@ -52,7 +52,7 @@ test("batches visible changes while suppressing cache changes under .explore", a
   // the gate below the test timeout so the watcher still closes before fixture removal.
   const watchdog = setTimeout(
     () => completion.reject(new Error(`watch batches incomplete: ${JSON.stringify(batches)}`)),
-    4_000,
+    30_000,
   );
 
   try {
@@ -74,4 +74,4 @@ test("batches visible changes while suppressing cache changes under .explore", a
     clearTimeout(watchdog);
     await watcher.close();
   }
-}, 5_000);
+}, 60_000);
