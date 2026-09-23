@@ -91,6 +91,49 @@ test("the root directory contains every visible file and its imports point both 
   expect(contract.edges).toHaveLength(5);
 });
 
+test("a directory selection ignores dotfiles, hidden subtrees and every edge touching them", async () => {
+  const project = await openProject("ts-explorer-uml-hidden-", {
+    "area/visible.ts": `import { secret } from "./.hidden/secret";
+import { Shape } from "../outside/shape";
+export const value = secret;
+export type Alias = Shape;
+`,
+    "area/.dotfile.ts": `import { Shape } from "../outside/shape";
+export const ignored = 1;
+`,
+    "area/.hidden/secret.ts": "export const secret = 1;\n",
+    "area/notes.md": "not a source file\n",
+    "outside/shape.ts": "export interface Shape { size: number; }\n",
+    ".tooling/generated.ts": `import { Shape } from "../outside/shape";
+export const generated = 1;
+`,
+  });
+
+  // A hidden file is neither a subtree member nor a boundary leaf, so the import into it vanishes
+  // with it; the visible sibling keeps its ordinary outside edge.
+  const area = toFileContract(readCompleteUml(project, { kind: "directory", path: "area" }));
+  expect(area.nodes).toEqual([
+    { path: "area/notes.md", boundary: false, test: false },
+    { path: "area/visible.ts", boundary: false, test: false },
+    { path: "outside/shape.ts", boundary: true, test: false },
+  ]);
+  expect(area.edges).toEqual([{ source: "area/visible.ts", target: "outside/shape.ts" }]);
+
+  const root = toFileContract(readCompleteUml(project, { kind: "directory", path: "" }));
+  expect(root.nodes.map((node) => node.path)).toEqual([
+    "area/notes.md",
+    "area/visible.ts",
+    "outside/shape.ts",
+  ]);
+  expect(root.edges).toEqual([{ source: "area/visible.ts", target: "outside/shape.ts" }]);
+
+  // Selecting a hidden directory is legal and simply graphs nothing.
+  const hidden = toFileContract(readCompleteUml(project, { kind: "directory", path: ".tooling" }));
+  expect(hidden.status).toBe("ready");
+  expect(hidden.nodes).toEqual([]);
+  expect(hidden.edges).toEqual([]);
+});
+
 test("local bindings shadow project declarations instead of creating edges", async () => {
   const project = await openProject("ts-explorer-uml-shadowing-", {
     "shadow.ts": `import { Helper } from "./helper";

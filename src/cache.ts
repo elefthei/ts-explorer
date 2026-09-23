@@ -1385,6 +1385,15 @@ function directoryRange(path: string): { from: string; to: string } | null {
   return { from: `${path}/`, to: `${path}0` };
 }
 
+/**
+ * A dot-prefixed file or directory is tooling metadata, never a UML subject. Kept in SQL so a
+ * hidden subtree never materializes a row; `.` and `/` carry no meaning to LIKE, so the literals
+ * need no escape clause.
+ */
+function visiblePath(column: string): string {
+  return `(${column} NOT LIKE '.%' AND ${column} NOT LIKE '%/.%')`;
+}
+
 export class Cache {
   private static createSchema(
     db: Database,
@@ -2083,6 +2092,8 @@ export class Cache {
     path: string,
   ): UmlDiagramPayload {
     this.assertTreeKind(generationId, path, "directory");
+    // Both queries drop dot-prefixed paths, so a hidden file is neither a subtree member nor a
+    // boundary leaf; selecting a hidden directory itself renders as an empty graph.
     const range = directoryRange(path);
     const inside = range
       ? this.query.selectDirectoryFiles.all(generationId, range.from, range.to)
@@ -2752,10 +2763,13 @@ function prepareQueries(db: Database) {
     selectDirectoryFiles: db.query<{ path: string }, [number, string, string]>(`
       SELECT path FROM tree_entries
       WHERE generation_id = ? AND kind = 'file' AND path >= ? AND path < ?
+        AND ${visiblePath("path")}
       ORDER BY path
     `),
     selectAllFiles: db.query<{ path: string }, [number]>(`
-      SELECT path FROM tree_entries WHERE generation_id = ? AND kind = 'file' ORDER BY path
+      SELECT path FROM tree_entries
+      WHERE generation_id = ? AND kind = 'file' AND ${visiblePath("path")}
+      ORDER BY path
     `),
     selectDirectoryImports: db.query<
       { source_path: string; target_path: string },
@@ -2763,9 +2777,12 @@ function prepareQueries(db: Database) {
     >(`
       SELECT source_path, target_path FROM file_imports
       WHERE generation_id = ? AND source_path >= ? AND source_path < ?
+        AND ${visiblePath("source_path")} AND ${visiblePath("target_path")}
     `),
     selectAllImports: db.query<{ source_path: string; target_path: string }, [number]>(`
-      SELECT source_path, target_path FROM file_imports WHERE generation_id = ?
+      SELECT source_path, target_path FROM file_imports
+      WHERE generation_id = ?
+        AND ${visiblePath("source_path")} AND ${visiblePath("target_path")}
     `),
     selectPackages: db.query<PackageRow, [number]>(`
       SELECT packages_json FROM package_snapshots WHERE generation_id = ?
