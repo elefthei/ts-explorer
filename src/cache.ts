@@ -19,6 +19,7 @@ import { validatePackageDiagramGraph } from "./packages.ts";
 import { buildSearchScopes } from "./search.ts";
 import { isSourcePath } from "./source.ts";
 import {
+  DEFAULT_UML_DEPTH,
   FILE_DEFINITION_KINDS,
   type DiagramKind,
   type EditorGotoDefinition,
@@ -104,6 +105,8 @@ type TreeRow = {
   kind: "directory" | "file";
   viewable: number;
 };
+/** Column list shared by the tree_entries row queries. */
+const TREE_ENTRY_COLUMNS = "path, name, kind, viewable";
 type DiagramRow = { response_json: string };
 type FileRow = {
   path: string;
@@ -129,6 +132,10 @@ type GotoDefinitionRow = {
   uml_member_name: string | null;
   uml_member_occurrence: number | null;
 };
+/** Column list shared by the GotoDef row queries; the continuation indent matches their SQL. */
+const GOTO_DEFINITION_COLUMNS = `definition_key, kind, name, qualified_name, source_path, source_line,
+        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
+        uml_member_name, uml_member_occurrence`;
 type DefinitionIndexRow = {
   definition_key: string;
   parent_key: string | null;
@@ -142,6 +149,9 @@ type DefinitionIndexRow = {
   source_line: number;
   source_column: number;
 };
+/** Column list shared by the DefinitionIndex row queries; the continuation indent matches their SQL. */
+const DEFINITION_INDEX_COLUMNS = `definition_key, parent_key, is_top_level, has_body, name, qualified_name,
+        kind, type_text, source_path, source_line, source_column`;
 type DefinitionLocationRow = {
   source_path: string;
   source_line: number;
@@ -721,6 +731,20 @@ type CacheTableName = Extract<
 const CACHE_SCHEMA_BY_NAME = new Map<CacheSchemaObjectName, CacheSchemaObjectDefinition>(
   CACHE_SCHEMA_OBJECTS.map((definition) => [definition.name, definition] as const),
 );
+
+/** Drops schema objects in reverse declaration order so children are removed before their parents. */
+function dropSchemaObjects(db: Database, definitions: readonly CacheSchemaObjectDefinition[]): void {
+  for (let index = definitions.length - 1; index >= 0; index -= 1) {
+    const definition = definitions[index];
+    if (!definition) continue;
+    const objectKind = definition.kind === "trigger"
+      ? "TRIGGER"
+      : definition.kind === "index"
+        ? "INDEX"
+        : "TABLE";
+    db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
+  }
+}
 
 const CACHE_TABLE_BY_LOWER_NAME = new Map<string, CacheTableName>(
   CACHE_SCHEMA_OBJECTS.flatMap((definition) =>
@@ -1374,16 +1398,7 @@ export class Cache {
   private static recreateSchema(db: Database): void {
     // Descriptors no longer list the version-8 UML tables, so they are dropped by name first.
     for (const name of REMOVED_CACHE_TABLES) db.run(`DROP TABLE IF EXISTS "${name}"`);
-    for (let index = CACHE_SCHEMA_OBJECTS.length - 1; index >= 0; index -= 1) {
-      const definition = CACHE_SCHEMA_OBJECTS[index];
-      if (!definition) continue;
-      const objectKind = definition.kind === "trigger"
-        ? "TRIGGER"
-        : definition.kind === "index"
-          ? "INDEX"
-          : "TABLE";
-      db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
-    }
+    dropSchemaObjects(db, CACHE_SCHEMA_OBJECTS);
     Cache.createSchema(db);
     db.run(`PRAGMA user_version=${CACHE_SCHEMA_VERSION}`);
   }
@@ -1793,16 +1808,7 @@ export class Cache {
     });
     const selectedObjects = new Set(schemaObjects);
     this.db.transaction(() => {
-      for (let index = definitions.length - 1; index >= 0; index -= 1) {
-        const definition = definitions[index];
-        if (!definition) continue;
-        const objectKind = definition.kind === "trigger"
-          ? "TRIGGER"
-          : definition.kind === "index"
-            ? "INDEX"
-            : "TABLE";
-        this.db.run(`DROP ${objectKind} IF EXISTS "${definition.name}"`);
-      }
+      dropSchemaObjects(this.db, definitions);
       Cache.createSchema(this.db, selectedObjects);
     }).immediate();
     return tableName;
@@ -2037,13 +2043,20 @@ export class Cache {
     };
   }
 
-  /** The rooted UML selection, or the set of file graphs that must be preprocessed first. */
-  readUmlDiagram(generationId: number, target: UmlTarget): UmlDiagramRead {
+  /**
+   * The rooted UML selection, or the set of file graphs that must be preprocessed first. `depth`
+   * bounds outgoing dependency hops from every root; a directory import graph ignores it.
+   */
+  readUmlDiagram(
+    generationId: number,
+    target: UmlTarget,
+    depth = DEFAULT_UML_DEPTH,
+  ): UmlDiagramRead {
     const path = normalizeRelativePath(target.path);
     if (target.kind === "directory") {
       return { state: "complete", diagram: this.readDirectoryDiagram(generationId, target, path) };
     }
-    return this.readDefinitionDiagram(generationId, target, path);
+    return this.readDefinitionDiagram(generationId, target, path, depth);
   }
 
   private assertTreeKind(
@@ -2118,25 +2131,30 @@ export class Cache {
     };
   }
 
+  private definitionDiagramError(target: UmlTarget, path: string, error: string): UmlDiagramRead {
+    return {
+      state: "complete",
+      diagram: {
+        kind: "uml",
+        scopePath: path,
+        target,
+        status: "error",
+        view: { kind: "definitions", nodes: [], edges: [], frames: [] },
+        error,
+      },
+    };
+  }
+
   private readDefinitionDiagram(
     generationId: number,
     target: UmlTarget,
     path: string,
+    depth: number,
   ): UmlDiagramRead {
     this.assertTreeKind(generationId, path, "file");
     const record = this.query.selectFile.get(generationId, path);
     if (record?.source_error) {
-      return {
-        state: "complete",
-        diagram: {
-          kind: "uml",
-          scopePath: path,
-          target,
-          status: "error",
-          view: { kind: "definitions", nodes: [], edges: [], frames: [] },
-          error: record.source_error,
-        },
-      };
+      return this.definitionDiagramError(target, path, record.source_error);
     }
     let roots: IndexedFileDefinition[];
     if (target.kind === "definition") {
@@ -2154,7 +2172,7 @@ export class Cache {
     const visibleKeys = new Set<string>();
     const edges = new Map<string, UmlDefinitionEdge>();
     for (const root of roots) {
-      const frame = reader.closure(root.key);
+      const frame = reader.closure(root.key, depth);
       if (reader.missing.size || reader.error) break;
       frames.push({ rootKey: root.key, nodeKeys: [...frame.keys].sort() });
       for (const key of frame.keys) visibleKeys.add(key);
@@ -2162,17 +2180,7 @@ export class Cache {
     }
     if (reader.missing.size) return { state: "pending", files: [...reader.missing].sort() };
     if (reader.error) {
-      return {
-        state: "complete",
-        diagram: {
-          kind: "uml",
-          scopePath: path,
-          target,
-          status: "error",
-          view: { kind: "definitions", nodes: [], edges: [], frames: [] },
-          error: reader.error,
-        },
-      };
+      return this.definitionDiagramError(target, path, reader.error);
     }
     const nodes = [...visibleKeys]
       .map((key) => reader.node(key))
@@ -2383,15 +2391,24 @@ class UmlSelectionReader {
     return false;
   }
 
-  closure(rootKey: string): { keys: Set<string>; edges: UmlDefinitionEdge[] } {
+  /**
+   * Breadth-first closure from `rootKey`, admitting a node only while its source level is below
+   * `maxDepth`. The root is level 0, so `maxDepth` 0 yields the root alone. Every admitted node —
+   * frontier included — still has its effective adjacency inspected, so its contributors are
+   * hydrated for `node()` and its relations to other admitted nodes survive; only relations to
+   * out-of-range endpoints are dropped.
+   */
+  closure(rootKey: string, maxDepth: number): { keys: Set<string>; edges: UmlDefinitionEdge[] } {
     const keys = new Set<string>();
     const edges: UmlDefinitionEdge[] = [];
-    const queue = [rootKey];
-    while (queue.length) {
-      const key = queue.shift();
-      if (key === undefined || keys.has(key)) continue;
-      if (!this.definition(key)) continue;
-      keys.add(key);
+    if (!this.definition(rootKey)) return { keys, edges };
+    keys.add(rootKey);
+    // FIFO with a moving head: a key is admitted exactly once, at its shortest distance.
+    const queue: { key: string; level: number }[] = [{ key: rootKey, level: 0 }];
+    for (let head = 0; head < queue.length; head += 1) {
+      const entry = queue[head];
+      if (entry === undefined) break;
+      const { key, level } = entry;
       const source = this.definition(key);
       const nominal = source !== undefined && isNominalKind(source.kind);
       for (const edge of this.effectiveAdjacency(key)) {
@@ -2402,7 +2419,9 @@ class UmlSelectionReader {
         // A recursive reference stays in SQL; the view never draws a self arrow.
         if (edge.targetKey === key) continue;
         edges.push({ sourceKey: key, targetKey: edge.targetKey, kind: edge.kind });
-        queue.push(edge.targetKey);
+        if (keys.has(edge.targetKey) || level >= maxDepth) continue;
+        keys.add(edge.targetKey);
+        queue.push({ key: edge.targetKey, level: level + 1 });
       }
     }
     return { keys, edges: edges.filter((edge) => keys.has(edge.targetKey)) };
@@ -2646,29 +2665,28 @@ function prepareQueries(db: Database) {
       LIMIT 1
     `),
     selectFileDefinitions: db.query<DefinitionIndexRow, [number, string]>(`
-      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
-        kind, type_text, source_path, source_line, source_column
+      SELECT ${DEFINITION_INDEX_COLUMNS}
       FROM DefinitionIndex
       WHERE generation_id = ? AND source_path = ?
       ORDER BY source_line, source_column, definition_key
     `),
     selectTopLevelDefinitions: db.query<DefinitionIndexRow, [number, string]>(`
-      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
-        kind, type_text, source_path, source_line, source_column
+      SELECT ${DEFINITION_INDEX_COLUMNS}
       FROM DefinitionIndex
       WHERE generation_id = ? AND source_path = ? AND is_top_level = 1
       ORDER BY source_line, source_column, definition_key
     `),
     selectDefinitionByKey: db.query<DefinitionIndexRow, [number, string]>(`
-      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
-        kind, type_text, source_path, source_line, source_column
+      SELECT ${DEFINITION_INDEX_COLUMNS}
       FROM DefinitionIndex
       WHERE generation_id = ? AND definition_key = ?
     `),
+    // INDEXED BY is required: left free, SQLite picks definition_index_by_source
+    // (generation_id only) and turns each of a rooted traversal's thousands of
+    // child lookups into a scan of the whole generation's definition catalogue.
     selectDefinitionChildren: db.query<DefinitionIndexRow, [number, string]>(`
-      SELECT definition_key, parent_key, is_top_level, has_body, name, qualified_name,
-        kind, type_text, source_path, source_line, source_column
-      FROM DefinitionIndex
+      SELECT ${DEFINITION_INDEX_COLUMNS}
+      FROM DefinitionIndex INDEXED BY definition_index_by_parent
       WHERE generation_id = ? AND parent_key = ?
       ORDER BY source_path, source_line, source_column, definition_key
     `),
@@ -2695,9 +2713,12 @@ function prepareQueries(db: Database) {
       WHERE generation_id = ? AND source_path = ? AND scope_key = ? AND binding_kind = 'export'
       ORDER BY name, space, ordinal
     `),
+    // INDEXED BY is required: left free, SQLite picks the primary key on
+    // (generation_id, kind) and rescans every 'uml' relation in the generation
+    // for each owner a rooted traversal expands.
     selectOutgoingRelations: db.query<RelationRow, [number, string]>(`
       SELECT DISTINCT target_node_id, relation_kind
-      FROM diagram_edge_relations
+      FROM diagram_edge_relations INDEXED BY diagram_relations_by_source
       WHERE generation_id = ? AND source_node_id = ? AND kind = 'uml'
       ORDER BY target_node_id, relation_kind
     `),
@@ -2712,19 +2733,19 @@ function prepareQueries(db: Database) {
       ORDER BY ordinal
     `),
     selectTreeEntries: db.query<TreeRow, [number]>(`
-      SELECT path, name, kind, viewable
+      SELECT ${TREE_ENTRY_COLUMNS}
       FROM tree_entries
       WHERE generation_id = ?
       ORDER BY path
     `),
     selectTreeChildren: db.query<TreeRow, [number, string, string]>(`
-      SELECT path, name, kind, viewable
+      SELECT ${TREE_ENTRY_COLUMNS}
       FROM tree_entries
       WHERE generation_id = ? AND parent_path = ? AND path <> ?
       ORDER BY path
     `),
     selectTreeEntry: db.query<TreeRow, [number, string]>(`
-      SELECT path, name, kind, viewable
+      SELECT ${TREE_ENTRY_COLUMNS}
       FROM tree_entries
       WHERE generation_id = ? AND path = ?
     `),
@@ -2763,18 +2784,14 @@ function prepareQueries(db: Database) {
       FROM files WHERE generation_id = ? AND path = ?
     `),
     selectDefinition: db.query<GotoDefinitionRow, [number, string, number, number]>(`
-      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
-        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
-        uml_member_name, uml_member_occurrence
+      SELECT ${GOTO_DEFINITION_COLUMNS}
       FROM GotoDef
       WHERE generation_id = ? AND source_path = ? AND source_line = ? AND source_column = ?
       ORDER BY definition_key
       LIMIT 1
     `),
     selectDefinitions: db.query<GotoDefinitionRow, [number, string]>(`
-      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
-        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
-        uml_member_name, uml_member_occurrence
+      SELECT ${GOTO_DEFINITION_COLUMNS}
       FROM GotoDef
       WHERE generation_id = ? AND source_path = ?
       ORDER BY source_line, source_column, definition_key
@@ -2800,9 +2817,7 @@ function prepareQueries(db: Database) {
         AND (goto_def_search.name LIKE ? OR goto_def_search.qualified_name LIKE ?)
     `),
     selectScanDefinitionCandidates: db.query<GotoDefinitionRow, [number]>(`
-      SELECT definition_key, kind, name, qualified_name, source_path, source_line,
-        source_column, display_from, display_to, uml_scope_path, uml_entity_name,
-        uml_member_name, uml_member_occurrence
+      SELECT ${GOTO_DEFINITION_COLUMNS}
       FROM GotoDef WHERE generation_id = ?
     `),
     markGenerationActive: db.query<never, [number, number]>(`

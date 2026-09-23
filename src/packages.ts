@@ -6,6 +6,8 @@ import {
   type RenderedPackageDiagram,
 } from "./diagram-graph.ts";
 import { normalizeRelativePath } from "./paths.ts";
+import { escapeMermaidLabel } from "./uml/mermaid.ts";
+import { pairKey } from "./uml/keys.ts";
 import type { PackageDiagramNode, PackageInfo } from "./types.ts";
 
 function toPosix(path: string): string {
@@ -302,7 +304,7 @@ export function validatePackageDiagramGraph(
     if (!nodes.has(edge.sourceNodeId) || !nodes.has(edge.targetNodeId)) {
       invalidPackageGraph(`edge ${edge.edgeOrdinal} has a missing endpoint`);
     }
-    const edgeKey = JSON.stringify([edge.sourceNodeId, edge.targetNodeId]);
+    const edgeKey = pairKey(edge.sourceNodeId, edge.targetNodeId);
     if (edgeKeys.has(edgeKey)) invalidPackageGraph(`duplicate package edge ${edge.edgeOrdinal}`);
     edgeKeys.add(edgeKey);
     edges.set(edge.edgeOrdinal, edge);
@@ -342,7 +344,7 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedP
   const lines = ["flowchart LR"];
   const packageNodes: PackageDiagramNode[] = [];
   for (const node of graph.nodes) {
-    lines.push(`  ${node.nodeId}["${escapeLabel(node.name)}"]`);
+    lines.push(`  ${node.nodeId}["${escapeMermaidLabel(node.name)}"]`);
     if (node.nodeKind === "package") {
       const packagePath = packageRows.get(node.nodeId);
       if (packagePath === undefined || packagePath === null) {
@@ -368,9 +370,4 @@ export function renderPackageDiagramGraph(graph: PackageDiagramGraph): RenderedP
     dsls: [dsl],
     packageNodes,
   };
-}
-
-
-function escapeLabel(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 }

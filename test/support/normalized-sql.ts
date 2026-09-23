@@ -1,5 +1,5 @@
 import { expect } from "bun:test";
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type DiagramGraph,
@@ -8,11 +8,39 @@ import {
 } from "../../src/diagram-graph.ts";
 import type {
   DiagramKind,
-  DiagramResponse,
   FileDefinitionKind,
   PackageDiagramPayload,
 } from "../../src/types.ts";
 import type { DefinitionIndexSnapshot } from "../../src/uml/model.ts";
+
+/**
+ * Opens `dbPath`, runs `operation`, and always closes the handle.
+ *
+ * A writable handle keeps the database file locked on Windows until it is collected, so it is
+ * released with `Bun.gc(true)` after `close()` and the temporary fixture can then be unlinked. A
+ * read-only handle never blocks deletion and is closed strictly instead.
+ */
+export function openDatabase<Value>(
+  dbPath: string,
+  operation: (db: Database) => Value,
+  options: { readonly?: boolean } = {},
+): Value {
+  const readonly = options.readonly === true;
+  let db: Database | null = readonly
+    ? new Database(dbPath, { strict: true, readonly: true })
+    : new Database(dbPath, { strict: true });
+  try {
+    return operation(db);
+  } finally {
+    if (readonly) {
+      db.close(true);
+    } else {
+      db.close();
+      db = null;
+      Bun.gc(true);
+    }
+  }
+}
 
 /**
  * Schema version 9. Every persisted graph and every catalogue snapshot is projected here to the
@@ -107,7 +135,7 @@ function tableSpec<
   };
 }
 
-export const NORMALIZED_TABLE_SPECS = {
+const NORMALIZED_TABLE_SPECS = {
   diagram_graphs: tableSpec(
     "diagram_graphs",
     ["format_version", "render_mode"],
@@ -419,13 +447,6 @@ const CATALOGUE_TABLE_SPECS = {
   ),
 } satisfies { [Table in CatalogueTable]: CatalogueTableSpec<Table> };
 
-type NormalizedSnapshotRecordFor<Table extends NormalizedTable> =
-  & { table: Table }
-  & Omit<NormalizedRowByTable[Table], "generation_id">;
-export type NormalizedSnapshotRecord = {
-  [Table in NormalizedTable]: NormalizedSnapshotRecordFor<Table>;
-}[NormalizedTable];
-
 /**
  * `diagrams.response_json` holds a `PackageDiagramPayload` for the package graph and only the
  * `UmlFileOutcome` completion marker for a source file; the UML display model lives in the
@@ -439,16 +460,11 @@ export type NormalizedGraphSnapshot = {
     format_version: typeof DIAGRAM_GRAPH_FORMAT_VERSION;
     render_mode: "normal" | "bare";
   };
-  records: NormalizedSnapshotRecord[];
   response: PackageDiagramPayload | UmlFileOutcome;
 };
 
 const NORMALIZED_TABLES = Object.keys(NORMALIZED_TABLE_SPECS) as NormalizedTable[];
 const CATALOGUE_TABLES = Object.keys(CATALOGUE_TABLE_SPECS) as CatalogueTable[];
-const GENERATION_SCOPED_TABLES: readonly (NormalizedTable | CatalogueTable)[] = [
-  ...NORMALIZED_TABLES,
-  ...CATALOGUE_TABLES,
-];
 type IdentityBindings = [number, DiagramKind, string];
 
 /**
@@ -551,11 +567,6 @@ export function readNormalizedGraphSnapshot(
     scopePath,
   );
   if (!header) throw new Error(`normalized ${kind} graph is missing: ${scopePath}`);
-  const records = NORMALIZED_TABLES.flatMap((table) =>
-    table === "diagram_graphs" ? [] : withoutGeneration(
-      graphRows(db, table, generationId, kind, scopePath),
-    ).map((record) => ({ table, ...record } as NormalizedSnapshotRecord))
-  );
   const responseRow = identityRow<{ response_json: string }>(
     db,
     `SELECT response_json FROM diagrams
@@ -570,7 +581,6 @@ export function readNormalizedGraphSnapshot(
     kind,
     scopePath,
     header,
-    records,
     response: JSON.parse(responseRow.response_json) as NormalizedGraphSnapshot["response"],
   };
 }
@@ -609,51 +619,5 @@ export function expectCatalogueRows(
     );
     expect(actual, table).toEqual(expected);
   }
-}
-
-export function normalizedGenerationIds(
-  db: Database,
-  table: NormalizedTable | CatalogueTable,
-): number[] {
-  // The table name is interpolated, so only a known schema object may reach the statement.
-  const allowed = GENERATION_SCOPED_TABLES.find((candidate) => candidate === table);
-  if (!allowed) throw new Error(`unknown normalized table: ${table}`);
-  const statement = db.query<{ generation_id: number }, []>(`
-    SELECT DISTINCT generation_id FROM ${allowed} ORDER BY generation_id
-  `);
-  try {
-    return statement.all().map(({ generation_id }) => generation_id);
-  } finally {
-    statement.finalize();
-  }
-}
-
-export function expectOnlyNormalizedGeneration(db: Database, generationId: number): void {
-  for (const table of GENERATION_SCOPED_TABLES) {
-    const ids = normalizedGenerationIds(db, table);
-    expect(ids, table).toEqual(ids.length === 0 ? [] : [generationId]);
-  }
-  const statement = db.query<{ diagram_count: number; graph_count: number }, [number, number]>(`
-    SELECT
-      (SELECT COUNT(*) FROM diagrams WHERE generation_id = ?) AS diagram_count,
-      (SELECT COUNT(*) FROM diagram_graphs WHERE generation_id = ?) AS graph_count
-  `);
-  try {
-    const counts = statement.get(generationId, generationId);
-    if (!counts) throw new Error(`normalized generation ${generationId} is missing`);
-    expect(counts.graph_count).toBeGreaterThan(0);
-    expect(counts.diagram_count).toBe(counts.graph_count);
-  } finally {
-    statement.finalize();
-  }
-}
-
-/** The package graph's `diagrams` row is still the full public payload, minus its version. */
-export function expectSnapshotResponse(
-  snapshot: NormalizedGraphSnapshot,
-  response: Extract<DiagramResponse, { kind: "packages" }>,
-): void {
-  const { version: _version, ...withoutVersion } = response;
-  expect(snapshot.response).toEqual(withoutVersion);
 }
 

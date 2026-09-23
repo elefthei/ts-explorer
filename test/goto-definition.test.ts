@@ -39,6 +39,23 @@ function contractRows(path: string, content: string) {
   }));
 }
 
+/** One interface merged from two declarations, in compact and reformatted spellings. */
+const MERGED_COMPACT = [
+  "export interface Merged<T>{run():void}",
+  "export interface Merged<T>{run(value:T):void;stop():void}",
+  "",
+].join("\n");
+const MERGED_FORMATTED = [
+  "export interface Merged<T> {",
+  "  run(): void;",
+  "}",
+  "export interface Merged<T> {",
+  "  run(value: T): void;",
+  "  stop(): void;",
+  "}",
+  "",
+].join("\n");
+
 test("parses every UML-addressable declaration with canonical names, keys, and source spans", () => {
   const source = [
     "export class Box<T, U> {",
@@ -277,24 +294,8 @@ test("parses every UML-addressable declaration with canonical names, keys, and s
 });
 
 test("keys distinguish declaration merges and overloads while remaining stable after formatting", () => {
-  const compact = [
-    "export interface Merged<T>{run():void}",
-    "export interface Merged<T>{run(value:T):void;stop():void}",
-    "",
-  ].join("\n");
-  const formatted = [
-    "export interface Merged<T> {",
-    "  run(): void;",
-    "}",
-    "export interface Merged<T> {",
-    "  run(value: T): void;",
-    "  stop(): void;",
-    "}",
-    "",
-  ].join("\n");
-
-  const compactDefinitions = parseDefinitionSpans("merged.ts", compact);
-  const formattedDefinitions = parseDefinitionSpans("merged.ts", formatted);
+  const compactDefinitions = parseDefinitionSpans("merged.ts", MERGED_COMPACT);
+  const formattedDefinitions = parseDefinitionSpans("merged.ts", MERGED_FORMATTED);
   const expectedKeys = [
     '["interface","Merged",0,null,null]',
     '["interface","Merged",0,"run",0]',
@@ -747,38 +748,25 @@ test("constructor parameter properties belong to the class, not the constructor"
 });
 
 test("outline keys identify one declaration per file and survive reformatting", () => {
-  const compact = [
-    "export interface Merged<T>{run():void}",
-    "export interface Merged<T>{run(value:T):void;stop():void}",
-    "",
-  ].join("\n");
-  const formatted = [
-    "export interface Merged<T> {",
-    "  run(): void;",
-    "}",
-    "export interface Merged<T> {",
-    "  run(value: T): void;",
-    "  stop(): void;",
-    "}",
-    "",
-  ].join("\n");
-
-  const compactKeys = parseFileDefinitions("merged.ts", compact).map(({ key }) => key);
-  const formattedKeys = parseFileDefinitions("merged.ts", formatted).map(({ key }) => key);
+  const compactKeys = parseFileDefinitions("merged.ts", MERGED_COMPACT).map(({ key }) => key);
+  const formattedKeys = parseFileDefinitions("merged.ts", MERGED_FORMATTED).map(({ key }) => key);
   expect(compactKeys).toEqual(formattedKeys);
   expect(new Set(compactKeys).size).toBe(compactKeys.length);
   // A line-only edit keeps every root selectable, so a selection survives editing above it.
-  expect(parseFileDefinitions("merged.ts", `\n\n${formatted}`).map(({ key }) => key))
+  expect(parseFileDefinitions("merged.ts", `\n\n${MERGED_FORMATTED}`).map(({ key }) => key))
     .toEqual(formattedKeys);
   // Each merged block owns its own members rather than the first block's.
-  expect(ownershipRows("merged.ts", formatted)).toEqual([
+  expect(ownershipRows("merged.ts", MERGED_FORMATTED)).toEqual([
     "Merged | root | —",
     "Merged.run | nested | Merged",
     "Merged | root | —",
     "Merged.run | nested | Merged",
     "Merged.stop | nested | Merged",
   ]);
-  const [firstBlock, firstRun, secondBlock, secondRun] = parseFileDefinitions("merged.ts", formatted);
+  const [firstBlock, firstRun, secondBlock, secondRun] = parseFileDefinitions(
+    "merged.ts",
+    MERGED_FORMATTED,
+  );
   expect(firstRun?.parentKey).toBe(firstBlock?.key ?? "");
   expect(secondRun?.parentKey).toBe(secondBlock?.key ?? "");
 

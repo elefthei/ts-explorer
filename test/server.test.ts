@@ -1,12 +1,22 @@
-import { expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { afterEach, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { resolveCacheDbPath, resolveSourceDir } from "../src/paths.ts";
 import { ExplorerServer } from "../src/server.ts";
 import { ExplorerStore } from "../src/store.ts";
+import { withBound } from "./support/async.ts";
 import { createFixtureTracker, randomVersionSeed, removeFixtureRoot } from "./support/fixtures.ts";
+import { openDatabase } from "./support/normalized-sql.ts";
+import {
+  type DefinitionsView,
+  definitionsView,
+  edgeRows,
+  filesView,
+  frameRows,
+  umlLabel,
+} from "./support/uml-contract.ts";
 import type {
   DiagramResponse,
   FileDefinition,
@@ -19,7 +29,6 @@ import type {
   WatchEventName,
   WatchMessage,
 } from "../src/types.ts";
-import type { UmlViewModel } from "../src/uml/view.ts";
 
 type WatchClient = {
   waitFor(predicate: (message: WatchMessage) => boolean): Promise<WatchMessage>;
@@ -56,15 +65,6 @@ function queryOne<Row>(db: Database, sql: string, ...bindings: SqlValue[]): Row 
     return statement.get(...bindings);
   } finally {
     statement.finalize();
-  }
-}
-
-function openDatabase<Value>(dbPath: string, operation: (db: Database) => Value): Value {
-  const db = new Database(dbPath, { strict: true, readonly: true });
-  try {
-    return operation(db);
-  } finally {
-    db.close(true);
   }
 }
 
@@ -154,57 +154,16 @@ function readActivePackageGraph(dbPath: string): PackageGraphRows {
         generationId,
       ),
     };
-  });
+  }, { readonly: true });
 }
-
-type DefinitionsView = Extract<UmlViewModel, { kind: "definitions" }>;
-type FilesView = Extract<UmlViewModel, { kind: "files" }>;
 
 function packagesPayload(response: DiagramResponse): PackageDiagramPayload {
   if (response.kind !== "packages") throw new Error("expected a packages diagram response");
   return response;
 }
 
-function definitionsView(response: DiagramResponse): DefinitionsView {
-  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
-  if (response.view.kind !== "definitions") throw new Error("expected a definitions view");
-  return response.view;
-}
-
-function filesView(response: DiagramResponse): FilesView {
-  if (response.kind !== "uml") throw new Error("expected a uml diagram response");
-  if (response.view.kind !== "files") throw new Error("expected a files view");
-  return response.view;
-}
-
-// Identities are asserted by qualified name and source path; the catalogue key serialization is
-// an implementation detail that tests must not pin.
-function label(definition: FileDefinition): string {
-  return `${definition.qualifiedName}@${definition.source.path}`;
-}
-
-function labelsByKey(view: DefinitionsView): Map<string, string> {
-  return new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
-}
-
 function definitionLabels(view: DefinitionsView): string[] {
-  return view.nodes.map((node) => label(node.definition));
-}
-
-function edgeLabels(view: DefinitionsView): string[] {
-  const names = labelsByKey(view);
-  return view.edges.map((edge) =>
-    `${names.get(edge.sourceKey) ?? edge.sourceKey} -${edge.kind}-> `
-    + `${names.get(edge.targetKey) ?? edge.targetKey}`
-  );
-}
-
-function frameLabels(view: DefinitionsView): { root: string; nodes: string[] }[] {
-  const names = labelsByKey(view);
-  return view.frames.map((frame) => ({
-    root: names.get(frame.rootKey) ?? frame.rootKey,
-    nodes: frame.nodeKeys.map((key) => names.get(key) ?? key).sort(),
-  }));
+  return view.nodes.map((node) => umlLabel(node.definition));
 }
 
 async function fetchDiagram(base: string, query: string): Promise<DiagramResponse> {
@@ -279,22 +238,6 @@ async function until<Value>(
   }
 }
 
-function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
-  return new Promise<Value>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeout);
-    void promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
 async function openWatch(base: string): Promise<WatchClient> {
   const socket = new WebSocket(`${base.replace(/^http/, "ws")}/ws`);
   const history: WatchMessage[] = [];
@@ -311,11 +254,12 @@ async function openWatch(base: string): Promise<WatchClient> {
     }
   });
 
-  await withTimeout(
+  await withBound(
     new Promise<void>((resolve, reject) => {
       socket.addEventListener("open", () => resolve(), { once: true });
       socket.addEventListener("error", () => reject(new Error("websocket failed to open")), { once: true });
     }),
+    10_000,
     "websocket connection",
   );
 
@@ -358,7 +302,9 @@ function hasWatchEvent(message: WatchMessage, path: string, event: WatchEventNam
 }
 
 
-const { writeFixtureFile } = createFixtureTracker();
+const fixtures = createFixtureTracker();
+const { writeFixtureFile } = fixtures;
+afterEach(fixtures.cleanup);
 
 async function createServerFixture(): Promise<{ outerRoot: string; root: string; sourceFile: string }> {
   const outerRoot = await mkdtemp(join(tmpdir(), "ts-explorer-server-"));
@@ -451,7 +397,7 @@ async function createServerFixture(): Promise<{ outerRoot: string; root: string;
 }
 
 test("failed startup on an occupied port cleans up before the port is reused", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-occupied-port-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-occupied-port-");
   await writeFile(join(root, "index.ts"), "export const value=1\n");
   const blocker = Bun.serve({
     hostname: "127.0.0.1",
@@ -473,16 +419,12 @@ test("failed startup on an occupied port cleans up before the port is reused", a
     replacement = undefined;
   } finally {
     if (!blockerStopped) blocker.stop(true);
-    try {
-      await replacement?.stop();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await replacement?.stop();
   }
 }, 30_000);
 
 test("concurrent stop calls share one promise and release the port", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-idempotent-stop-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-idempotent-stop-");
   await writeFile(join(root, "index.ts"), "export const value=1\n");
   let server: ExplorerServer | undefined;
   let replacement: ExplorerServer | undefined;
@@ -499,12 +441,8 @@ test("concurrent stop calls share one promise and release the port", async () =>
     await replacement.stop();
     replacement = undefined;
   } finally {
-    try {
-      await replacement?.stop();
-      await server?.stop();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await replacement?.stop();
+    await server?.stop();
   }
 }, 30_000);
 
@@ -535,13 +473,13 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     expect(styleResponse.status).toBe(200);
     await styleResponse.text();
 
-    const tree = await withTimeout(
+    const tree = await withBound(
       fetch(`${base}/api/tree`).then(async (response) => {
         expect(response.status).toBe(200);
         return response.json() as Promise<{ version: number; root: TreeNode }>;
       }),
-      "complete live filesystem tree",
       5_000,
+      "complete live filesystem tree",
     );
     const bulk = tree.root.children?.find((child) => child.path === "bulk");
     expect(bulk?.children?.map((child) => child.path)).toEqual(
@@ -694,10 +632,10 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       `AbstractStateMachine@${machinePath}`,
       `DataflowRuntime@${runtimePath}`,
     ]);
-    expect(edgeLabels(rootView)).toEqual([
+    expect(edgeRows(rootView, umlLabel)).toEqual([
       `DataflowRuntime@${runtimePath} -references-> AbstractStateMachine@${machinePath}`,
     ]);
-    expect(frameLabels(rootView)).toEqual([
+    expect(frameRows(rootView, umlLabel)).toEqual([
       {
         root: `DataflowRuntime@${runtimePath}`,
         nodes: [`AbstractStateMachine@${machinePath}`, `DataflowRuntime@${runtimePath}`],
@@ -718,7 +656,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
       `kind=uml&target=file&path=${encodeURIComponent(pairPath)}`,
     );
     expect(pairFile.status).toBe("ready");
-    expect(frameLabels(definitionsView(pairFile))).toEqual([
+    expect(frameRows(definitionsView(pairFile), umlLabel)).toEqual([
       {
         root: `PairFirst@${pairPath}`,
         nodes: [`PairFirst@${pairPath}`, `Widget@${widgetPath}`],
@@ -987,7 +925,7 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
     const polls = new AbortController();
     let polled = priority;
     try {
-      await withTimeout(
+      await withBound(
         (async () => {
           while (polled.status !== "done") {
             // Only yield while the request is still outstanding; the loop ends on the terminal state.
@@ -1005,8 +943,8 @@ test("serves the subprocess-backed read-only API and non-Git literal search", as
             expect(polled.requestId).toBe(priority.requestId);
           }
         })(),
-        "priority request completion",
         5_000,
+        "priority request completion",
       );
     } finally {
       polls.abort();
@@ -1113,12 +1051,12 @@ test("serves live add and remove trees before separately promoted APIs", async (
       events: addedMessage.events,
       version: addedMessage.version,
     }]);
-    const addedTree = await withTimeout(
+    const addedTree = await withBound(
       fetch(`${base}/api/tree`).then(
         (response) => response.json() as Promise<{ root: TreeNode }>,
       ),
-      "live tree after add",
       5_000,
+      "live tree after add",
     );
     expect(
       addedTree.root.children
@@ -1147,7 +1085,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
       `kind=uml&target=file&path=${encodeURIComponent(deletedModelPath)}`,
     );
     expect(presentUml.status).toBe("ready");
-    expect(frameLabels(definitionsView(presentUml))).toEqual([
+    expect(frameRows(definitionsView(presentUml), umlLabel)).toEqual([
       {
         root: `WatchedTarget@${deletedModelPath}`,
         nodes: [`WatchedTarget@${deletedModelPath}`],
@@ -1191,12 +1129,12 @@ test("serves live add and remove trees before separately promoted APIs", async (
       events: removedMessage.events,
       version: removedMessage.version,
     }]);
-    const removedTree = await withTimeout(
+    const removedTree = await withBound(
       fetch(`${base}/api/tree`).then(
         (response) => response.json() as Promise<{ root: TreeNode }>,
       ),
-      "live tree after remove",
       5_000,
+      "live tree after remove",
     );
     expect(
       removedTree.root.children
@@ -1245,7 +1183,7 @@ test("serves live add and remove trees before separately promoted APIs", async (
 }, 60_000);
 
 test("package diagram errors retain the last promoted snapshot", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-package-fallback-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-package-fallback-");
   await writeFixtureFile(root, "package.json", JSON.stringify({ workspaces: ["packages/*"] }));
   await writeFixtureFile(
     root,
@@ -1266,7 +1204,7 @@ test("package diagram errors retain the last promoted snapshot", async () => {
     // A ready diagram does not imply a promoted generation: the meta row lands once the rebuild
     // commits, so each graph read below waits for the generation it is about to inspect.
     const promotedGeneration = async (): Promise<number | undefined> =>
-      openDatabase(graphDbPath, findActiveGenerationId);
+      openDatabase(graphDbPath, findActiveGenerationId, { readonly: true });
     await until(
       promotedGeneration,
       (generationId) => generationId !== undefined,
@@ -1324,11 +1262,7 @@ test("package diagram errors retain the last promoted snapshot", async () => {
     expect(failed.dsls).toEqual(ready.dsls);
     expect(failed.error).toEqual(expect.any(String));
   } finally {
-    try {
-      await store.close();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await store.close();
   }
 }, 30_000);
 
@@ -1359,7 +1293,7 @@ test("an undecodable source file reports its real error instead of a stale graph
       (diagram) => diagram.status === "ready",
       "initial UML cache promotion",
     );
-    expect(frameLabels(definitionsView(ready))).toEqual([
+    expect(frameRows(definitionsView(ready), umlLabel)).toEqual([
       { root: "FallbackTarget@model.ts", nodes: ["FallbackTarget@model.ts"] },
       {
         root: "FallbackSource@model.ts",
@@ -1404,7 +1338,7 @@ test("an undecodable source file reports its real error instead of a stale graph
 }, 30_000);
 
 test("a malformed root manifest produces the stable empty package error", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-malformed-root-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-malformed-root-");
   await writeFile(join(root, "package.json"), "{ malformed");
   const store = new ExplorerStore(root);
   try {
@@ -1416,16 +1350,12 @@ test("a malformed root manifest produces the stable empty package error", async 
     expect(response.dsls).toEqual(["flowchart LR"]);
     expect(response.packageNodes).toEqual([]);
   } finally {
-    try {
-      await store.close();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await store.close();
   }
 }, 30_000);
 
 test("warm restart rebuilds when sources changed while stopped and reuses the cache when they did not", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-package-restart-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-package-restart-");
   await writeFile(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   await mkdir(join(root, "packages", "a"), { recursive: true });
   const packageAManifest = join(root, "packages", "a", "package.json");
@@ -1451,8 +1381,11 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     ]);
     const dbPath = resolveCacheDbPath(root);
     const recoveredId = readActivePackageGraph(dbPath).generationId;
-    const recoveredStartedAt = openDatabase(dbPath, (db) =>
-      queryAll<{ started_at: number }>(db, "SELECT started_at FROM generations ORDER BY id")
+    const recoveredStartedAt = openDatabase(
+      dbPath,
+      (db) =>
+        queryAll<{ started_at: number }>(db, "SELECT started_at FROM generations ORDER BY id"),
+      { readonly: true },
     );
     expect(recoveredStartedAt).toHaveLength(1);
 
@@ -1473,11 +1406,14 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     // The ambient watch version differs per server; the served topology must not.
     expect({ ...untouchedDiagram, version: firstDiagram.version }).toEqual(firstDiagram);
     expect(readActivePackageGraph(dbPath).generationId).toBe(recoveredId);
-    expect(openDatabase(dbPath, (db) =>
-      queryAll<{ id: number; state: string; cause: string }>(
-        db,
-        "SELECT id, state, cause FROM generations ORDER BY id",
-      )
+    expect(openDatabase(
+      dbPath,
+      (db) =>
+        queryAll<{ id: number; state: string; cause: string }>(
+          db,
+          "SELECT id, state, cause FROM generations ORDER BY id",
+        ),
+      { readonly: true },
     )).toEqual([{ id: recoveredId, state: "active", cause: "startup" }]);
     await firstServer.stop();
     firstServer = undefined;
@@ -1502,11 +1438,14 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
       { nodeId: "p1", name: "b", path: "packages/b" },
     ]);
     expect(packagesPayload(restartedDiagram).dsl).toContain("p0 --> p1");
-    const restartedGenerations = openDatabase(dbPath, (db) =>
-      queryAll<{ id: number; state: string; cause: string; started_at: number }>(
-        db,
-        "SELECT id, state, cause, started_at FROM generations ORDER BY id",
-      )
+    const restartedGenerations = openDatabase(
+      dbPath,
+      (db) =>
+        queryAll<{ id: number; state: string; cause: string; started_at: number }>(
+          db,
+          "SELECT id, state, cause, started_at FROM generations ORDER BY id",
+        ),
+      { readonly: true },
     );
     expect(restartedGenerations).toHaveLength(1);
     const [restartedGeneration] = restartedGenerations;
@@ -1542,25 +1481,24 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     expect(packagesPayload(rebuiltDiagram).dsl).not.toBe(packagesPayload(firstDiagram).dsl);
     const rebuiltId = readActivePackageGraph(dbPath).generationId;
     expect(rebuiltId).not.toBe(restartedId);
-    expect(openDatabase(dbPath, (db) =>
-      queryAll<{ id: number; state: string; cause: string }>(
-        db,
-        "SELECT id, state, cause FROM generations ORDER BY id",
-      )
+    expect(openDatabase(
+      dbPath,
+      (db) =>
+        queryAll<{ id: number; state: string; cause: string }>(
+          db,
+          "SELECT id, state, cause FROM generations ORDER BY id",
+        ),
+      { readonly: true },
     )).toEqual([{ id: rebuiltId, state: "active", cause: "watch" }]);
   } finally {
-    try {
-      await watch?.close();
-      await secondServer?.stop();
-      await firstServer?.stop();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await watch?.close();
+    await secondServer?.stop();
+    await firstServer?.stop();
   }
 }, 60_000);
 
 test("warm restart serves file content edited while the server was stopped", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-restart-file-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-restart-file-");
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "restart-file" }));
   await mkdir(join(root, "src"), { recursive: true });
   const filePath = join(root, "src", "a.ts");
@@ -1599,16 +1537,12 @@ test("warm restart serves file content edited while the server was stopped", asy
     expect(fresh.content).toContain("kept");
     expect(fresh.content).not.toContain("EMPTY_BATCH");
   } finally {
-    try {
-      await server?.stop();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await server?.stop();
   }
 }, 60_000);
 
 test("serves real file outlines and rejects unusable paths", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-file-outline-"));
+  const root = await fixtures.temporaryRoot("ts-explorer-file-outline-");
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "file-outline" }));
   await writeFile(
     join(root, "outline.ts"),
@@ -1693,11 +1627,7 @@ test("serves real file outlines and rejects unusable paths", async () => {
     expect(escaping.status).toBe(403);
     expect(escaping.body).toEqual({ error: "path escapes the source root" });
   } finally {
-    try {
-      await server?.stop();
-    } finally {
-      await removeFixtureRoot(root);
-    }
+    await server?.stop();
   }
 }, 60_000);
 
@@ -1728,9 +1658,41 @@ test("the diagram route enforces its typed target contract", async () => {
       `kind=uml&target=definition&path=lib%2Froot.ts&definition=${encodedRootKey}`,
     );
     expect(definition.status).toBe("ready");
-    expect(frameLabels(definitionsView(definition))).toEqual([
+    expect(frameRows(definitionsView(definition), umlLabel)).toEqual([
       { root: "Root@lib/root.ts", nodes: ["Leaf@lib/leaf.ts", "Root@lib/root.ts"] },
     ]);
+
+    // Concurrent shallow and deep reads of one root must not share a normalized, deduped or IPC
+    // cache entry, and neither may a repeat of each after they settle.
+    const definitionQuery = `kind=uml&target=definition&path=lib%2Froot.ts&definition=${encodedRootKey}`;
+    const [rootOnly, rootAndLeaf] = await Promise.all([
+      fetchDiagram(base, `${definitionQuery}&depth=0`),
+      fetchDiagram(base, `${definitionQuery}&depth=1`),
+    ]);
+    expect(frameRows(definitionsView(rootOnly), umlLabel)).toEqual([
+      { root: "Root@lib/root.ts", nodes: ["Root@lib/root.ts"] },
+    ]);
+    expect(frameRows(definitionsView(rootAndLeaf), umlLabel)).toEqual([
+      { root: "Root@lib/root.ts", nodes: ["Leaf@lib/leaf.ts", "Root@lib/root.ts"] },
+    ]);
+    expect(frameRows(definitionsView(await fetchDiagram(base, `${definitionQuery}&depth=0`)), umlLabel))
+      .toEqual([{ root: "Root@lib/root.ts", nodes: ["Root@lib/root.ts"] }]);
+    expect(frameRows(definitionsView(await fetchDiagram(base, `${definitionQuery}&depth=1`)), umlLabel))
+      .toEqual([
+        { root: "Root@lib/root.ts", nodes: ["Leaf@lib/leaf.ts", "Root@lib/root.ts"] },
+      ]);
+
+    // A directory import graph ignores depth rather than rejecting it.
+    expect((await fetchDiagram(base, "kind=uml&target=directory&path=lib&depth=0")).status)
+      .toBe("ready");
+
+    for (const depth of ["", "-1", "1.5", "1e2", "9007199254740992", " 1", "01x"]) {
+      const response = await fetch(
+        `${base}/api/diagram?${definitionQuery}&depth=${encodeURIComponent(depth)}`,
+      );
+      expect(response.status, `depth=${depth}`).toBe(422);
+      expect(await response.json(), `depth=${depth}`).toEqual({ error: expect.any(String) });
+    }
 
     // A syntactically valid empty source file is a completed selection with no frames.
     const empty = await fetchDiagram(base, "kind=uml&target=file&path=empty.ts");

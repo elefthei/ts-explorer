@@ -1,4 +1,4 @@
-import type { UmlCategoryKind } from "../diagram-graph.ts";
+import type { UmlCategoryKind, UmlRelationKind } from "../diagram-graph.ts";
 import type { FileDefinition, UmlTarget } from "../types.ts";
 import { emitMermaidClassBlock } from "./emit.ts";
 import {
@@ -13,7 +13,7 @@ import type { UmlEntityModel, UmlVisibility } from "./model.ts";
 export type UmlDefinitionEdge = {
   sourceKey: string;
   targetKey: string;
-  kind: "extends" | "implements" | "references";
+  kind: UmlRelationKind;
 };
 
 export type UmlDefinitionNode = {

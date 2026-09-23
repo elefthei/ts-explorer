@@ -55,10 +55,6 @@ export function hasPassedDragThreshold(
   return dx * dx + dy * dy >= threshold * threshold;
 }
 
-export function definitionNodeIdFromNodeId(id: string): string | undefined {
-  return /classId-(d\d+)-\d+$/.exec(id)?.[1];
-}
-
 export function fileNodeIdFromNodeId(id: string): string | undefined {
   return /(?:^|-)flowchart-(f\d+)-\d+$/.exec(id)?.[1];
 }

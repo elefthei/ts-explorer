@@ -1,10 +1,10 @@
 import {
   DIAGRAM_GRAPH_FORMAT_VERSION,
   type DiagramNodeKind,
-  type DiagramRelationKind,
   type UmlDiagramGraph,
   type UmlRelationKind,
 } from "../diagram-graph.ts";
+import { pairKey, unpairKey } from "./keys.ts";
 import type { UmlReferenceEdge } from "./usage.ts";
 
 const UML_NODE_KINDS: Record<string, true> = { entity: true, definition: true, boundary: true };
@@ -52,7 +52,7 @@ export function extractUmlTopology(input: UmlTopologyInput): Topology {
   const byPair = new Map<string, Set<UmlRelationKind>>();
   for (const reference of input.references) {
     if (!nodeKinds.has(reference.ownerKey) || !nodeKinds.has(reference.targetKey)) continue;
-    const pair = JSON.stringify([reference.ownerKey, reference.targetKey]);
+    const pair = pairKey(reference.ownerKey, reference.targetKey);
     const kinds = byPair.get(pair);
     if (kinds) kinds.add(reference.kind);
     else byPair.set(pair, new Set([reference.kind]));
@@ -61,7 +61,7 @@ export function extractUmlTopology(input: UmlTopologyInput): Topology {
   const relations: Topology["relations"] = [];
   const pairs = [...byPair.keys()].sort((left, right) => left.localeCompare(right));
   for (const pair of pairs) {
-    const [sourceNodeId, targetNodeId] = JSON.parse(pair) as [string, string];
+    const [sourceNodeId, targetNodeId] = unpairKey(pair);
     const kinds = RELATION_ORDER.filter((kind) => byPair.get(pair)?.has(kind));
     const edgeOrdinal = edges.length;
     edges.push({
@@ -131,7 +131,7 @@ export function validateUmlDiagramGraph(graph: UmlDiagramGraph): void {
     if (!nodes.has(edge.sourceNodeId) || !nodes.has(edge.targetNodeId)) {
       invalid(`edge ${edge.edgeOrdinal} has a missing endpoint`);
     }
-    const pair = JSON.stringify([edge.sourceNodeId, edge.targetNodeId]);
+    const pair = pairKey(edge.sourceNodeId, edge.targetNodeId);
     if (pairs.has(pair)) invalid(`duplicate edge ${edge.edgeOrdinal}`);
     pairs.add(pair);
     edges.set(edge.edgeOrdinal, edge);
@@ -216,5 +216,3 @@ export function validateUmlDiagramGraph(graph: UmlDiagramGraph): void {
     categoryKeys.add(category.definitionKey);
   }
 }
-
-export type { DiagramRelationKind };

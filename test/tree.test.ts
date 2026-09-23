@@ -1,19 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { buildTree, readDirectoryEntries, readTree } from "../src/tree.ts";
 import type { TreeNode } from "../src/types.ts";
+import { createFixtureTracker } from "./support/fixtures.ts";
 
-const roots: string[] = [];
+const fixtures = createFixtureTracker();
 
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(fixtures.cleanup);
 
 test("reads only immediate visible entries and classifies source paths case-sensitively", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-tree-"));
-  roots.push(root);
+  const root = await fixtures.temporaryRoot("ts-explorer-tree-");
   await Promise.all([
     mkdir(join(root, "src", "nested"), { recursive: true }),
     mkdir(join(root, "src", ".explore"), { recursive: true }),
@@ -99,8 +96,7 @@ test("reconstructs and sorts a nested tree from unordered flat entries", () => {
 });
 
 test("reads a complete nested tree with the directory-entry traversal rules", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-read-tree-"));
-  roots.push(root);
+  const root = await fixtures.temporaryRoot("ts-explorer-read-tree-");
   await Promise.all([
     mkdir(join(root, "src", "nested", "deeper"), { recursive: true }),
     mkdir(join(root, "src", "nested", "coverage"), { recursive: true }),

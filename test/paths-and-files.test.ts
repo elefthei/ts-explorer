@@ -1,7 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import {
   normalizeRelativePath,
   type PathErrorCode,
@@ -9,12 +8,11 @@ import {
   resolveInside,
   resolveSourceDir,
 } from "../src/paths.ts";
+import { createFixtureTracker } from "./support/fixtures.ts";
 
-const roots: string[] = [];
+const fixtures = createFixtureTracker();
 
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(fixtures.cleanup);
 
 function expectNormalizationError(input: string, code: PathErrorCode): void {
   try {
@@ -55,9 +53,8 @@ test("rejects NUL, absolute, drive-qualified, and traversal paths", () => {
 });
 
 test("resolves ordinary files but rejects traversal, absolute paths, and symlink escapes", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ts-explorer-paths-"));
-  const outside = await mkdtemp(join(tmpdir(), "ts-explorer-outside-"));
-  roots.push(root, outside);
+  const root = await fixtures.temporaryRoot("ts-explorer-paths-");
+  const outside = await fixtures.temporaryRoot("ts-explorer-outside-");
   await mkdir(join(root, "src"));
   const file = join(root, "src", "ok.ts");
   await writeFile(file, "export const ok = 1;\n");

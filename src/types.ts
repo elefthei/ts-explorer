@@ -145,14 +145,9 @@ export type HighlightSpan = {
   token: HighlightToken;
 };
 
-export type GotoDefinitionLookupResponse = {
+export type LookupResponse<T> = {
   version: number;
-  definition: GotoDefinition | null;
-};
-
-export type DefinitionLookupResponse = {
-  version: number;
-  definition: UmlSourceLocation | null;
+  definition: T | null;
 };
 
 export const UML_METHOD_RETURN_MARKER = "§";
@@ -173,9 +168,12 @@ export type UmlTarget =
   | { kind: "file"; path: string }
   | { kind: "directory"; path: string };
 
+/** Default outgoing dependency levels for a UML selection; 0 renders roots only. */
+export const DEFAULT_UML_DEPTH = 5;
+
 export type DiagramRequest =
   | { kind: "packages"; scopePath: "" }
-  | { kind: "uml"; target: UmlTarget };
+  | { kind: "uml"; target: UmlTarget; depth?: number };
 
 /** The manifest dependency graph; its JSON shape is unchanged by the rooted UML redesign. */
 export type PackageDiagramPayload = {

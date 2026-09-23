@@ -11,9 +11,6 @@ const TRAVERSAL_IGNORED_SEGMENTS = new Set([
   "out",
   ".explore",
 ]);
-function hasIgnoredSegment(path: string, ignored: ReadonlySet<string>): boolean {
-  return path.split(/[\\/]+/).some((segment) => ignored.has(segment));
-}
 
 // A directory named `target` is Cargo's build output only when a `Cargo.toml` sits beside it;
 // `src/target` in a TypeScript project is an ordinary source directory and must stay visible.
@@ -49,7 +46,7 @@ export function isDeclarationPath(path: string): boolean {
 }
 
 export function isTraversalIgnoredPath(path: string): boolean {
-  return hasIgnoredSegment(path, TRAVERSAL_IGNORED_SEGMENTS);
+  return path.split(/[\\/]+/).some((segment) => TRAVERSAL_IGNORED_SEGMENTS.has(segment));
 }
 
 const UTF8 = new TextDecoder("utf-8", { fatal: true });

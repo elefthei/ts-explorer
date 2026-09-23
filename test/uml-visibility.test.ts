@@ -2,19 +2,17 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import type { UmlTarget } from "../src/types.ts";
-import { FULL_UML_VISIBILITY, type UmlVisibility } from "../src/uml/model.ts";
-import { renderUmlView, type RenderedUmlFrame, type RenderedUmlView } from "../src/uml/view.ts";
-import { createFixtureTracker } from "./support/fixtures.ts";
+import type { RenderedUmlFrame } from "../src/uml/view.ts";
 import { umlLabel } from "./support/uml-contract.ts";
-import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
+import {
+  createUmlProjectTracker,
+  renderSelection,
+  type UmlProject,
+} from "./support/uml-project.ts";
 
-const fixtures = createFixtureTracker();
-const projects: UmlProject[] = [];
+const { openProject, cleanup } = createUmlProjectTracker();
 
-afterEach(async () => {
-  for (const project of projects.splice(0)) project.close();
-  await fixtures.cleanup();
-});
+afterEach(cleanup);
 
 const FIXTURE_FILES = {
   "src/model.ts": `import { Bridge } from "../test/bridge.test";
@@ -35,22 +33,11 @@ export class SecondRoot {}
   "only-tests/thing.test.ts": "export class OnlyTest {}\n",
 };
 
-async function openFixture(prefix: string): Promise<UmlProject> {
-  const root = await fixtures.fixtureRoot(prefix, FIXTURE_FILES);
-  // A directory with no files at all; the tree still lists it as a selectable target.
-  await mkdir(join(root, "nothing"), { recursive: true });
-  const project = await buildUmlProject(root);
-  projects.push(project);
-  return project;
-}
-
-function render(
-  project: UmlProject,
-  target: UmlTarget,
-  overrides: Partial<UmlVisibility> = {},
-): RenderedUmlView {
-  const diagram = readCompleteUml(project, target);
-  return renderUmlView(diagram.view, { ...FULL_UML_VISIBILITY, ...overrides }, target);
+function openFixture(prefix: string): Promise<UmlProject> {
+  return openProject(prefix, FIXTURE_FILES, async (root) => {
+    // A directory with no files at all; the tree still lists it as a selectable target.
+    await mkdir(join(root, "nothing"), { recursive: true });
+  });
 }
 
 /** The definitions a frame actually drew, by label, in emission order. */
@@ -67,9 +54,9 @@ test("Attributes and Methods hide compartments without touching the graph", asyn
     definitionKey: project.key("src/model.ts", "ResultService"),
   };
 
-  const full = render(project, target).frames[0];
-  const withoutAttributes = render(project, target, { attributes: false }).frames[0];
-  const withoutMethods = render(project, target, { methods: false }).frames[0];
+  const full = renderSelection(project, target).frames[0];
+  const withoutAttributes = renderSelection(project, target, { attributes: false }).frames[0];
+  const withoutMethods = renderSelection(project, target, { methods: false }).frames[0];
 
   const nodes = [
     "Leaf@src/leaf.ts",
@@ -110,7 +97,7 @@ test("Attributes and Methods hide compartments without touching the graph", asyn
 test("a selected member root survives its own compartment control being off", async () => {
   const project = await openFixture("ts-explorer-uml-member-root-");
 
-  const property = render(project, {
+  const property = renderSelection(project, {
     kind: "definition",
     path: "src/model.ts",
     definitionKey: project.key("src/model.ts", "ResultService.cache"),
@@ -121,7 +108,7 @@ test("a selected member root survives its own compartment control being off", as
     "ResultService.cache@src/model.ts",
   ]);
 
-  const method = render(project, {
+  const method = renderSelection(project, {
     kind: "definition",
     path: "src/model.ts",
     definitionKey: project.key("src/model.ts", "ResultService.execute"),
@@ -141,8 +128,8 @@ test("Types hides declared type text but never a type node", async () => {
     definitionKey: project.key("src/model.ts", "ResultService"),
   };
 
-  const full = render(project, service).frames[0];
-  const withoutTypes = render(project, service, { types: false }).frames[0];
+  const full = renderSelection(project, service).frames[0];
+  const withoutTypes = renderSelection(project, service, { types: false }).frames[0];
   expect(full?.dsl).toContain(": Output");
   expect(withoutTypes?.dsl).not.toContain(": Output");
   // `Output` is still a node of the graph, and still carries the property row that referenced it.
@@ -155,8 +142,8 @@ test("Types hides declared type text but never a type node", async () => {
     definitionKey: project.key("src/model.ts", "marker"),
   };
   // An unannotated value shows an em dash rather than an invented inferred type.
-  expect(render(project, marker).frames[0]?.dsl).toContain("—");
-  expect(render(project, marker, { types: false }).frames[0]?.dsl).not.toContain("—");
+  expect(renderSelection(project, marker).frames[0]?.dsl).toContain("—");
+  expect(renderSelection(project, marker, { types: false }).frames[0]?.dsl).not.toContain("—");
 });
 
 test("Tests hides test nodes and drops what only they reached", async () => {
@@ -167,9 +154,9 @@ test("Tests hides test nodes and drops what only they reached", async () => {
     definitionKey: project.key("src/model.ts", "ResultService"),
   };
 
-  expect(drawn(render(project, service).frames[0])).toContain("Bridge@test/bridge.test.ts");
+  expect(drawn(renderSelection(project, service).frames[0])).toContain("Bridge@test/bridge.test.ts");
 
-  const withoutTests = render(project, service, { tests: false }).frames[0];
+  const withoutTests = renderSelection(project, service, { tests: false }).frames[0];
   // `Leaf` is production code, but the only path to it ran through the hidden test class.
   expect(drawn(withoutTests)).toEqual(["Output@src/model.ts", "ResultService@src/model.ts"]);
   expect(withoutTests?.dsl).not.toContain("Leaf");
@@ -179,7 +166,7 @@ test("a hidden definition root says so while a file selection just omits its fra
   const project = await openFixture("ts-explorer-uml-hidden-root-");
   const bridgeKey = project.key("test/bridge.test.ts", "Bridge");
 
-  const definition = render(project, {
+  const definition = renderSelection(project, {
     kind: "definition",
     path: "test/bridge.test.ts",
     definitionKey: bridgeKey,
@@ -192,13 +179,17 @@ test("a hidden definition root says so while a file selection just omits its fra
   expect(definition.frames[0]?.dsl).toBe("");
 
   // The same file selected whole reports that nothing is left, without naming a root.
-  const file = render(project, { kind: "file", path: "test/bridge.test.ts" }, { tests: false });
+  const file = renderSelection(
+    project,
+    { kind: "file", path: "test/bridge.test.ts" },
+    { tests: false },
+  );
   expect(file.frames).toHaveLength(1);
   expect(file.frames[0]?.emptyMessage).toBe("No visible definitions");
   expect(file.frames[0]?.rootKey).toBeNull();
 
   // Unfiltered, that file really does have two roots.
-  expect(render(project, { kind: "file", path: "test/bridge.test.ts" }).frames.map((frame) =>
+  expect(renderSelection(project, { kind: "file", path: "test/bridge.test.ts" }).frames.map((frame) =>
     frame.rootKey
   )).toEqual([bridgeKey, project.key("test/bridge.test.ts", "SecondRoot")]);
 });
@@ -206,16 +197,20 @@ test("a hidden definition root says so while a file selection just omits its fra
 test("empty selections name the kind of thing that is missing", async () => {
   const project = await openFixture("ts-explorer-uml-empty-states-");
 
-  const emptyFile = render(project, { kind: "file", path: "src/empty.ts" });
+  const emptyFile = renderSelection(project, { kind: "file", path: "src/empty.ts" });
   expect(emptyFile.frames[0]?.emptyMessage).toBe("No definitions");
   expect(emptyFile.dsl).toBe("");
 
-  const emptyDirectory = render(project, { kind: "directory", path: "nothing" });
+  const emptyDirectory = renderSelection(project, { kind: "directory", path: "nothing" });
   expect(emptyDirectory.frames[0]?.emptyMessage).toBe("No files");
   expect(emptyDirectory.dsl).toBe("");
 
   // A directory whose every file is hidden by the Tests filter is empty for the same reason.
-  const onlyTests = render(project, { kind: "directory", path: "only-tests" }, { tests: false });
+  const onlyTests = renderSelection(
+    project,
+    { kind: "directory", path: "only-tests" },
+    { tests: false },
+  );
   expect(onlyTests.frames[0]?.emptyMessage).toBe("No files");
 });
 
@@ -223,8 +218,8 @@ test("a directory view ignores the compartment controls but obeys Tests", async 
   const project = await openFixture("ts-explorer-uml-directory-visibility-");
   const target: UmlTarget = { kind: "directory", path: "src" };
 
-  const full = render(project, target);
-  const withoutDetail = render(project, target, {
+  const full = renderSelection(project, target);
+  const withoutDetail = renderSelection(project, target, {
     attributes: false,
     methods: false,
     types: false,
@@ -238,7 +233,7 @@ test("a directory view ignores the compartment controls but obeys Tests", async 
   ]);
 
   // The test file is an outside boundary leaf here; hiding tests removes it and its import arrow.
-  const withoutTests = render(project, target, { tests: false });
+  const withoutTests = renderSelection(project, target, { tests: false });
   expect(withoutTests.frames[0]?.fileLinks.map((link) => link.path)).toEqual([
     "src/empty.ts",
     "src/leaf.ts",

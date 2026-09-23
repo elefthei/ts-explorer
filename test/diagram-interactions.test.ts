@@ -4,7 +4,6 @@ import {
   RequestSequence,
   DiagramClickSequence,
   type DiagramPointerTarget,
-  definitionNodeIdFromNodeId,
   fileNodeIdFromNodeId,
   formatUmlMethodReturnLabel,
   packageNodeIdFromNodeId,
@@ -219,29 +218,6 @@ test("RequestSequence instances issue tokens independently", () => {
   expect(secondSequence.next()).toBe(1);
   expect(firstSequence.isCurrent(2)).toBe(true);
   expect(secondSequence.isCurrent(1)).toBe(true);
-});
-
-test("definitionNodeIdFromNodeId resolves only installed Mermaid definition-node IDs", () => {
-  const cases = [
-    { name: "standard installed ID", id: "classId-d0-1", expected: "d0" },
-    {
-      name: "prefixed installed ID with multi-digit node and render counters",
-      id: "diagram-classId-d27-314",
-      expected: "d27",
-    },
-    { name: "source name used as an identifier", id: "classId-Widget-1", expected: undefined },
-    { name: "definition marker without node index", id: "classId-d-1", expected: undefined },
-    { name: "node index with trailing text", id: "classId-d12x-3", expected: undefined },
-    { name: "node index with a leading letter", id: "classId-xd12-3", expected: undefined },
-    { name: "installed ID without render counter", id: "classId-d12", expected: undefined },
-    { name: "suffix after the render counter", id: "classId-d12-7-extra", expected: undefined },
-    { name: "file node in a flowchart", id: "flowchart-d0-1", expected: undefined },
-    { name: "raw response-local node ID", id: "d12", expected: undefined },
-  ];
-
-  for (const { name, id, expected } of cases) {
-    expect(definitionNodeIdFromNodeId(id), name).toBe(expected);
-  }
 });
 
 test("fileNodeIdFromNodeId resolves only Mermaid flowchart file-node IDs", () => {

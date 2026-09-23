@@ -1,16 +1,6 @@
 import { expect } from "bun:test";
-import { join } from "node:path";
-import { Cache, type CachePackageDiagramInput } from "../../src/cache.ts";
-import type {
-  PackageDiagramGraph,
-  RenderedPackageDiagram,
-  UmlDiagramGraph,
-} from "../../src/diagram-graph.ts";
-import { renderPackageDiagramGraph } from "../../src/packages.ts";
-import type { PackageDiagramPayload } from "../../src/types.ts";
+import type { UmlDiagramGraph } from "../../src/diagram-graph.ts";
 import type { UmlProject } from "./uml-project.ts";
-
-let cacheOrdinal = 0;
 
 /**
  * Every array a persisted UML file graph carries. A reload that silently drops one of these has to
@@ -64,49 +54,4 @@ export function expectUmlGraphRoundTrip(project: UmlProject, path: string): UmlD
 /** The same round-trip over every source file the project indexed. */
 export function expectFileGraphRoundTrips(project: UmlProject): void {
   for (const path of project.sourcePaths) expectUmlGraphRoundTrip(project, path);
-}
-
-export type MaterializedPackageGraph = {
-  extracted: PackageDiagramGraph;
-  reloaded: PackageDiagramGraph;
-  rendered: RenderedPackageDiagram;
-  cached: PackageDiagramPayload;
-};
-
-/**
- * Writes a package graph through the real discovery transaction and reads it back. Packages are
- * the one diagram whose `diagrams` row is still the complete public payload.
- */
-export function materializePackageGraph(
-  cacheDirectory: string,
-  extracted: PackageDiagramGraph,
-  outcome: CachePackageDiagramInput["outcome"] = { status: "ready" },
-): MaterializedPackageGraph {
-  cacheOrdinal += 1;
-  const cache = new Cache(join(cacheDirectory, `.package-graph-${cacheOrdinal}.sqlite`));
-  try {
-    const generationId = cache.beginGeneration("startup", "");
-    const cached = cache.writeDiscovery(
-      generationId,
-      [],
-      { graph: extracted, outcome },
-      renderPackageDiagramGraph,
-    );
-    const reloaded = cache.readDiagramGraph(generationId, "packages", "");
-    if (reloaded?.kind !== "packages") throw new Error("no persisted package graph");
-    expect(reloaded).toEqual(extracted);
-    const rendered = renderPackageDiagramGraph(reloaded);
-    expect(cached).toEqual({
-      ...rendered,
-      scopePath: "",
-      status: outcome.status,
-      definitions: [],
-      externalUsers: [],
-      localUsers: [],
-      ...(outcome.status === "error" ? { error: outcome.error } : {}),
-    });
-    return { extracted, reloaded, rendered, cached };
-  } finally {
-    cache.close();
-  }
 }

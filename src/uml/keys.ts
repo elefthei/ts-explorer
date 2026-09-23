@@ -1,7 +1,10 @@
-import { sep } from "node:path";
+/** Ordered endpoint pair key. The exact `JSON.stringify` form is load-bearing: callers sort it. */
+export function pairKey(source: string, target: string): string {
+  return JSON.stringify([source, target]);
+}
 
-export function posix(path: string): string {
-  return path.split(sep).join("/");
+export function unpairKey(key: string): [string, string] {
+  return JSON.parse(key) as [string, string];
 }
 
 export function isTestPath(path: string): boolean {

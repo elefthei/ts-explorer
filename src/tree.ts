@@ -36,34 +36,27 @@ export async function readDirectoryEntries(
     .sort(compareTreeNodes);
 }
 
+/**
+ * `tolerateErrors` is the fingerprint's contract: a scan must survive a directory vanishing
+ * mid-walk, while `readTree` has to surface the failure to the caller.
+ */
 export async function collectTreeEntries(
   sourceDir: string,
   scopePath: string,
+  tolerateErrors = false,
 ): Promise<TreeNode[]> {
-  const entries = await readDirectoryEntries(sourceDir, scopePath);
+  const read = readDirectoryEntries(sourceDir, scopePath);
+  const entries = tolerateErrors ? await read.catch((): TreeNode[] => []) : await read;
   const descendants = await Promise.all(
     entries
       .filter((entry) => entry.kind === "directory")
-      .map((entry) => collectTreeEntries(sourceDir, entry.path)),
-  );
-  return entries.concat(...descendants);
-}
-
-async function collectFingerprintEntries(
-  sourceDir: string,
-  scopePath: string,
-): Promise<TreeNode[]> {
-  const entries = await readDirectoryEntries(sourceDir, scopePath).catch((): TreeNode[] => []);
-  const descendants = await Promise.all(
-    entries
-      .filter((entry) => entry.kind === "directory")
-      .map((entry) => collectFingerprintEntries(sourceDir, entry.path)),
+      .map((entry) => collectTreeEntries(sourceDir, entry.path, tolerateErrors)),
   );
   return entries.concat(...descendants);
 }
 
 export async function computeSourceFingerprint(sourceDir: string): Promise<string> {
-  const entries = await collectFingerprintEntries(sourceDir, "");
+  const entries = await collectTreeEntries(sourceDir, "", true);
   const stamps = await Promise.all(
     entries.map(async (entry): Promise<string | null> => {
       if (entry.kind === "directory") return `d\0${entry.path}`;

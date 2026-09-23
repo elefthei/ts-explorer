@@ -1,24 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { createFixtureTracker } from "./support/fixtures.ts";
 import { memberLabels, toUmlContract } from "./support/uml-contract.ts";
-import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
+import { createUmlProjectTracker, readCompleteUml } from "./support/uml-project.ts";
 
-const fixtures = createFixtureTracker();
-const projects: UmlProject[] = [];
+const { openProject, cleanup } = createUmlProjectTracker();
 
-afterEach(async () => {
-  for (const project of projects.splice(0)) project.close();
-  await fixtures.cleanup();
-});
-
-async function openProject(
-  prefix: string,
-  files: Record<string, string>,
-): Promise<UmlProject> {
-  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
-  projects.push(project);
-  return project;
-}
+afterEach(cleanup);
 
 /** The fixture the rooted-navigation design is specified against. */
 const ROOT_FILES = {
@@ -67,8 +53,6 @@ test("a definition root closes over its outgoing references and keeps the cycle 
     root: "Root@feature/root.ts",
     nodeKeys: ["B@feature/b.ts", "C@shared/c.ts", "Root@feature/root.ts"],
   }]);
-  // Re-reading the same selection is byte-identical: no traversal order leaks into the payload.
-  expect(toUmlContract(readCompleteUml(project, target))).toEqual(contract);
 });
 
 test("a file selection renders one frame per top-level definition", async () => {

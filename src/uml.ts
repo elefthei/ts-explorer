@@ -1,8 +1,7 @@
 import { DIAGRAM_GRAPH_FORMAT_VERSION, type UmlDiagramGraph } from "./diagram-graph.ts";
 import { collectFileDefinitionNodes } from "./goto-definition.ts";
+import { parseSourceForLanguage } from "./lang/parse.ts";
 import { highlightLanguageForPath } from "./lang/registry.ts";
-import { parseRustSource } from "./lang/rust.ts";
-import { parseTypeScriptSource } from "./lang/typescript.ts";
 import { normalizeRelativePath } from "./paths.ts";
 import { extractUmlTopology } from "./uml/graph.ts";
 import type { DefinitionResolutionIndex, UmlEntityModel } from "./uml/model.ts";
@@ -104,9 +103,7 @@ export function extractFileUmlGraph(
   const scopePath = normalizeRelativePath(path);
   const language = highlightLanguageForPath(scopePath);
   if (language === undefined) return { ...bareUmlDiagramGraph(scopePath), renderMode: "normal" };
-  const parsed = language === "rust"
-    ? parseRustSource(content)
-    : parseTypeScriptSource(scopePath, content);
+  const parsed = parseSourceForLanguage(language, scopePath, content);
   if (!parsed) return { ...bareUmlDiagramGraph(scopePath), renderMode: "normal" };
   try {
     const definitions = collectFileDefinitionNodes(scopePath, parsed.root);

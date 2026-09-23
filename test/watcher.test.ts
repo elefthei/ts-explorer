@@ -1,21 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveSourceDir } from "../src/paths.ts";
 import { startSourceWatcher } from "../src/watcher.ts";
+import { createFixtureTracker } from "./support/fixtures.ts";
 
-const roots: string[] = [];
+const fixtures = createFixtureTracker();
 
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(fixtures.cleanup);
 
 test("batches visible changes while suppressing cache changes under .explore", async () => {
   // Fixture I/O uses the canonical root because Bun's writes fail on namespaced UNC spellings, while
   // the watcher receives TEMP/TMP exactly as configured to prove the application canonicalizes it.
-  const root = await mkdtemp(join(resolveSourceDir(tmpdir()), "ts-explorer-watch-"));
-  roots.push(root);
+  const root = await fixtures.temporaryRoot("ts-explorer-watch-", resolveSourceDir(tmpdir()));
   const watchedArgument = join(tmpdir(), basename(root));
   await Promise.all([
     mkdir(join(root, "src"), { recursive: true }),

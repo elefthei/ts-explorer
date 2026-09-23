@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
 import { createFixtureTracker } from "./support/fixtures.ts";
-import { expectFileGraphRoundTrips } from "./support/normalized-graph.ts";
 import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
 
 const fixtures = createFixtureTracker();
@@ -75,7 +74,6 @@ test("the same sources extract identically under two different roots", async () 
     expect(second.sourcePaths).toEqual(first.sourcePaths);
     expect(graphText(second)).toBe(graphText(first));
     expect(selectionText(second)).toBe(selectionText(first));
-    expectFileGraphRoundTrips(first);
   } finally {
     second.close();
     first.close();

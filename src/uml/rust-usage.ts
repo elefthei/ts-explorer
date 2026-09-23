@@ -1,7 +1,9 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
 import { firstAncestor, namedChildren } from "../lang/ast.ts";
 import type { UmlRelationKind } from "../diagram-graph.ts";
-import type { DefinitionBindingSpace, DefinitionBindingTarget } from "./model.ts";
+import type { DefinitionBindingTarget } from "./model.ts";
+import { isDeclarationName, memberKeys, shadowed, type ScopeFrame } from "./reference-scope.ts";
+import { rustBareTypeName } from "./rust-parse.ts";
 import type { ReferenceContext, UmlReferenceEdge } from "./usage.ts";
 
 const RUST_SKIPPED_SUBTREES: Record<string, true> = {
@@ -33,8 +35,6 @@ const RUST_DECLARATION_NAME_PARENTS: Record<string, true> = {
   closure_parameter: true,
 };
 
-type RustScopeFrame = { values: Set<string>; types: Set<string> };
-
 function collectRustPatternNames(pattern: Node, out: Set<string>): void {
   if (pattern.type === "identifier") {
     out.add(pattern.text);
@@ -43,7 +43,7 @@ function collectRustPatternNames(pattern: Node, out: Set<string>): void {
   for (const child of namedChildren(pattern)) collectRustPatternNames(child, out);
 }
 
-function rustScopeFrame(node: Node): RustScopeFrame | undefined {
+function rustScopeFrame(node: Node): ScopeFrame | undefined {
   const values = new Set<string>();
   const types = new Set<string>();
   const typeParameters = node.childForFieldName("type_parameters");
@@ -78,47 +78,14 @@ function rustScopeFrame(node: Node): RustScopeFrame | undefined {
   return values.size || types.size ? { values, types } : undefined;
 }
 
-function rustShadowed(
-  frames: readonly RustScopeFrame[],
-  name: string,
-  space: DefinitionBindingSpace,
-): boolean {
-  for (let index = frames.length - 1; index >= 0; index -= 1) {
-    const frame = frames[index];
-    if (!frame) continue;
-    if (space === "value" ? frame.values.has(name) : frame.types.has(name)) return true;
-  }
-  return false;
-}
-
 function rustIsUsage(node: Node): boolean {
   const parent = node.parent;
   if (!parent) return false;
   if (parent.type === "field_expression") return parent.childForFieldName("field")?.id !== node.id;
   if (parent.type === "scoped_type_identifier" || parent.type === "scoped_identifier") return false;
   if (parent.type === "attribute" || parent.type === "lifetime") return false;
-  if (RUST_DECLARATION_NAME_PARENTS[parent.type] === true) {
-    if (parent.childForFieldName("name")?.id === node.id) return false;
-    if (parent.childForFieldName("pattern")?.id === node.id) return false;
-  }
+  if (isDeclarationName(node, RUST_DECLARATION_NAME_PARENTS)) return false;
   return true;
-}
-
-/** Bare name of a possibly generic/reference/scoped type node. */
-function rustBareTypeName(node: Node): string | undefined {
-  let current: Node | undefined = node;
-  while (current) {
-    if (current.type === "generic_type" || current.type === "reference_type") {
-      current = current.childForFieldName("type") ?? undefined;
-      continue;
-    }
-    if (current.type === "scoped_type_identifier" || current.type === "scoped_identifier") {
-      current = current.childForFieldName("name") ?? undefined;
-      continue;
-    }
-    return current.text || undefined;
-  }
-  return undefined;
 }
 
 function rustRelationKind(node: Node): UmlRelationKind {
@@ -128,7 +95,7 @@ function rustRelationKind(node: Node): UmlRelationKind {
 
 type RustVisitState = {
   context: ReferenceContext;
-  frames: RustScopeFrame[];
+  frames: ScopeFrame[];
   implOwner: string | undefined;
   /** `impl` header nodes already consumed as heritage; they are not generic references too. */
   skipped: Set<number>;
@@ -150,7 +117,7 @@ function rustReceiverTargets(
     return owner === undefined ? [] : [{ kind: "definition", key: owner }];
   }
   if (node.type === "identifier" || node.type === "type_identifier") {
-    if (rustShadowed(state.frames, node.text, "value") && rustShadowed(state.frames, node.text, "type")) {
+    if (shadowed(state.frames, node.text, "value") && shadowed(state.frames, node.text, "type")) {
       return [];
     }
     const types = state.context.resolveName(node.text, "type", chain);
@@ -162,24 +129,16 @@ function rustReceiverTargets(
     const name = node.childForFieldName("name");
     if (!path || !name) return [];
     const receivers = rustReceiverTargets(state, path, chain);
-    const keys = new Set<string>();
-    for (const receiver of receivers) {
-      for (const space of ["type", "value"] as const) {
-        for (const key of state.context.resolveMember(receiver, name.text, space)) keys.add(key);
-      }
-    }
-    return [...keys].map((key) => ({ kind: "definition", key } as const));
+    const keys = memberKeys(state.context, receivers, name.text, ["type", "value"]);
+    return keys.map((key) => ({ kind: "definition", key } as const));
   }
   if (node.type === "field_expression") {
     const value = node.childForFieldName("value");
     const field = node.childForFieldName("field");
     if (!value || !field) return [];
     const receivers = rustReceiverTargets(state, value, chain);
-    const keys = new Set<string>();
-    for (const receiver of receivers) {
-      for (const key of state.context.resolveMember(receiver, field.text, "value")) keys.add(key);
-    }
-    return [...keys].map((key) => ({ kind: "definition", key } as const));
+    const keys = memberKeys(state.context, receivers, field.text, ["value"]);
+    return keys.map((key) => ({ kind: "definition", key } as const));
   }
   return [];
 }
@@ -218,13 +177,8 @@ function visitRust(state: RustVisitState, node: Node): void {
       const name = node.childForFieldName("name");
       if (path && name && owners.length) {
         const receivers = rustReceiverTargets(state, path, chain);
-        const keys = new Set<string>();
-        for (const receiver of receivers) {
-          for (const space of ["type", "value"] as const) {
-            for (const key of state.context.resolveMember(receiver, name.text, space)) keys.add(key);
-          }
-        }
-        if (keys.size) {
+        const keys = memberKeys(state.context, receivers, name.text, ["type", "value"]);
+        if (keys.length) {
           const kind = rustRelationKind(node);
           for (const key of keys) state.context.add(owners, key, kind);
           return;
@@ -237,10 +191,7 @@ function visitRust(state: RustVisitState, node: Node): void {
       const field = node.childForFieldName("field");
       if (value && field && owners.length) {
         const receivers = rustReceiverTargets(state, value, chain);
-        const keys = new Set<string>();
-        for (const receiver of receivers) {
-          for (const key of state.context.resolveMember(receiver, field.text, "value")) keys.add(key);
-        }
+        const keys = memberKeys(state.context, receivers, field.text, ["value"]);
         for (const key of keys) state.context.add(owners, key, "references");
         if (value.type !== "identifier" && value.type !== "self") visitRust(state, value);
         return;
@@ -250,7 +201,7 @@ function visitRust(state: RustVisitState, node: Node): void {
       if (rustIsUsage(node) && owners.length) {
         const kind = rustRelationKind(node);
         for (const space of ["type", "value"] as const) {
-          if (rustShadowed(state.frames, node.text, space)) continue;
+          if (shadowed(state.frames, node.text, space)) continue;
           for (const target of state.context.resolveName(node.text, space, chain)) {
             if (target.kind === "definition") state.context.add(owners, target.key, kind);
           }

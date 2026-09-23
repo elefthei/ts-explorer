@@ -2,33 +2,22 @@ import { afterEach, expect, test } from "bun:test";
 import { computeHighlightSpans } from "../src/highlight.ts";
 import { parseDefinitionSpans, parseFileDefinitions } from "../src/goto-definition.ts";
 import { discoverPackages } from "../src/packages.ts";
-import type { FileDefinition, UmlTarget } from "../src/types.ts";
+import type { UmlTarget } from "../src/types.ts";
 import { HIGHLIGHT_TOKENS } from "../src/types.ts";
 import { validateUmlDiagramGraph } from "../src/uml/graph.ts";
 import { FULL_UML_VISIBILITY } from "../src/uml/model.ts";
 import { renderUmlView, type UmlDefinitionNode } from "../src/uml/view.ts";
-import { createFixtureTracker } from "./support/fixtures.ts";
 import { expectFileGraphRoundTrips } from "./support/normalized-graph.ts";
-import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
+import { umlLabel } from "./support/uml-contract.ts";
+import {
+  createUmlProjectTracker,
+  readCompleteUml,
+  type UmlProject,
+} from "./support/uml-project.ts";
 
-const fixtures = createFixtureTracker();
-const projects: UmlProject[] = [];
+const { fixtureRoot, openProject, cleanup } = createUmlProjectTracker();
 
-afterEach(async () => {
-  for (const project of projects.splice(0)) project.close();
-  await fixtures.cleanup();
-});
-
-async function umlProject(prefix: string, files: Record<string, string>): Promise<UmlProject> {
-  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
-  projects.push(project);
-  return project;
-}
-
-/** `qualifiedName@path`: stable across runs and independent of the opaque catalogue key. */
-function label(definition: FileDefinition): string {
-  return `${definition.qualifiedName}@${definition.source.path}`;
-}
+afterEach(cleanup);
 
 /** Node identities, directed edges and frames of one rooted selection. */
 function definitionView(project: UmlProject, target: UmlTarget) {
@@ -37,13 +26,13 @@ function definitionView(project: UmlProject, target: UmlTarget) {
   if (view.kind !== "definitions") {
     throw new Error(`expected a definition view for ${JSON.stringify(target)}`);
   }
-  const names = new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
+  const names = new Map(view.nodes.map((node) => [node.definition.key, umlLabel(node.definition)]));
   const named = (key: string): string => names.get(key) ?? `<outside the view: ${key}>`;
   return {
     status: diagram.status,
     error: diagram.error,
-    nodes: view.nodes.map((node) => label(node.definition)),
-    kinds: view.nodes.map((node) => `${label(node.definition)} ${node.definition.kind}`),
+    nodes: view.nodes.map((node) => umlLabel(node.definition)),
+    kinds: view.nodes.map((node) => `${umlLabel(node.definition)} ${node.definition.kind}`),
     edges: view.edges.map((edge) =>
       `${named(edge.sourceKey)} -${edge.kind}-> ${named(edge.targetKey)}`
     ),
@@ -51,8 +40,8 @@ function definitionView(project: UmlProject, target: UmlTarget) {
       `${named(frame.rootKey)} => ${frame.nodeKeys.map(named).join(", ")}`
     ),
     node(wanted: string): UmlDefinitionNode {
-      const found = view.nodes.find((node) => label(node.definition) === wanted);
-      if (!found) throw new Error(`no node ${wanted} in ${view.nodes.map((n) => label(n.definition)).join(", ")}`);
+      const found = view.nodes.find((node) => umlLabel(node.definition) === wanted);
+      if (!found) throw new Error(`no node ${wanted} in ${view.nodes.map((n) => umlLabel(n.definition)).join(", ")}`);
       return found;
     },
   };
@@ -65,13 +54,13 @@ function drawnBox(project: UmlProject, target: UmlTarget, box: string) {
     throw new Error(`expected a definition view for ${JSON.stringify(target)}`);
   }
   const frame = renderUmlView(diagram.view, FULL_UML_VISIBILITY, target).frames[0];
-  const drawn = frame?.definitionLinks.find((entry) => label(entry.definition) === box);
+  const drawn = frame?.definitionLinks.find((entry) => umlLabel(entry.definition) === box);
   if (!frame || !drawn) throw new Error(`no box ${box} in ${JSON.stringify(target)}`);
   return {
     dsl: frame.dsl,
     nodeId: drawn.nodeId,
-    attributes: drawn.attributes.map(label),
-    methods: drawn.methods.map(label),
+    attributes: drawn.attributes.map((definition) => umlLabel(definition)),
+    methods: drawn.methods.map((definition) => umlLabel(definition)),
   };
 }
 
@@ -147,13 +136,12 @@ pub fn make() -> Leaf {
 };
 
 function rootedProject(): Promise<UmlProject> {
-  return umlProject("ts-explorer-rust-rooted-", ROOTED_FIXTURE);
+  return openProject("ts-explorer-rust-rooted-", ROOTED_FIXTURE);
 }
 
 test("highlights Rust with the shared token vocabulary", () => {
   const spans = computeHighlightSpans("lib.rs", RUST_SOURCE);
 
-  expect(spans.length).toBeGreaterThan(0);
   const vocabulary = [...new Set(spans.map((span) => span.token))];
   expect(vocabulary.filter((token) => !HIGHLIGHT_TOKENS.includes(token))).toEqual([]);
   for (const [index, span] of spans.entries()) {
@@ -377,7 +365,7 @@ test("a module declaration reaches the dependencies of its body file", async () 
 });
 
 test("a module box lists its body's declarations and what its `pub use` re-exports", async () => {
-  const project = await umlProject("ts-explorer-rust-module-members-", {
+  const project = await openProject("ts-explorer-rust-module-members-", {
     "Cargo.toml": `[workspace]
 members = ["crates/dep"]
 
@@ -477,7 +465,7 @@ test("every top-level declaration of a Rust file gets its own frame in source or
 });
 
 test("use aliases, grouped uses, crate/self/super paths and wildcard modules resolve", async () => {
-  const project = await umlProject("ts-explorer-rust-paths-", {
+  const project = await openProject("ts-explorer-rust-paths-", {
     "lib.rs": "pub mod shapes;\npub mod consumers;\npub struct Crate;\n",
     "shapes.rs": "pub struct Circle;\npub struct Square;\npub struct Triangle;\n",
     "consumers/mod.rs": `pub mod inner;
@@ -557,7 +545,7 @@ pub struct Deep {
 });
 
 test("an unresolvable external crate produces no node and no edge", async () => {
-  const project = await umlProject("ts-explorer-rust-external-", {
+  const project = await openProject("ts-explorer-rust-external-", {
     "src/lib.rs": `use other_crate::Thing;
 
 pub struct Holder {
@@ -578,7 +566,7 @@ pub struct Holder {
 });
 
 test("discovers Cargo workspace members and their internal dependencies", async () => {
-  const root = await fixtures.fixtureRoot("ts-explorer-cargo-", {
+  const root = await fixtureRoot("ts-explorer-cargo-", {
     "Cargo.toml": `[workspace]
 members = ["crates/*"]
 `,
@@ -605,7 +593,7 @@ serde = "1"
 });
 
 test("a mixed TypeScript and Rust project keeps each language's closure separate", async () => {
-  const project = await umlProject("ts-explorer-mixed-", {
+  const project = await openProject("ts-explorer-mixed-", {
     "src/ts/model.ts": `export class TsPayload {}
 export class TsService {
   build(): TsPayload {

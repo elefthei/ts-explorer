@@ -38,7 +38,7 @@ function applyModifiers(modifiers: readonly UmlModifier[], text: string): string
 }
 
 function escapeMermaidRow(value: string): string {
-  return value.replace(/[<>]/g, "~").replace("{", "#123;").replace("}", "#125;");
+  return value.replace(/[<>]/g, "~").replaceAll("{", "#123;").replaceAll("}", "#125;");
 }
 
 /**

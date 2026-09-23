@@ -3,17 +3,18 @@ import { Preprocessor } from "./preprocessor.ts";
 import type { PreprocessProgressEvent } from "./preprocess-protocol.ts";
 import { readTree } from "./tree.ts";
 import type {
-  DefinitionLookupResponse,
   DiagramRequest,
   DiagramResponse,
   FileDefinitionsResponse,
   FileResponse,
-  GotoDefinitionLookupResponse,
+  GotoDefinition,
+  LookupResponse,
   PackageInfo,
   PreprocessControlRequest,
   PreprocessPriorityResponse,
   SearchResponse,
   TreeNode,
+  UmlSourceLocation,
   WatchEventName,
 } from "./types.ts";
 import { startSourceWatcher } from "./watcher.ts";
@@ -133,7 +134,7 @@ export class ExplorerStore {
   async getDefinition(
     relativePath: string,
     location: { line: number; column: number },
-  ): Promise<GotoDefinitionLookupResponse> {
+  ): Promise<LookupResponse<GotoDefinition>> {
     const requestedVersion = this.version;
     const definition = await this.fromPreprocessor(() =>
       this.preprocessor.getDefinition(relativePath, location),
@@ -153,7 +154,7 @@ export class ExplorerStore {
     relativePath: string,
     name: string,
     qualifiedName: string,
-  ): Promise<DefinitionLookupResponse> {
+  ): Promise<LookupResponse<UmlSourceLocation>> {
     const requestedVersion = this.version;
     const definition = await this.fromPreprocessor(() =>
       this.preprocessor.lookupDefinition(relativePath, name, qualifiedName),
@@ -173,7 +174,7 @@ export class ExplorerStore {
     if (this.closed) return;
     this.version += 1;
     this.treePromise = undefined;
-    this.preprocessor.rebuild("watch");
+    this.preprocessor.rebuild();
     this.onWatchBatch(paths, events, this.version);
   }
 

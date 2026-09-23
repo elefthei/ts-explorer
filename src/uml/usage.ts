@@ -2,10 +2,12 @@ import type { Node } from "@vscode/tree-sitter-wasm";
 import type { ParsedFileDefinition } from "../goto-definition.ts";
 import { firstAncestor, namedChildren } from "../lang/ast.ts";
 import { highlightLanguageForPath } from "../lang/registry.ts";
+import { forEachBindingName } from "../lang/typescript.ts";
 import type { UmlRelationKind } from "../diagram-graph.ts";
 import type { FileDefinitionKind } from "../types.ts";
 import { canonicalScopeKey } from "./keys.ts";
 import { collectRustReferences } from "./rust-usage.ts";
+import { isDeclarationName, memberKeys, shadowed, type ScopeFrame } from "./reference-scope.ts";
 import type {
   DefinitionBindingSpace,
   DefinitionBindingTarget,
@@ -221,31 +223,8 @@ function scriptParameterNames(parameters: Node | null, out: Set<string>): void {
 }
 
 function collectPatternNames(pattern: Node, out: Set<string>): void {
-  switch (pattern.type) {
-    case "identifier":
-    case "shorthand_property_identifier_pattern":
-      out.add(pattern.text);
-      return;
-    case "pair_pattern": {
-      const value = pattern.childForFieldName("value");
-      if (value) collectPatternNames(value, out);
-      return;
-    }
-    case "assignment_pattern":
-    case "object_assignment_pattern": {
-      const left = pattern.childForFieldName("left");
-      if (left) collectPatternNames(left, out);
-      return;
-    }
-    case "rest_pattern":
-    case "object_pattern":
-    case "array_pattern":
-      for (const child of namedChildren(pattern)) collectPatternNames(child, out);
-      return;
-  }
+  forEachBindingName(pattern, (nameNode) => out.add(nameNode.text));
 }
-
-type ScopeFrame = { values: Set<string>; types: Set<string> };
 
 function scriptScopeFrame(node: Node): ScopeFrame | undefined {
   const values = new Set<string>();
@@ -314,15 +293,6 @@ function scriptScopeFrame(node: Node): ScopeFrame | undefined {
   return values.size || types.size ? { values, types } : undefined;
 }
 
-function shadowed(frames: readonly ScopeFrame[], name: string, space: DefinitionBindingSpace): boolean {
-  for (let index = frames.length - 1; index >= 0; index -= 1) {
-    const frame = frames[index];
-    if (!frame) continue;
-    if (space === "value" ? frame.values.has(name) : frame.types.has(name)) return true;
-  }
-  return false;
-}
-
 function scriptIsUsage(node: Node): boolean {
   const parent = node.parent;
   if (!parent) return false;
@@ -331,10 +301,7 @@ function scriptIsUsage(node: Node): boolean {
   if (parent.type === "member_expression") return parent.childForFieldName("property")?.id !== node.id;
   if (parent.type === "nested_type_identifier") return parent.childForFieldName("name")?.id !== node.id;
   if (parent.type === "pair") return parent.childForFieldName("key")?.id !== node.id;
-  if (SCRIPT_DECLARATION_NAME_PARENTS[parent.type] === true) {
-    if (parent.childForFieldName("name")?.id === node.id) return false;
-    if (parent.childForFieldName("pattern")?.id === node.id) return false;
-  }
+  if (isDeclarationName(node, SCRIPT_DECLARATION_NAME_PARENTS)) return false;
   return true;
 }
 
@@ -371,10 +338,8 @@ function scriptReceiverTargets(
     const property = node.childForFieldName("property");
     if (!object || !property) return [];
     const receivers = scriptReceiverTargets(context, object, frames, chain);
-    const keys = receivers.flatMap((receiver) =>
-      context.resolveMember(receiver, property.text, "value")
-    );
-    return [...new Set(keys)].map((key) => ({ kind: "definition", key } as const));
+    const keys = memberKeys(context, receivers, property.text, ["value"]);
+    return keys.map((key) => ({ kind: "definition", key } as const));
   }
   return [];
 }
@@ -432,9 +397,7 @@ function visitScript(
       const name = node.childForFieldName("name");
       if (module && name) {
         const receivers = scriptReceiverTargets(context, module, frames, chain);
-        const keys = [
-          ...new Set(receivers.flatMap((receiver) => context.resolveMember(receiver, name.text, "type"))),
-        ];
+        const keys = memberKeys(context, receivers, name.text, ["type"]);
         const kind = scriptHeritageKind(node);
         for (const key of keys) context.add(owners, key, kind);
       }
@@ -445,9 +408,7 @@ function visitScript(
       const property = node.childForFieldName("property");
       if (object && property) {
         const receivers = scriptReceiverTargets(context, object, frames, chain);
-        const keys = [
-          ...new Set(receivers.flatMap((receiver) => context.resolveMember(receiver, property.text, "value"))),
-        ];
+        const keys = memberKeys(context, receivers, property.text, ["value"]);
         for (const key of keys) context.add(owners, key, "references");
         // Executable receiver subexpressions still carry their own references.
         if (object.type !== "identifier" && object.type !== "this" && object.type !== "member_expression") {
@@ -471,7 +432,7 @@ function visitScript(
   }
 }
 
-export function collectScriptReferences(
+function collectScriptReferences(
   context: ReferenceContext,
   root: Node,
 ): UmlReferenceEdge[] {

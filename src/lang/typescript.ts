@@ -101,3 +101,32 @@ export function isAccessor(node: Node): boolean {
 export function annotationType(node: Node, field: "type" | "return_type"): Node | undefined {
   return node.childForFieldName(field)?.namedChild(0) ?? undefined;
 }
+
+/**
+ * Binding leaves of a declaration pattern: object keys, array holes and default expressions never
+ * declare a name.
+ */
+export function forEachBindingName(pattern: Node, visit: (nameNode: Node) => void): void {
+  switch (pattern.type) {
+    case "identifier":
+    case "shorthand_property_identifier_pattern":
+      visit(pattern);
+      return;
+    case "pair_pattern": {
+      const value = pattern.childForFieldName("value");
+      if (value) forEachBindingName(value, visit);
+      return;
+    }
+    case "assignment_pattern":
+    case "object_assignment_pattern": {
+      const left = pattern.childForFieldName("left");
+      if (left) forEachBindingName(left, visit);
+      return;
+    }
+    case "rest_pattern":
+    case "object_pattern":
+    case "array_pattern":
+      for (const child of namedChildren(pattern)) forEachBindingName(child, visit);
+      return;
+  }
+}

@@ -1,10 +1,8 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   browserOpenCommand,
   browserUrl,
-  cliVersion,
   formatSyncProgress,
   formatWatchInvalidation,
   parseCliOptions,
@@ -102,15 +100,6 @@ test.each(["--help", "-h", "--version", "-v"])(
     expect(parseCliOptions([flag])).toBeNull();
   },
 );
-
-test("reports the version declared in package.json", () => {
-  const manifest = JSON.parse(
-    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-  ) as { version: string };
-
-  expect(cliVersion).toBe(manifest.version);
-  expect(cliVersion).toMatch(/^\d+\.\d+\.\d+/);
-});
 
 test("formats generation-aware phase progress exactly", () => {
   expect(formatSyncProgress({

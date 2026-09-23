@@ -4,7 +4,8 @@ import type { ParsedFileDefinition } from "../goto-definition.ts";
 import { children, namedChildren } from "../lang/ast.ts";
 import { highlightLanguageForPath } from "../lang/registry.ts";
 import { rustVisibility } from "../lang/rust.ts";
-import { canonicalScopeKey } from "./keys.ts";
+import { rustBareTypeName } from "./rust-parse.ts";
+import { canonicalScopeKey, pairKey, unpairKey } from "./keys.ts";
 import type { FileDefinitionKind, PackageInfo, TreeNode } from "../types.ts";
 import type {
   DefinitionBinding,
@@ -318,22 +319,6 @@ function collectRustFacts(
   visit(root, "");
 }
 
-function rustBareTypeName(node: Node): string | undefined {
-  let current: Node | undefined = node;
-  while (current) {
-    if (current.type === "generic_type" || current.type === "reference_type") {
-      current = current.childForFieldName("type") ?? undefined;
-      continue;
-    }
-    if (current.type === "scoped_type_identifier" || current.type === "scoped_identifier") {
-      current = current.childForFieldName("name") ?? undefined;
-      continue;
-    }
-    return current.text || undefined;
-  }
-  return undefined;
-}
-
 /**
  * Copies one file's catalogue facts out of a live syntax tree. `definitions` must come from
  * `collectFileDefinitionNodes` on the same tree.
@@ -501,6 +486,11 @@ type NameTable = Map<string, string[]>;
 
 function nameKey(name: string, space: DefinitionBindingSpace): string {
   return `${name}\u0000${space}`;
+}
+
+function splitNameKey(key: string): { name: string; space: DefinitionBindingSpace } {
+  const separator = key.lastIndexOf("\u0000");
+  return { name: key.slice(0, separator), space: key.slice(separator + 1) as DefinitionBindingSpace };
 }
 
 function pushName(table: NameTable, key: string, definitionKey: string): void {
@@ -778,23 +768,17 @@ export function buildCatalogue(
     }
     const fileScopes = scopes.get(facts.path);
     if (!fileScopes) continue;
-    for (const [scopeKey, table] of fileScopes.local) {
-      for (const [key, targets] of table) {
-        const separator = key.lastIndexOf("\u0000");
-        const name = key.slice(0, separator);
-        const space = key.slice(separator + 1) as DefinitionBindingSpace;
-        for (const target of targets) {
-          addBinding(facts.path, scopeKey, name, space, "local", { kind: "definition", key: target });
-        }
-      }
-    }
-    for (const [scopeKey, table] of fileScopes.exported) {
-      for (const [key, targets] of table) {
-        const separator = key.lastIndexOf("\u0000");
-        const name = key.slice(0, separator);
-        const space = key.slice(separator + 1) as DefinitionBindingSpace;
-        for (const target of targets) {
-          addBinding(facts.path, scopeKey, name, space, "export", { kind: "definition", key: target });
+    const bindingScopes = [["local", fileScopes.local], ["export", fileScopes.exported]] as const;
+    for (const [bindingKind, tables] of bindingScopes) {
+      for (const [scopeKey, table] of tables) {
+        for (const [key, targets] of table) {
+          const { name, space } = splitNameKey(key);
+          for (const target of targets) {
+            addBinding(facts.path, scopeKey, name, space, bindingKind, {
+              kind: "definition",
+              key: target,
+            });
+          }
         }
       }
     }
@@ -805,7 +789,7 @@ export function buildCatalogue(
         const body = rustModuleBodyFile(catalogue, facts, module);
         if (!body) continue;
         addContributor(module.key, body, "module");
-        importEdges.add(JSON.stringify([facts.path, body]));
+        importEdges.add(pairKey(facts.path, body));
       }
       for (const leaf of facts.rustUses) {
         const base = resolveRustBase(facts, leaf.segments);
@@ -815,11 +799,9 @@ export function buildCatalogue(
         if (leaf.local === "*") {
           const target = rustModuleFile(catalogue, base.base, base.rest);
           if (!target) continue;
-          importEdges.add(JSON.stringify([facts.path, target]));
+          importEdges.add(pairKey(facts.path, target));
           for (const [key, definitionKeys] of exportedTable(target)) {
-            const separator = key.lastIndexOf("\u0000");
-            const name = key.slice(0, separator);
-            const space = key.slice(separator + 1) as DefinitionBindingSpace;
+            const { name, space } = splitNameKey(key);
             for (const definitionKey of definitionKeys) {
               const bound = { kind: "definition", key: definitionKey } as const;
               addBinding(facts.path, importScope, name, space, "import", bound);
@@ -830,7 +812,7 @@ export function buildCatalogue(
           continue;
         }
         const moduleTarget = rustModuleFile(catalogue, base.base, base.rest.slice(0, -1));
-        if (moduleTarget) importEdges.add(JSON.stringify([facts.path, moduleTarget]));
+        if (moduleTarget) importEdges.add(pairKey(facts.path, moduleTarget));
         for (const space of ["type", "value"] as const) {
           for (const target of resolveRustUse(facts, leaf, leaf.local, space, new Set())) {
             addBinding(facts.path, importScope, leaf.local, space, "import", target);
@@ -845,7 +827,7 @@ export function buildCatalogue(
 
     for (const specifier of facts.moduleSpecifiers) {
       const target = resolveScriptModule(catalogue, facts.path, specifier);
-      if (target && target !== facts.path) importEdges.add(JSON.stringify([facts.path, target]));
+      if (target && target !== facts.path) importEdges.add(pairKey(facts.path, target));
     }
     for (const entry of facts.scriptImports) {
       const target = resolveScriptModule(catalogue, facts.path, entry.specifier);
@@ -885,9 +867,7 @@ export function buildCatalogue(
       const target = resolveScriptModule(catalogue, facts.path, specifier);
       if (!target) continue;
       for (const [key] of exportedTable(target)) {
-        const separator = key.lastIndexOf("\u0000");
-        const name = key.slice(0, separator);
-        const space = key.slice(separator + 1) as DefinitionBindingSpace;
+        const { name, space } = splitNameKey(key);
         if (exportedTable(facts.path).has(key)) continue;
         for (const resolved of resolveExport(facts.path, name, space, new Set())) {
           addBinding(facts.path, "", name, space, "export", resolved);
@@ -899,7 +879,7 @@ export function buildCatalogue(
   const definitions: IndexedFileDefinition[] = [];
   for (const facts of files) definitions.push(...facts.definitions);
   const imports: FileImportEdge[] = [...importEdges].map((serialized) => {
-    const [sourcePath, targetPath] = JSON.parse(serialized) as [string, string];
+    const [sourcePath, targetPath] = unpairKey(serialized);
     return { sourcePath, targetPath };
   });
   imports.sort((left, right) =>

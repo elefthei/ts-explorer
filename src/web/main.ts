@@ -1,15 +1,15 @@
-import mermaid from "mermaid";
 import { basicSetup, EditorView } from "codemirror";
 import { Decoration } from "@codemirror/view";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { oneDark } from "@codemirror/theme-one-dark";
+import { DEFAULT_UML_DEPTH } from "../types.ts";
 import type {
-  DefinitionLookupResponse,
   DiagramResponse,
   FileDefinition,
   FileDefinitionsResponse,
   FileResponse,
   GotoDefinition,
+  LookupResponse,
   PackageDiagramNode,
   SearchResponse,
   TreeNode,
@@ -18,12 +18,13 @@ import type {
   WatchMessage,
 } from "../types.ts";
 import { FULL_UML_VISIBILITY } from "../uml/model.ts";
-import { type RenderedUmlFrame, renderUmlView } from "../uml/view.ts";
+import type { RenderedUmlFrame } from "../uml/view.ts";
 import {
   adjacentTreeRowIndex,
   DiagramClickSequence,
   type DiagramPointerTarget,
   RequestSequence,
+  fileNodeIdFromNodeId,
   formatUmlMethodReturnLabel,
   hasDiagramBody,
   hasPassedDragThreshold,
@@ -34,6 +35,7 @@ import {
   zoomViewportAt,
   type ViewportState,
 } from "./diagram-interactions.ts";
+import { prepareUmlView, renderDiagramSvg } from "./diagram-renderer.ts";
 
 function $<T extends Element = HTMLInputElement>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -73,7 +75,9 @@ const state = {
   expandedFiles: new Set<string>(),
   fileDefinitions: new Map<string, FileDefinitionEntry>(),
   umlVisibility: { ...FULL_UML_VISIBILITY },
-  umlRenders: [] as { target: UmlTarget; diagram: UmlDiagramResponse }[],
+  /** Outgoing dependency levels requested for definition and file selections. */
+  umlDepth: DEFAULT_UML_DEPTH,
+  umlRenders: [] as { target: UmlTarget; depth: number; diagram: UmlDiagramResponse }[],
   umlRenderVersion: -1,
   umlScopedErrors: false,
 };
@@ -113,12 +117,12 @@ const searchRequests = new RequestSequence();
 const definitionRequests = new RequestSequence();
 const editorRequests = new RequestSequence();
 const clickSequence = new DiagramClickSequence();
-const diagramLoadingState = { loading: false, showMessage: false };
+let diagramLoading = false;
+/** Cancels the current diagram operation's preparation and rendering; replaced on every change. */
+let diagramController = new AbortController();
 let diagramError: string | undefined;
 let pendingDiagram: { key: string; token: number } | undefined;
 let paintedUmlKey: string | undefined;
-
-mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
@@ -127,18 +131,26 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
-function diagramKey(target: UmlTarget): string {
+/** A directory import graph ignores depth, so its identity stays depth-free. */
+function diagramKey(target: UmlTarget, depth: number): string {
   return JSON.stringify(
     target.kind === "definition"
-      ? ["definition", target.path, target.definitionKey]
-      : [target.kind, target.path],
+      ? ["definition", target.path, target.definitionKey, depth]
+      : target.kind === "file"
+        ? ["file", target.path, depth]
+        : ["directory", target.path],
   );
 }
 
-function diagramQuery(target: UmlTarget): string {
+function diagramQuery(target: UmlTarget, depth: number): string {
   const params = new URLSearchParams({ kind: "uml", target: target.kind, path: target.path });
   if (target.kind === "definition") params.set("definition", target.definitionKey);
+  if (target.kind !== "directory") params.set("depth", String(depth));
   return params.toString();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function setStatus(text: string, error = false): void {
@@ -149,7 +161,7 @@ function setStatus(text: string, error = false): void {
 
 function renderErrorPanel(): void {
   const panel = $("#error-panel");
-  const text = diagramLoadingState.loading ? undefined : diagramError;
+  const text = diagramLoading ? undefined : diagramError;
   panel.textContent = text ?? "";
   panel.hidden = !text;
 }
@@ -159,23 +171,39 @@ function showError(error: string | undefined): void {
   renderErrorPanel();
 }
 
+function reportFailure(error: unknown, status?: string): void {
+  const message = errorMessage(error);
+  showError(message);
+  setStatus(status ?? message, true);
+}
+
 function applyDiagramLoading(): void {
-  const panel = $("#diagram-loading");
-  panel.hidden = !diagramLoadingState.showMessage;
+  $("#diagram-loading").hidden = !diagramLoading;
   const stage = $("#diagram-stage");
-  stage.setAttribute("aria-busy", String(diagramLoadingState.loading));
-  stage.classList.toggle("loading", diagramLoadingState.loading);
+  stage.setAttribute("aria-busy", String(diagramLoading));
+  // Scoped to the selected diagram: its stale links leave the tab order, the shell never does.
+  $("#svg-holder").inert = diagramLoading;
   renderErrorPanel();
 }
 
-function setDiagramLoading(loading: boolean, showMessage = false): void {
-  diagramLoadingState.loading = loading;
-  diagramLoadingState.showMessage = showMessage;
+function setDiagramLoading(loading: boolean): void {
+  diagramLoading = loading;
   applyDiagramLoading();
 }
 
-function setEditorLoading(loading: boolean): void {
-  $("#editor-loading").hidden = !loading;
+/**
+ * Supersedes the in-flight diagram operation and releases its overlay. Every caller that abandons a
+ * diagram request must go through here: a superseded operation never reaches its own finalizer, so
+ * bumping the sequence alone would leave "Loading" painted over the workspace forever.
+ */
+function invalidateDiagramRequest(): number {
+  // The token moves first: an abort listener must never observe the superseded generation as live.
+  const token = diagramRequests.next();
+  diagramController.abort();
+  diagramController = new AbortController();
+  pendingDiagram = undefined;
+  setDiagramLoading(false);
+  return token;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +213,12 @@ function setEditorLoading(loading: boolean): void {
 const diagramLinks = new Map<string, DiagramPointerTarget>();
 let nextDiagramLinkId = 0;
 
-function registerDiagramLink(element: Element, target: DiagramPointerTarget, label: string): void {
+/** Returns the registry id so a caller can extend the hit area without a second registration. */
+function registerDiagramLink(
+  element: Element,
+  target: DiagramPointerTarget,
+  label: string,
+): string {
   const id = String(nextDiagramLinkId++);
   diagramLinks.set(id, target);
   const html = element as HTMLElement;
@@ -194,12 +227,14 @@ function registerDiagramLink(element: Element, target: DiagramPointerTarget, lab
   element.setAttribute("role", "link");
   element.setAttribute("tabindex", "0");
   element.setAttribute("aria-label", `Select ${label}; double-click to open its source`);
+  return id;
 }
 
 function diagramTargetFromElement(node: EventTarget | null): DiagramPointerTarget | undefined {
   if (!(node instanceof Element)) return undefined;
-  const link = node.closest<HTMLElement>("[data-diagram-link]");
-  const id = link?.dataset.diagramLink;
+  // Nearest wins: a member row inside a box still selects that member, not its declaring node.
+  const link = node.closest<HTMLElement>("[data-diagram-link], [data-diagram-node-link]");
+  const id = link?.dataset.diagramLink ?? link?.dataset.diagramNodeLink;
   return id === undefined ? undefined : diagramLinks.get(id);
 }
 
@@ -219,7 +254,8 @@ function decorateDefinitionFrame(root: Element, frame: RenderedUmlFrame): void {
     const title = node.querySelector(".label-group .label, .classTitle");
     if (title) {
       (title as HTMLElement).dataset.searchText = (title.textContent ?? "").trim();
-      registerDiagramLink(
+      // The whole box points at the same registry entry as its title; no second focusable link.
+      node.dataset.diagramNodeLink = registerDiagramLink(
         title,
         { kind: "definition", definition: link.definition },
         link.definition.qualifiedName,
@@ -252,13 +288,16 @@ function decorateDefinitionFrame(root: Element, frame: RenderedUmlFrame): void {
 function decorateFileFrame(root: Element, frame: RenderedUmlFrame): void {
   const byNodeId = new Map(frame.fileLinks.map((link) => [link.nodeId, link] as const));
   for (const node of root.querySelectorAll<SVGGElement>("g.node")) {
-    const match = /(?:^|-)flowchart-(f\d+)-\d+$/.exec(node.id);
-    const nodeId = match?.[1];
+    const nodeId = fileNodeIdFromNodeId(node.id);
     const link = nodeId === undefined ? undefined : byNodeId.get(nodeId);
     if (!link) continue;
     const label = node.querySelector(".nodeLabel") ?? node;
     (label as HTMLElement).dataset.searchText = link.path;
-    registerDiagramLink(label, { kind: "file", path: link.path }, link.path);
+    node.dataset.diagramNodeLink = registerDiagramLink(
+      label,
+      { kind: "file", path: link.path },
+      link.path,
+    );
   }
 }
 
@@ -320,7 +359,7 @@ async function loadFileDefinitions(path: string): Promise<void> {
     );
     settled = { status: "ready", definitions: response.definitions };
   } catch (error) {
-    settled = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    settled = { status: "error", error: errorMessage(error) };
   }
   if (state.fileDefinitions.get(path) !== pending) return;
   state.fileDefinitions.set(path, settled);
@@ -680,16 +719,31 @@ type UmlPaint = {
   errors: string[];
   dslSections: string[];
   frameIndex: number;
+  signal: AbortSignal;
 };
 
-function beginUmlPaint(token: number, isCurrent: () => boolean, scopedErrors: boolean): UmlPaint {
+function beginUmlPaint(
+  token: number,
+  isCurrent: () => boolean,
+  scopedErrors: boolean,
+  signal: AbortSignal,
+): UmlPaint {
   const holder = $("#svg-holder");
   holder.replaceChildren();
   holder.classList.add("stacked");
   holder.setAttribute("role", "list");
   // The tap snapshot deliberately survives the first tap's own repaint.
   diagramLinks.clear();
-  return { holder, token, isCurrent, scopedErrors, errors: [], dslSections: [], frameIndex: 0 };
+  return {
+    holder,
+    token,
+    isCurrent,
+    scopedErrors,
+    errors: [],
+    dslSections: [],
+    frameIndex: 0,
+    signal,
+  };
 }
 
 async function renderUmlFrames(request: {
@@ -700,6 +754,8 @@ async function renderUmlFrames(request: {
 }): Promise<boolean> {
   const { paint, scope, frames, directoryIndex } = request;
   for (const [frameIndex, rendered] of frames.entries()) {
+    // Every resumed frame revalidates: a stale one must never be appended over a newer diagram.
+    if (!paint.isCurrent()) return false;
     const frame = document.createElement("div");
     frame.className = "uml-frame";
     frame.setAttribute("role", "listitem");
@@ -717,17 +773,18 @@ async function renderUmlFrames(request: {
       body.textContent = rendered.emptyMessage ?? EMPTY_DIAGRAM_MESSAGE;
     } else {
       try {
-        const svg = await mermaid.render(
+        const svg = await renderDiagramSvg(
           `diagram-${paint.token}-${directoryIndex}-${frameIndex}`,
           rendered.dsl,
+          paint.signal,
         );
         if (!paint.isCurrent()) return false;
-        body.innerHTML = svg.svg;
+        body.innerHTML = svg;
         decorateDefinitionFrame(body, rendered);
         decorateFileFrame(body, rendered);
       } catch (error) {
         if (!paint.isCurrent()) return false;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         frame.classList.add("error");
         body.textContent = `Diagram ${frameIndex + 1}: ${message}`;
         paint.errors.push(
@@ -750,7 +807,8 @@ async function paintUmlScope(
   directoryIndex: number,
 ): Promise<boolean> {
   const scope = target.path || ".";
-  const view = renderUmlView(diagram.view, state.umlVisibility, target);
+  const view = await prepareUmlView(diagram.view, { ...state.umlVisibility }, target, paint.signal);
+  if (!paint.isCurrent()) return false;
   paint.dslSections.push(paint.scopedErrors ? `%% Scope: ${scope}\n${view.dsl}` : view.dsl);
   if (diagram.status === "error") {
     paint.errors.push(
@@ -776,34 +834,43 @@ function finishUmlPaint(paint: UmlPaint, errorStatus: string, readyStatus: strin
   }
 }
 
-async function loadUmlDiagram(target: UmlTarget, token: number): Promise<void> {
+async function loadUmlDiagram(target: UmlTarget, token: number, signal: AbortSignal): Promise<void> {
   const isCurrent = () => diagramRequests.isCurrent(token);
-  setDiagramLoading(true, true);
+  // Captured once: every key, query and retained entry below must describe the depth actually
+  // fetched, never whatever the input holds after an await.
+  const depth = target.kind === "directory" ? DEFAULT_UML_DEPTH : state.umlDepth;
+  setDiagramLoading(true);
   showError(undefined);
+  // Drop the retained model before awaiting: a member-visibility repaint arriving during this fetch
+  // must not mistake the previous search overview for this selection and cancel the request.
+  state.umlRenders = [];
+  state.umlRenderVersion = -1;
+  state.umlScopedErrors = false;
   try {
-    const diagram = await api<DiagramResponse>(`/api/diagram?${diagramQuery(target)}`);
+    const diagram = await api<DiagramResponse>(`/api/diagram?${diagramQuery(target, depth)}`);
     if (!isCurrent()) return;
     if (diagram.kind !== "uml") throw new Error("Unexpected diagram kind");
     state.version = diagram.version;
-    state.umlRenders = [{ target, diagram }];
+    state.umlRenders = [{ target, depth, diagram }];
     state.umlRenderVersion = diagram.version;
     state.umlScopedErrors = false;
-    const paint = beginUmlPaint(token, isCurrent, false);
+    const paint = beginUmlPaint(token, isCurrent, false, signal);
     const complete = await paintUmlScope(paint, target, diagram, 0);
     if (!complete || !isCurrent()) return;
-    paintedUmlKey = diagramKey(target);
+    paintedUmlKey = diagramKey(target, depth);
     finishUmlPaint(paint, "Mermaid render error", `Updated · v${diagram.version}`);
   } finally {
     if (isCurrent()) setDiagramLoading(false);
   }
 }
 
-async function loadPackagesDiagram(token = diagramRequests.next()): Promise<void> {
+async function loadPackagesDiagram(token = invalidateDiagramRequest()): Promise<void> {
+  const signal = diagramController.signal;
   const isCurrent = () => diagramRequests.isCurrent(token);
   state.mode = "packages";
   activateView("packages");
   viewport.reset();
-  setDiagramLoading(true, true);
+  setDiagramLoading(true);
   showError(undefined);
   paintedUmlKey = undefined;
   try {
@@ -811,17 +878,20 @@ async function loadPackagesDiagram(token = diagramRequests.next()): Promise<void
     if (!isCurrent()) return;
     if (diagram.kind !== "packages") throw new Error("Unexpected diagram kind");
     state.version = diagram.version;
-    paintPackages(diagram, token);
+    await paintPackages(diagram, token, signal);
   } catch (error) {
     if (!isCurrent()) return;
-    showError(error instanceof Error ? error.message : String(error));
-    setStatus("Request failed", true);
+    reportFailure(error, "Request failed");
   } finally {
     if (isCurrent()) setDiagramLoading(false);
   }
 }
 
-function paintPackages(diagram: PackageDiagramResponse, token: number): void {
+async function paintPackages(
+  diagram: PackageDiagramResponse,
+  token: number,
+  signal: AbortSignal,
+): Promise<void> {
   const holder = $("#svg-holder");
   holder.classList.remove("stacked");
   holder.removeAttribute("role");
@@ -838,25 +908,27 @@ function paintPackages(diagram: PackageDiagramResponse, token: number): void {
     setStatus(`Updated · v${diagram.version}`);
     return;
   }
-  void mermaid.render(`diagram-${token}`, diagram.dsl).then((rendered) => {
+  // Awaited so the caller's loading overlay lasts until package rendering settles, not merely until
+  // its HTTP response arrived.
+  try {
+    const rendered = await renderDiagramSvg(`diagram-${token}`, diagram.dsl, signal);
     if (!diagramRequests.isCurrent(token)) return;
-    holder.innerHTML = rendered.svg;
+    holder.innerHTML = rendered;
     decoratePackageNodes(holder, diagram.packageNodes);
     applySearchHighlights();
     viewport.apply();
     setStatus(`Updated · v${diagram.version}`);
-  }, (error: unknown) => {
+  } catch (error) {
     if (!diagramRequests.isCurrent(token)) return;
-    showError(error instanceof Error ? error.message : String(error));
-    setStatus("Mermaid render error", true);
-  });
+    reportFailure(error, "Mermaid render error");
+  }
 }
 
 function umlModelIsCurrent(target: UmlTarget): boolean {
   const render = state.umlRenders.length === 1 ? state.umlRenders[0] : undefined;
   return render !== undefined
     && state.umlRenderVersion === state.version
-    && diagramKey(render.target) === diagramKey(target);
+    && diagramKey(render.target, render.depth) === diagramKey(target, state.umlDepth);
 }
 
 /**
@@ -864,7 +936,7 @@ function umlModelIsCurrent(target: UmlTarget): boolean {
  * editor, so a late graph response can never switch the workspace away from a double-click.
  */
 async function selectUmlTarget(target: UmlTarget): Promise<void> {
-  const key = diagramKey(target);
+  const key = diagramKey(target, state.umlDepth);
   if (pendingDiagram && pendingDiagram.key === key && diagramRequests.isCurrent(pendingDiagram.token)) {
     return;
   }
@@ -872,7 +944,8 @@ async function selectUmlTarget(target: UmlTarget): Promise<void> {
   definitionRequests.next();
   editorRequests.next();
   searchRequests.next();
-  const token = diagramRequests.next();
+  const token = invalidateDiagramRequest();
+  const signal = diagramController.signal;
   const record = { key, token };
   pendingDiagram = record;
   state.mode = "uml";
@@ -881,12 +954,11 @@ async function selectUmlTarget(target: UmlTarget): Promise<void> {
   viewport.reset();
   renderTree();
   try {
-    await loadUmlDiagram(target, token);
+    await loadUmlDiagram(target, token, signal);
   } catch (error) {
     if (!diagramRequests.isCurrent(token)) return;
     setDiagramLoading(false);
-    showError(error instanceof Error ? error.message : String(error));
-    setStatus("Request failed", true);
+    reportFailure(error, "Request failed");
   } finally {
     // Cleared by identity so a superseded record can never block a retry.
     if (pendingDiagram === record) pendingDiagram = undefined;
@@ -895,20 +967,38 @@ async function selectUmlTarget(target: UmlTarget): Promise<void> {
 
 async function rerenderUmlDiagrams(): Promise<void> {
   if (state.activeView !== "uml" || !state.umlRenders.length) return;
-  const token = diagramRequests.next();
+  // A single-selection repaint may only supersede the diagram sequence when the retained model still
+  // belongs to the selected target; otherwise a checkbox would cancel another target's live request.
+  if (!state.umlScopedErrors && !umlModelIsCurrent(state.umlTarget)) return;
+  const token = invalidateDiagramRequest();
+  const signal = diagramController.signal;
   const isCurrent = () => diagramRequests.isCurrent(token);
-  const paint = beginUmlPaint(token, isCurrent, state.umlScopedErrors);
-  for (const [directoryIndex, render] of state.umlRenders.entries()) {
-    const complete = await paintUmlScope(paint, render.target, render.diagram, directoryIndex);
-    if (!complete) return;
+  setDiagramLoading(true);
+  try {
+    const paint = beginUmlPaint(token, isCurrent, state.umlScopedErrors, signal);
+    for (const [directoryIndex, render] of state.umlRenders.entries()) {
+      const complete = await paintUmlScope(paint, render.target, render.diagram, directoryIndex);
+      if (!complete) return;
+    }
+    finishUmlPaint(paint, "Mermaid render error", `Updated · v${state.version}`);
+    if (isCurrent() && !state.umlScopedErrors && umlModelIsCurrent(state.umlTarget)) {
+      paintedUmlKey = diagramKey(state.umlTarget, state.umlDepth);
+    }
+  } catch (error) {
+    if (!isCurrent()) return;
+    reportFailure(error, "Mermaid render error");
+  } finally {
+    if (isCurrent()) setDiagramLoading(false);
   }
-  finishUmlPaint(paint, "Mermaid render error", `Updated · v${state.version}`);
 }
 
 /** Restores the remembered UML selection, rerendering the retained model when it is still current. */
 function restoreUmlView(): void {
   state.mode = "uml";
-  if (umlModelIsCurrent(state.umlTarget) && paintedUmlKey === diagramKey(state.umlTarget)) {
+  if (
+    umlModelIsCurrent(state.umlTarget)
+    && paintedUmlKey === diagramKey(state.umlTarget, state.umlDepth)
+  ) {
     activateView("uml");
     void rerenderUmlDiagrams();
     return;
@@ -984,9 +1074,7 @@ async function selectSearchDefinition(definition: GotoDefinition): Promise<void>
     });
   } catch (error) {
     if (!definitionRequests.isCurrent(token)) return;
-    const message = error instanceof Error ? error.message : String(error);
-    showError(message);
-    setStatus(message, true);
+    reportFailure(error);
   }
 }
 
@@ -1003,15 +1091,16 @@ function clearSearch(): void {
 }
 
 async function renderSearchDiagrams(renderDirs: readonly string[], searchToken: number): Promise<void> {
-  const renderToken = diagramRequests.next();
+  const renderToken = invalidateDiagramRequest();
+  const signal = diagramController.signal;
   const isCurrent = () =>
     searchRequests.isCurrent(searchToken) && diagramRequests.isCurrent(renderToken);
   state.mode = "uml";
   activateView("uml");
   viewport.reset();
-  setDiagramLoading(true, true);
+  setDiagramLoading(true);
   paintedUmlKey = undefined;
-  const paint = beginUmlPaint(renderToken, isCurrent, true);
+  const paint = beginUmlPaint(renderToken, isCurrent, true, signal);
   state.umlRenders = [];
   state.umlRenderVersion = state.version;
   state.umlScopedErrors = true;
@@ -1020,18 +1109,30 @@ async function renderSearchDiagrams(renderDirs: readonly string[], searchToken: 
       const target: UmlTarget = { kind: "directory", path: renderDir };
       let diagram: UmlDiagramResponse;
       try {
-        const response = await api<DiagramResponse>(`/api/diagram?${diagramQuery(target)}`);
+        const response = await api<DiagramResponse>(
+          // A search overview is a directory import graph: the remembered depth never applies.
+          `/api/diagram?${diagramQuery(target, DEFAULT_UML_DEPTH)}`,
+        );
         if (!isCurrent()) return;
         if (response.kind !== "uml") throw new Error("Unexpected diagram kind");
         diagram = response;
       } catch (error) {
         if (!isCurrent()) return;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         paint.errors.push(`[${renderDir || "."}] request: ${message}`);
         continue;
       }
-      state.umlRenders.push({ target, diagram });
-      const complete = await paintUmlScope(paint, target, diagram, directoryIndex);
+      state.umlRenders.push({ target, depth: DEFAULT_UML_DEPTH, diagram });
+      // A worker or preparation failure stays this scope's problem: escaping here would clear the
+      // retained search results that every other scope still paints from.
+      let complete: boolean;
+      try {
+        complete = await paintUmlScope(paint, target, diagram, directoryIndex);
+      } catch (error) {
+        if (!isCurrent()) return;
+        paint.errors.push(`[${renderDir || "."}] render: ${errorMessage(error)}`);
+        continue;
+      }
       if (!complete) return;
     }
     finishUmlPaint(
@@ -1052,8 +1153,7 @@ async function commitSearch(query: string, caseInsensitive: boolean): Promise<vo
   definitionRequests.next();
   const activeView = state.activeView;
   const token = searchRequests.next();
-  diagramRequests.next();
-  setDiagramLoading(false);
+  invalidateDiagramRequest();
   state.search = query;
   state.searchCaseInsensitive = caseInsensitive;
   state.searchFiles = new Set();
@@ -1092,13 +1192,18 @@ async function commitSearch(query: string, caseInsensitive: boolean): Promise<vo
     state.searchDefinitions = [];
     renderDefinitionResults();
     renderTree();
-    setStatus(error instanceof Error ? error.message : String(error), true);
+    setStatus(errorMessage(error), true);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Editor
 // ---------------------------------------------------------------------------
+
+function setEditorPanelVisible(hasFile: boolean): void {
+  $("#editor-empty").hidden = hasFile;
+  $("#editor-content").hidden = !hasFile;
+}
 
 function activateView(view: "packages" | "uml" | "editor"): void {
   state.activeView = view;
@@ -1110,9 +1215,7 @@ function activateView(view: "packages" | "uml" | "editor"): void {
   $("#graph-panel").hidden = editorActive;
   $("#editor-panel").hidden = !editorActive;
   $("#uml-visibility").hidden = view !== "uml";
-  const hasFile = state.file !== null;
-  $("#editor-empty").hidden = hasFile;
-  $("#editor-content").hidden = !hasFile;
+  setEditorPanelVisible(state.file !== null);
   applySearchHighlights();
 }
 
@@ -1124,8 +1227,7 @@ function destroyEditor(invalidate = true): void {
   state.view?.destroy();
   state.view = null;
   state.file = null;
-  $("#editor-content").hidden = true;
-  $("#editor-empty").hidden = false;
+  setEditorPanelVisible(false);
 }
 
 function revealEditorOffset(offset: number, focus = true): void {
@@ -1206,10 +1308,9 @@ function editorDefinitionHandlers() {
 async function openFile(path: string, position?: UmlSourceLocation): Promise<boolean> {
   definitionRequests.next();
   // A late diagram response must never repaint over the editor this gesture opened.
-  diagramRequests.next();
+  invalidateDiagramRequest();
   searchRequests.next();
   clickSequence.clear();
-  pendingDiagram = undefined;
   const editorToken = editorRequests.next();
   const isCurrent = () => editorRequests.isCurrent(editorToken);
   try {
@@ -1247,20 +1348,20 @@ async function openFile(path: string, position?: UmlSourceLocation): Promise<boo
     return true;
   } catch (error) {
     if (!isCurrent()) return false;
-    setStatus(error instanceof Error ? error.message : String(error), true);
+    setStatus(errorMessage(error), true);
     return false;
   }
 }
 
 async function lookupEditorDefinition(
   target: EditorDefinitionTarget,
-): Promise<DefinitionLookupResponse> {
+): Promise<LookupResponse<UmlSourceLocation>> {
   const query = new URLSearchParams({
     path: target.path,
     name: target.name,
     qualifiedName: target.qualifiedName,
   });
-  return api<DefinitionLookupResponse>(`/api/definition?${query}`);
+  return api<LookupResponse<UmlSourceLocation>>(`/api/definition?${query}`);
 }
 
 async function navigateToEditorDefinition(target: EditorDefinitionTarget): Promise<void> {
@@ -1272,11 +1373,7 @@ async function navigateToEditorDefinition(target: EditorDefinitionTarget): Promi
     if (!location) throw new Error("Definition not found");
     await openFile(location.path, location);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    showError(message);
-    setStatus(message, true);
-  } finally {
-    setEditorLoading(false);
+    reportFailure(error);
   }
 }
 
@@ -1290,9 +1387,7 @@ async function reloadOpenFile(): Promise<void> {
 
 function refreshCachedViews(): void {
   definitionRequests.next();
-  void loadTree().catch((error) =>
-    setStatus(error instanceof Error ? error.message : String(error), true)
-  );
+  void loadTree().catch((error) => setStatus(errorMessage(error), true));
   if (state.file) void reloadOpenFile();
   if (state.search && state.mode === "uml") {
     void commitSearch(state.search, state.searchCaseInsensitive);
@@ -1322,11 +1417,9 @@ function handleWatch(message: WatchMessage): void {
   state.fileDefinitions.clear();
   state.umlRenderVersion = -1;
   paintedUmlKey = undefined;
-  diagramRequests.next();
+  invalidateDiagramRequest();
   if (message.paths.length === 0 && message.events.length === 0) {
-    void loadTree().catch((error) =>
-      setStatus(error instanceof Error ? error.message : String(error), true)
-    );
+    void loadTree().catch((error) => setStatus(errorMessage(error), true));
     return;
   }
   refreshCachedViews();
@@ -1639,7 +1732,7 @@ $("#packages-mode").onclick = () => void loadPackagesDiagram();
 $("#uml-mode").onclick = () => restoreUmlView();
 $("#editor-mode").onclick = () => {
   definitionRequests.next();
-  diagramRequests.next();
+  invalidateDiagramRequest();
   activateView("editor");
 };
 $("#tree-filter").oninput = renderTree;
@@ -1647,11 +1740,11 @@ $("#zoom-in").onclick = () => zoomAtStageCenter(ZOOM_IN_FACTOR);
 $("#zoom-out").onclick = () => zoomAtStageCenter(ZOOM_OUT_FACTOR);
 $("#zoom-reset").onclick = () => viewport.reset();
 $("#legend-toggle").onclick = () => {
-  $("#legend").hidden = !$("#legend").hidden;
+  const legend = $("#legend");
+  legend.hidden = !legend.hidden;
 };
 $("#sidebar-toggle").onclick = toggleSidebar;
 $("#editor-close").onclick = () => {
-  setEditorLoading(false);
   destroyEditor();
   if (state.mode === "uml") restoreUmlView();
   else void loadPackagesDiagram();
@@ -1675,9 +1768,38 @@ for (
   };
 }
 
+const umlDepthInput = $("#uml-depth");
+umlDepthInput.value = String(state.umlDepth);
+
+/**
+ * Accepts a non-negative safe integer and reloads the current definition/file selection through the
+ * ordinary depth-carrying request path. Anything else silently restores the last accepted value:
+ * a typo must never blank the graph or spend a request.
+ */
+function commitUmlDepth(): void {
+  const value = umlDepthInput.valueAsNumber;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    umlDepthInput.value = String(state.umlDepth);
+    return;
+  }
+  umlDepthInput.value = String(value);
+  if (value === state.umlDepth) return;
+  state.umlDepth = value;
+  if (
+    state.activeView !== "uml"
+    || state.umlScopedErrors
+    || state.umlTarget.kind === "directory"
+  ) return;
+  void selectUmlTarget(state.umlTarget);
+}
+
+umlDepthInput.onchange = commitUmlDepth;
+umlDepthInput.onkeydown = (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  commitUmlDepth();
+};
+
 await loadTree();
 connect();
-void loadPackagesDiagram().catch((error) => {
-  showError(error instanceof Error ? error.message : String(error));
-  setStatus("Request failed", true);
-});
+void loadPackagesDiagram().catch((error) => reportFailure(error, "Request failed"));

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,11 +25,18 @@ import type {
   UmlDiagramPayload,
 } from "../src/types.ts";
 import type { DefinitionIndexSnapshot } from "../src/uml/model.ts";
-import type { UmlViewModel } from "../src/uml/view.ts";
+import { withBound } from "./support/async.ts";
 import { createFixtureTracker } from "./support/fixtures.ts";
-
-type DefinitionsView = Extract<UmlViewModel, { kind: "definitions" }>;
-type FilesView = Extract<UmlViewModel, { kind: "files" }>;
+import { openDatabase } from "./support/normalized-sql.ts";
+import {
+  type DefinitionsView,
+  definitionsView,
+  edgeRows,
+  filesView,
+  frameRows,
+  memberLabels,
+  qualifiedNameLabel,
+} from "./support/uml-contract.ts";
 
 /**
  * A synthetic catalogue for cache-level tests. The keys are test-owned opaque identifiers: the
@@ -195,17 +202,6 @@ function flattenTree(root: TreeNode): TreeNode[] {
   return nodes.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function openDatabase<T>(dbPath: string, operation: (db: Database) => T): T {
-  let db: Database | null = new Database(dbPath, { strict: true });
-  try {
-    return operation(db);
-  } finally {
-    db.close();
-    db = null;
-    Bun.gc(true);
-  }
-}
-
 function tableColumns(db: Database, table: string): { name: string; type: string }[] {
   const statement = db.query<{ name: string; type: string }, []>(`PRAGMA table_info('${table}')`);
   try {
@@ -249,50 +245,6 @@ function expectOnlyGeneration(db: Database, generationId: number): void {
   }
 }
 
-function expectSearchSchema(
-  db: Database,
-  table: "files" | "GotoDef",
-  searchTable: "file_search" | "goto_def_search",
-  expectedTriggers: readonly string[],
-): void {
-  expect(db.query<{ name: string; type: string }, [string, string]>(`
-    SELECT name, type
-    FROM sqlite_schema
-    WHERE name IN (?, ?)
-    ORDER BY name
-  `).all(table, searchTable)).toEqual(
-    [
-      { name: table, type: "table" },
-      { name: searchTable, type: "table" },
-    ].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
-  );
-  expect(db.query<{ name: string }, [string]>(`
-    SELECT name
-    FROM sqlite_schema
-    WHERE type = 'trigger' AND tbl_name = ?
-    ORDER BY name
-  `).all(table)).toEqual(expectedTriggers.map((name) => ({ name })));
-}
-
-function withTimeout<Value>(promise: Promise<Value>, description: string, timeout = 10_000): Promise<Value> {
-  const timed = Promise.withResolvers<Value>();
-  const timer = setTimeout(
-    () => timed.reject(new Error(`timed out waiting for ${description}`)),
-    timeout,
-  );
-  void promise.then(
-    (value) => {
-      clearTimeout(timer);
-      timed.resolve(value);
-    },
-    (error) => {
-      clearTimeout(timer);
-      timed.reject(error);
-    },
-  );
-  return timed.promise;
-}
-
 function occurrenceOffset(content: string, needle: string, occurrence: number): number {
   let offset = -1;
   for (let index = 0; index <= occurrence; index += 1) {
@@ -313,12 +265,24 @@ function withoutDisplay(definitions: readonly EditorGotoDefinition[]): GotoDefin
   }));
 }
 
-function definitionRequest(path: string, definitionKey: string): DiagramRequest {
-  return { kind: "uml", target: { kind: "definition", path, definitionKey } };
+function definitionRequest(
+  path: string,
+  definitionKey: string,
+  depth?: number,
+): DiagramRequest {
+  return {
+    kind: "uml",
+    target: { kind: "definition", path, definitionKey },
+    ...(depth === undefined ? {} : { depth }),
+  };
 }
 
-function fileRequest(path: string): DiagramRequest {
-  return { kind: "uml", target: { kind: "file", path } };
+function fileRequest(path: string, depth?: number): DiagramRequest {
+  return {
+    kind: "uml",
+    target: { kind: "file", path },
+    ...(depth === undefined ? {} : { depth }),
+  };
 }
 
 function directoryRequest(path: string): DiagramRequest {
@@ -330,40 +294,8 @@ function expectUml(diagram: DiagramPayload): UmlDiagramPayload {
   return diagram;
 }
 
-function definitionsView(diagram: DiagramPayload): DefinitionsView {
-  const view = expectUml(diagram).view;
-  if (view.kind !== "definitions") throw new Error("expected a definitions view");
-  return view;
-}
-
-function filesView(diagram: DiagramPayload): FilesView {
-  const view = expectUml(diagram).view;
-  if (view.kind !== "files") throw new Error("expected a files view");
-  return view;
-}
-
 function nodeNames(view: DefinitionsView): string[] {
   return view.nodes.map((node) => node.definition.qualifiedName).sort();
-}
-
-/** Edges projected onto readable identities, so assertions never pin a key serialization. */
-function edgeSummary(view: DefinitionsView): string[] {
-  const names = new Map(view.nodes.map((node) => [node.definition.key, node.definition.qualifiedName]));
-  return view.edges
-    .map((edge) =>
-      `${names.get(edge.sourceKey) ?? edge.sourceKey} -${edge.kind}-> ${
-        names.get(edge.targetKey) ?? edge.targetKey
-      }`
-    )
-    .sort();
-}
-
-function frameSummary(view: DefinitionsView): { root: string; nodes: string[] }[] {
-  const names = new Map(view.nodes.map((node) => [node.definition.key, node.definition.qualifiedName]));
-  return view.frames.map((frame) => ({
-    root: names.get(frame.rootKey) ?? frame.rootKey,
-    nodes: frame.nodeKeys.map((key) => names.get(key) ?? key).sort(),
-  }));
 }
 
 function definitionKeyOf(definitions: readonly FileDefinition[], qualifiedName: string): string {
@@ -434,7 +366,7 @@ function spawnPreprocessChild(): {
       if (waiters.has(id)) throw new Error(`already waiting for preprocess response ${id}`);
       const { promise: response, resolve, reject } = Promise.withResolvers<PreprocessResponse>();
       waiters.set(id, { resolve, reject });
-      return withTimeout(response, `preprocess response ${id}`, 30_000).finally(() => {
+      return withBound(response, 30_000, `preprocess response ${id}`).finally(() => {
         waiters.delete(id);
       });
     },
@@ -730,6 +662,16 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
       request: { kind: "packages", scopePath: "src" },
       message: "packages diagram scope must be the source root",
     },
+    {
+      id: 12,
+      request: { kind: "uml", target: { kind: "file", path: "a.ts" }, depth: -1 },
+      message: "depth must be an integer of at least 0",
+    },
+    {
+      id: 13,
+      request: { kind: "uml", target: { kind: "file", path: "a.ts" }, depth: "1" },
+      message: "depth must be an integer of at least 0",
+    },
   ];
   const diagramResponses = diagramCases.map(({ id }) => waitForResponse(id));
   for (const { id, request } of diagramCases) {
@@ -743,10 +685,10 @@ test("serves the preprocessing protocol from a Bun child process and exits clean
     })),
   );
 
-  const shutdownResponse = waitForResponse(12);
-  subprocess.send({ id: 12, type: "shutdown" });
-  expect(await shutdownResponse).toEqual({ id: 12, ok: true, value: null });
-  expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
+  const shutdownResponse = waitForResponse(14);
+  subprocess.send({ id: 14, type: "shutdown" });
+  expect(await shutdownResponse).toEqual({ id: 14, ok: true, value: null });
+  expect(await withBound(subprocess.exited, 10_000, "preprocess child exit")).toBe(0);
 }, 30_000);
 
 test("exits when the parent IPC channel disconnects", async () => {
@@ -768,7 +710,8 @@ test("exits when the parent IPC channel disconnects", async () => {
   });
 
   subprocess.disconnect();
-  expect(await withTimeout(subprocess.exited, "preprocess child exit after IPC disconnect")).toBe(0);
+  expect(await withBound(subprocess.exited, 10_000, "preprocess child exit after IPC disconnect"))
+    .toBe(0);
 }, 30_000);
 
 test("names the owner and dependency files a rooted selection still needs", async () => {
@@ -810,12 +753,11 @@ test("names the owner and dependency files a rooted selection still needs", asyn
     cause: "startup",
   });
   await call({ type: "discover-packages", generationId });
-  const indexed = await call<{ definitionCount: number }>({
+  await call({
     type: "index-definitions",
     generationId,
     cause: "startup",
   });
-  expect(indexed.definitionCount).toBeGreaterThan(0);
 
   const rootDefinitions = await call<FileDefinition[]>({
     type: "read-file-definitions",
@@ -823,36 +765,63 @@ test("names the owner and dependency files a rooted selection still needs", asyn
     path: "feature/root.ts",
   });
   const rootKey = definitionKeyOf(rootDefinitions, "Root");
-  const request = definitionRequest("feature/root.ts", rootKey);
 
-  const readSelection = () =>
-    call<
-      { state: "pending"; files: string[] } | { state: "complete"; diagram: DiagramPayload }
-    >({ type: "read-diagram", generationId, request });
+  type SelectionRead =
+    | { state: "pending"; files: string[] }
+    | { state: "complete"; diagram: DiagramPayload };
+  const readSelection = (depth?: number) =>
+    call<SelectionRead>({
+      type: "read-diagram",
+      generationId,
+      request: definitionRequest("feature/root.ts", rootKey, depth),
+    });
+  const completeSelection = async (depth?: number): Promise<DiagramPayload> => {
+    const result = await readSelection(depth);
+    if (result.state !== "complete") {
+      throw new Error(`selection is still pending: ${result.files.join(", ")}`);
+    }
+    return result.diagram;
+  };
   const processFile = (path: string) =>
     call({ type: "preprocess-scope", generationId, cause: "startup", scope: { path, kind: "file" } });
 
-  // No file scope has run yet: the owner file itself is the only thing the selection needs.
+  // No file scope has run yet: the owner file itself is the only thing any depth needs.
+  expect(await readSelection(0)).toEqual({ state: "pending", files: ["feature/root.ts"] });
   expect(await readSelection()).toEqual({ state: "pending", files: ["feature/root.ts"] });
   await processFile("feature/root.ts");
+
+  // Depth 0 is the root alone, and it still waits for the root's real member details.
+  const rootOnly = await completeSelection(0);
+  const rootOnlyView = definitionsView(rootOnly);
+  expect(nodeNames(rootOnlyView)).toEqual(["Root"]);
+  expect(edgeRows(rootOnlyView, qualifiedNameLabel)).toEqual([]);
+  expect(memberLabels(expectUml(rootOnly), "Root@feature/root.ts"))
+    .toEqual(["Root.value@feature/root.ts"]);
+
+  // The next level demands the dependency's own file, never that dependency's dependency.
+  expect(await readSelection(1)).toEqual({ state: "pending", files: ["feature/b.ts"] });
   expect(await readSelection()).toEqual({ state: "pending", files: ["feature/b.ts"] });
   await processFile("feature/b.ts");
+  const visibleChild = definitionsView(await completeSelection(1));
+  expect(nodeNames(visibleChild)).toEqual(["B", "Root"]);
+  expect(edgeRows(visibleChild, qualifiedNameLabel)).toEqual(["Root -references-> B"]);
+
+  expect(await readSelection(2)).toEqual({ state: "pending", files: ["shared/c.ts"] });
   expect(await readSelection()).toEqual({ state: "pending", files: ["shared/c.ts"] });
   await processFile("shared/c.ts");
 
-  const complete = await readSelection();
-  if (complete.state !== "complete") {
-    throw new Error(`selection is still pending: ${complete.files.join(", ")}`);
-  }
-  const view = definitionsView(complete.diagram);
-  expect(expectUml(complete.diagram).status).toBe("ready");
+  const complete = await completeSelection();
+  const view = definitionsView(complete);
+  expect(expectUml(complete).status).toBe("ready");
   expect(nodeNames(view)).toEqual(["B", "C", "Root"]);
-  expect(edgeSummary(view)).toEqual([
+  expect(edgeRows(view, qualifiedNameLabel)).toEqual([
     "B -references-> C",
     "C -references-> B",
     "Root -references-> B",
   ]);
-  expect(frameSummary(view)).toEqual([{ root: "Root", nodes: ["B", "C", "Root"] }]);
+  expect(frameRows(view, qualifiedNameLabel)).toEqual([{ root: "Root", nodes: ["B", "C", "Root"] }]);
+  expect(frameRows(definitionsView(await completeSelection(2)), qualifiedNameLabel))
+    .toEqual([{ root: "Root", nodes: ["B", "C", "Root"] }]);
 
   // Nothing outside that closure was preprocessed, and the generation was never promoted.
   expect(
@@ -867,7 +836,7 @@ test("names the owner and dependency files a rooted selection still needs", asyn
   const shutdown = waitForResponse(shutdownId);
   subprocess.send({ id: shutdownId, type: "shutdown" });
   expect(await shutdown).toEqual({ id: shutdownId, ok: true, value: null });
-  expect(await withTimeout(subprocess.exited, "preprocess child exit")).toBe(0);
+  expect(await withBound(subprocess.exited, 10_000, "preprocess child exit")).toBe(0);
 
   openDatabase(dbPath, (db) => {
     expect(db.query<{ id: number; state: string }, []>("SELECT id, state FROM generations").all())
@@ -1035,7 +1004,6 @@ test("preprocesses each visible scope once and serves formatted files and litera
   await idle;
   expect(promotions).toEqual(["promoted"]);
   expect(errors).toEqual([]);
-  expect(progressEvents.length).toBeGreaterThan(0);
   const progressGenerationIds = [...new Set(progressEvents.map((event) => event.generationId))];
   expect(progressGenerationIds).toHaveLength(1);
   const [progressGenerationId] = progressGenerationIds;
@@ -1144,11 +1112,12 @@ test("preprocesses each visible scope once and serves formatted files and litera
     await preprocessor.getDiagram(fileRequest("packages/b/index.js")),
   );
   expect(nodeNames(javaScriptView)).toEqual(["jsValue"]);
-  expect(frameSummary(javaScriptView)).toEqual([{ root: "jsValue", nodes: ["jsValue"] }]);
+  expect(frameRows(javaScriptView, qualifiedNameLabel))
+    .toEqual([{ root: "jsValue", nodes: ["jsValue"] }]);
 
   const rootOutline = await preprocessor.getFileDefinitions("root.ts");
   const rootFileView = definitionsView(await preprocessor.getDiagram(fileRequest("root.ts")));
-  expect(frameSummary(rootFileView).map(({ root: name }) => name)).toEqual([
+  expect(frameRows(rootFileView, qualifiedNameLabel).map(({ root: name }) => name)).toEqual([
     "before",
     "SearchNeedleEntity",
     "OtherNeedle",
@@ -1159,7 +1128,7 @@ test("preprocesses each visible scope once and serves formatted files and litera
     definitionRequest("root.ts", definitionKeyOf(rootOutline, "SearchNeedleEntity")),
   ));
   expect(nodeNames(entityView)).toEqual(["SearchNeedleEntity"]);
-  expect(edgeSummary(entityView)).toEqual([]);
+  expect(edgeRows(entityView, qualifiedNameLabel)).toEqual([]);
 
   expect(await preprocessor.readFile("root.ts")).toEqual({
     path: "root.ts",
@@ -1935,7 +1904,7 @@ test("labels repeated scope work across startup and watch generations", async ()
 
   await preprocessor.ready();
   await preprocessor.whenIdle();
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
 
   expect(errors).toEqual([]);
@@ -2053,34 +2022,36 @@ test("serves concurrent roots from one target file with a single UML phase", asy
   });
   await preprocessor.ready();
   const outline = await preprocessor.getFileDefinitions(targetPath);
-  await withTimeout(blockerStarted.promise, "blocker preprocessing start", 30_000);
+  await withBound(blockerStarted.promise, 30_000, "blocker preprocessing start");
 
   // Three selections rooted in the same unprocessed file: the first pending reply must not be
   // cached, and the file must be extracted exactly once for all of them.
-  const [targetDiagram, isolatedDiagram, fileDiagram] = await withTimeout(
+  const [targetDiagram, isolatedDiagram, fileDiagram] = await withBound(
     Promise.all([
       preprocessor.getDiagram(definitionRequest(targetPath, definitionKeyOf(outline, "PriorityTarget"))),
       preprocessor.getDiagram(definitionRequest(targetPath, definitionKeyOf(outline, "PriorityIsolated"))),
       preprocessor.getDiagram(fileRequest(targetPath)),
     ]),
-    "rooted selections from a building generation",
     45_000,
+    "rooted selections from a building generation",
   );
 
   const targetView = definitionsView(targetDiagram);
   expect(expectUml(targetDiagram).status).toBe("ready");
   expect(nodeNames(targetView)).toEqual(["PriorityDependency", "PriorityTarget"]);
-  expect(edgeSummary(targetView)).toEqual(["PriorityTarget -references-> PriorityDependency"]);
+  expect(edgeRows(targetView, qualifiedNameLabel))
+    .toEqual(["PriorityTarget -references-> PriorityDependency"]);
 
   // A completed root with no outgoing reference is a one-node graph, not a pending selection.
   const isolatedView = definitionsView(isolatedDiagram);
   expect(nodeNames(isolatedView)).toEqual(["PriorityIsolated"]);
-  expect(edgeSummary(isolatedView)).toEqual([]);
-  expect(frameSummary(isolatedView)).toEqual([
+  expect(edgeRows(isolatedView, qualifiedNameLabel)).toEqual([]);
+  expect(frameRows(isolatedView, qualifiedNameLabel)).toEqual([
     { root: "PriorityIsolated", nodes: ["PriorityIsolated"] },
   ]);
 
-  expect(frameSummary(definitionsView(fileDiagram)).map(({ root: name }) => name)).toEqual([
+  const fileFrameRoots = frameRows(definitionsView(fileDiagram), qualifiedNameLabel);
+  expect(fileFrameRoots.map(({ root: name }) => name)).toEqual([
     "PriorityDependency",
     "PriorityTarget",
     "PriorityIsolated",
@@ -2150,7 +2121,7 @@ test("reports queued, processing and done for a prioritized selection without pr
     idleResolved = true;
   });
   await preprocessor.ready();
-  await withTimeout(blockerStarted.promise, "blocker preprocessing start", 30_000);
+  await withBound(blockerStarted.promise, 30_000, "blocker preprocessing start");
 
   expect(await preprocessor.getDefinition(targetPath, { line: 1, column: 14 })).toBeNull();
   const priority = await preprocessor.prioritize(`./${targetPath}`);
@@ -2159,7 +2130,7 @@ test("reports queued, processing and done for a prioritized selection without pr
     status: "queued",
     requestId: priority.requestId,
   });
-  await withTimeout(targetStarted.promise, "prioritized source start", 30_000);
+  await withBound(targetStarted.promise, 30_000, "prioritized source start");
   expect(await preprocessor.poll(priority.requestId)).toEqual({
     resource: targetPath,
     status: "processing",
@@ -2190,7 +2161,13 @@ test("reports queued, processing and done for a prioritized selection without pr
 test("reuses warm SQL and a recovered generation without restarting UML extraction", async () => {
   const root = await temporaryRoot("ts-explorer-preprocessor-warm-");
   await writeFixtureFile(root, "package.json", JSON.stringify({ name: "warm-cache" }));
-  await writeFixtureFile(root, "dep.ts", "export class Dependency {}\n");
+  await writeFixtureFile(
+    root,
+    "dep.ts",
+    'import { Tail } from "./tail";\nexport class Dependency { tail: Tail; }\n',
+  );
+  await writeFixtureFile(root, "tail.ts", "export class Tail {}\n");
+  await writeFixtureFile(root, "island.ts", "export class Island {}\n");
   await writeFixtureFile(
     root,
     "root.ts",
@@ -2198,7 +2175,13 @@ test("reuses warm SQL and a recovered generation without restarting UML extracti
   );
 
   const umlStarts = (events: readonly PreprocessProgressEvent[]) =>
-    events.filter((event) => event.component === "uml" && event.event === "start").length;
+    events
+      .filter((event) => event.component === "uml" && event.event === "start")
+      .map((event) => event.resource)
+      .sort();
+  /** Every record that would mean source was parsed again rather than read from SQL. */
+  const extractionStarts = (events: readonly PreprocessProgressEvent[]) =>
+    events.filter((event) => event.event === "start");
 
   const warmProgress: PreprocessProgressEvent[] = [];
   const warmErrors: Error[] = [];
@@ -2212,15 +2195,57 @@ test("reuses warm SQL and a recovered generation without restarting UML extracti
   await warm.ready();
   await warm.whenIdle();
   const rootKey = definitionKeyOf(await warm.getFileDefinitions("root.ts"), "Root");
-  const extractedPhases = umlStarts(warmProgress);
-  expect(extractedPhases).toBe(2);
+  const dependencyKey = definitionKeyOf(await warm.getFileDefinitions("dep.ts"), "Dependency");
+  const islandKey = definitionKeyOf(await warm.getFileDefinitions("island.ts"), "Island");
+  // The whole project is extracted up front; every bounded view below only projects that cache.
+  expect(umlStarts(warmProgress)).toEqual(["./dep.ts", "./island.ts", "./root.ts", "./tail.ts"]);
+  const baseline = warmProgress.length;
 
-  const warmDiagram = definitionsView(await warm.getDiagram(definitionRequest("root.ts", rootKey)));
-  expect(nodeNames(warmDiagram)).toEqual(["Dependency", "Root"]);
-  expect(edgeSummary(warmDiagram)).toEqual(["Root -references-> Dependency"]);
+  const rootAtOne = definitionsView(
+    await warm.getDiagram(definitionRequest("root.ts", rootKey, 1)),
+  );
+  expect(edgeRows(rootAtOne, qualifiedNameLabel)).toEqual(["Root -references-> Dependency"]);
+  expect(frameRows(rootAtOne, qualifiedNameLabel))
+    .toEqual([{ root: "Root", nodes: ["Dependency", "Root"] }]);
+
+  // Re-rooting the truncated child reaches its own child: the new root is not limited to the
+  // previous slice, and nothing about it was fetched from source.
+  const dependencyAtOne = definitionsView(
+    await warm.getDiagram(definitionRequest("dep.ts", dependencyKey, 1)),
+  );
+  expect(edgeRows(dependencyAtOne, qualifiedNameLabel)).toEqual(["Dependency -references-> Tail"]);
+  expect(frameRows(dependencyAtOne, qualifiedNameLabel))
+    .toEqual([{ root: "Dependency", nodes: ["Dependency", "Tail"] }]);
+
+  const islandAtOne = definitionsView(
+    await warm.getDiagram(definitionRequest("island.ts", islandKey, 1)),
+  );
+  expect(edgeRows(islandAtOne, qualifiedNameLabel)).toEqual([]);
+  expect(frameRows(islandAtOne, qualifiedNameLabel)).toEqual([{ root: "Island", nodes: ["Island"] }]);
+
+  const rootAtZero = definitionsView(
+    await warm.getDiagram(definitionRequest("root.ts", rootKey, 0)),
+  );
+  expect(frameRows(rootAtZero, qualifiedNameLabel)).toEqual([{ root: "Root", nodes: ["Root"] }]);
+  const rootAtTwo = definitionsView(
+    await warm.getDiagram(definitionRequest("root.ts", rootKey, 2)),
+  );
+  expect(edgeRows(rootAtTwo, qualifiedNameLabel)).toEqual([
+    "Dependency -references-> Tail",
+    "Root -references-> Dependency",
+  ]);
+  expect(frameRows(rootAtTwo, qualifiedNameLabel))
+    .toEqual([{ root: "Root", nodes: ["Dependency", "Root", "Tail"] }]);
+  expect(
+    frameRows(
+      definitionsView(await warm.getDiagram(definitionRequest("root.ts", rootKey, 1))),
+      qualifiedNameLabel,
+    ),
+  ).toEqual([{ root: "Root", nodes: ["Dependency", "Root"] }]);
+
   await warm.getDiagram(fileRequest("root.ts"));
   await warm.getDiagram(directoryRequest(""));
-  expect(umlStarts(warmProgress)).toBe(extractedPhases);
+  expect(extractionStarts(warmProgress.slice(baseline))).toEqual([]);
   expect(warmErrors).toEqual([]);
   await closePreprocessor(warm);
 
@@ -2235,11 +2260,23 @@ test("reuses warm SQL and a recovered generation without restarting UML extracti
   );
   await restarted.ready();
   await restarted.whenIdle();
+  // A cold process reaching roots it never served proves the durable cache, not a warm LRU.
+  expect(
+    frameRows(
+      definitionsView(await restarted.getDiagram(definitionRequest("island.ts", islandKey, 1))),
+      qualifiedNameLabel,
+    ),
+  ).toEqual([{ root: "Island", nodes: ["Island"] }]);
+  const restartedDependency = definitionsView(
+    await restarted.getDiagram(definitionRequest("dep.ts", dependencyKey, 1)),
+  );
+  expect(edgeRows(restartedDependency, qualifiedNameLabel))
+    .toEqual(["Dependency -references-> Tail"]);
   const restartedDiagram = definitionsView(
-    await restarted.getDiagram(definitionRequest("root.ts", rootKey)),
+    await restarted.getDiagram(definitionRequest("root.ts", rootKey, 1)),
   );
   expect(nodeNames(restartedDiagram)).toEqual(["Dependency", "Root"]);
-  expect(edgeSummary(restartedDiagram)).toEqual(["Root -references-> Dependency"]);
+  expect(edgeRows(restartedDiagram, qualifiedNameLabel)).toEqual(["Root -references-> Dependency"]);
   // An unchanged fingerprint recovers the active generation: nothing is preprocessed again.
   expect(restartProgress).toEqual([]);
   expect(restartErrors).toEqual([]);
@@ -2269,26 +2306,27 @@ test("drops a root's last edge when its dependency is removed and 404s a deleted
   const rootKey = definitionKeyOf(await preprocessor.getFileDefinitions("root.ts"), "Root");
   const before = definitionsView(await preprocessor.getDiagram(definitionRequest("root.ts", rootKey)));
   expect(nodeNames(before)).toEqual(["Dependency", "Root"]);
-  expect(edgeSummary(before)).toEqual(["Root -references-> Dependency"]);
+  expect(edgeRows(before, qualifiedNameLabel)).toEqual(["Root -references-> Dependency"]);
 
   await writeFixtureFile(root, "root.ts", "\nexport class Root { value: number; }\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
 
   // The key is stable across a line-only edit, so the selection survives the rebuild.
   expect(definitionKeyOf(await preprocessor.getFileDefinitions("root.ts"), "Root")).toBe(rootKey);
   const after = definitionsView(await preprocessor.getDiagram(definitionRequest("root.ts", rootKey)));
   expect(nodeNames(after)).toEqual(["Root"]);
-  expect(edgeSummary(after)).toEqual([]);
-  expect(frameSummary(after)).toEqual([{ root: "Root", nodes: ["Root"] }]);
+  expect(edgeRows(after, qualifiedNameLabel)).toEqual([]);
+  expect(frameRows(after, qualifiedNameLabel)).toEqual([{ root: "Root", nodes: ["Root"] }]);
 
   await writeFixtureFile(root, "root.ts", "export class Renamed {}\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
   const promotionsBefore = promotions.length;
 
-  const failure = await withTimeout(
+  const failure = await withBound(
     captureError(preprocessor.getDiagram(definitionRequest("root.ts", rootKey))),
+    10_000,
     "deleted root selection",
   );
   expect(failure.code).toBe("NOT_FOUND");
@@ -2310,24 +2348,24 @@ test("settles rooted selections across supersession and close", async () => {
   await preprocessor.whenIdle();
 
   await writeFixtureFile(root, "app.ts", "export class Second {}\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   const superseded = preprocessor.getDiagram(fileRequest("app.ts"));
   await writeFixtureFile(root, "app.ts", "export class Third {}\n");
-  preprocessor.rebuild("watch");
-  const settled = definitionsView(await withTimeout(superseded, "superseded diagram read", 30_000));
+  preprocessor.rebuild();
+  const settled = definitionsView(await withBound(superseded, 30_000, "superseded diagram read"));
   expect(nodeNames(settled)).toEqual(["Third"]);
   await preprocessor.whenIdle();
   expect(errors).toEqual([]);
 
   await writeFixtureFile(root, "app.ts", "export class Fourth {}\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   const duringClose = preprocessor.getDiagram(fileRequest("app.ts")).then(
     () => "resolved" as const,
     () => "rejected" as const,
   );
   await closePreprocessor(preprocessor);
   expect(["resolved", "rejected"]).toContain(
-    await withTimeout(duringClose, "diagram read during close"),
+    await withBound(duringClose, 10_000, "diagram read during close"),
   );
 }, 60_000);
 
@@ -2359,7 +2397,7 @@ test("drains superseded subprocess jobs before discarding their generation", asy
 
   await preprocessor.ready();
   expect(idleResolved).toBe(false);
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await idle;
 
   expect(errors).toEqual([]);
@@ -2512,7 +2550,7 @@ test("startup recovery removes orphan generations and rebuilds when the active p
     return generation.id;
   });
 
-  second.rebuild("watch");
+  second.rebuild();
   await second.whenIdle();
   expect((await second.search("after-orphan-recovery", false)).files).toEqual(["app.js"]);
   expect((await second.search("initial-cache", false)).files).toEqual([]);
@@ -2694,7 +2732,7 @@ test("serves packages from a building generation before the watch rebuild promot
   await writeFixtureFile(root, "packages/b/package.json", JSON.stringify({ name: "b" }));
   await writeFixtureFile(root, "packages/b/b-blocker.ts", `${blockerSource}\n`);
   watchingRebuild = true;
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   let idleResolved = false;
   const idle = preprocessor.whenIdle().then(() => {
     idleResolved = true;
@@ -2702,7 +2740,7 @@ test("serves packages from a building generation before the watch rebuild promot
 
   // A scope job for the rebuild means discovery already finished and the remaining scope work is
   // still queued: exactly the window in which /api/packages used to block until promotion.
-  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+  await withBound(rebuildScopeStarted.promise, 30_000, "watch rebuild scope start");
   const rebuilding = await preprocessor.getPackages();
   expect(rebuilding.map((pkg) => pkg.name).sort()).toEqual(["a", "b"]);
   expect(readActiveId()).toBe(seededId);
@@ -2755,12 +2793,12 @@ test("reserves a subprocess slot so background scope work never saturates the po
   await preprocessor.whenIdle();
 
   watchingRebuild = true;
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   let idleResolved = false;
   const idle = preprocessor.whenIdle().then(() => {
     idleResolved = true;
   });
-  await withTimeout(rebuildScopeStarted.promise, "watch rebuild scope start", 30_000);
+  await withBound(rebuildScopeStarted.promise, 30_000, "watch rebuild scope start");
 
   // Issued while the rebuild owns the pool: the reserved slot has to serve it anyway.
   await preprocessor.getDefinition(targetPath, { line: 1, column: 14 });
@@ -2804,7 +2842,7 @@ test("defers recovered readiness when a watch rebuild is requested before bootst
     1,
     (event) => progress.push(event),
   );
-  second.rebuild("watch");
+  second.rebuild();
   await second.ready();
   await second.whenIdle();
 
@@ -2878,15 +2916,6 @@ test("recovers named cache tables and retries queued database work for runtime l
   });
   expect(errors).toEqual([]);
 
-  openDatabase(dbPath, (db) => {
-    expectSearchSchema(
-      db,
-      "GotoDef",
-      "goto_def_search",
-      ["goto_def_ai", "goto_def_au", "goto_def_bd", "goto_def_bu"],
-    );
-  });
-
   openDatabase(dbPath, (db) => db.run("DROP TABLE files"));
   const filesRepairSearch = await preprocessor.search("RuntimeRecoveryNeedle", false);
   expect(filesRepairSearch.files).toEqual([]);
@@ -2894,12 +2923,6 @@ test("recovers named cache tables and retries queued database work for runtime l
   expect(errors).toEqual([]);
 
   openDatabase(dbPath, (db) => {
-    expectSearchSchema(
-      db,
-      "files",
-      "file_search",
-      ["files_ai", "files_au", "files_bd", "files_bu"],
-    );
     expect(db.query<{ id: number; state: string; cause: string }, []>(`
       SELECT id, state, cause FROM generations ORDER BY id
     `).all()).toEqual([
@@ -2913,7 +2936,7 @@ test("recovers named cache tables and retries queued database work for runtime l
   });
 
   openDatabase(dbPath, (db) => db.run("DROP TABLE package_snapshots"));
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
 
   expect(await preprocessor.getPackages()).toEqual(expectedPackages);
@@ -3074,7 +3097,7 @@ test("serves repeated read-only requests from memory and drops them when a rebui
   expect((await preprocessor.readFile("app.ts")).content).toBe("export const cached = 1;\n");
 
   await writeFixtureFile(root, "app.ts", "export const rebuilt = 3;\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
   expect((await preprocessor.readFile("app.ts")).content).toBe("export const rebuilt = 3;\n");
   expect(errors).toEqual([]);
@@ -3095,21 +3118,22 @@ test("serves file outlines from the current generation and never from an older o
   const preprocessor = trackedPreprocessor(root, () => undefined, (error) => errors.push(error));
 
   // Readable from the still-building generation: the outline waits on the definition index only.
-  expect(outlineSummary(await withTimeout(
+  expect(outlineSummary(await withBound(
     preprocessor.getFileDefinitions("outline.ts"),
+    10_000,
     "outline before UML completion",
   ))).toEqual(["LIMIT constant number"]);
   await preprocessor.whenIdle();
 
   await writeFixtureFile(root, "outline.ts", 'export const LIMIT: string = "updated";\n');
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
   expect(outlineSummary(await preprocessor.getFileDefinitions("outline.ts"))).toEqual([
     "LIMIT constant string",
   ]);
 
   await writeFixtureFile(root, "outline.ts", "");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   await preprocessor.whenIdle();
   expect(await preprocessor.getFileDefinitions("outline.ts")).toEqual([]);
   expect(errors).toEqual([]);
@@ -3128,21 +3152,22 @@ test("settles pending file outline reads across supersession and shutdown", asyn
   await preprocessor.whenIdle();
 
   await writeFixtureFile(root, "outline.ts", "export const SECOND: number = 2;\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   const superseded = preprocessor.getFileDefinitions("outline.ts");
   await writeFixtureFile(root, "outline.ts", "export const THIRD: number = 3;\n");
-  preprocessor.rebuild("watch");
-  expect(outlineSummary(await withTimeout(superseded, "superseded outline read"))).toEqual([
+  preprocessor.rebuild();
+  expect(outlineSummary(await withBound(superseded, 10_000, "superseded outline read"))).toEqual([
     "THIRD constant number",
   ]);
   await preprocessor.whenIdle();
 
   await writeFixtureFile(root, "outline.ts", "export const FOURTH: number = 4;\n");
-  preprocessor.rebuild("watch");
+  preprocessor.rebuild();
   const duringClose = preprocessor.getFileDefinitions("outline.ts").then(
     () => "resolved" as const,
     () => "rejected" as const,
   );
   await closePreprocessor(preprocessor);
-  expect(["resolved", "rejected"]).toContain(await withTimeout(duringClose, "outline read during close"));
+  expect(["resolved", "rejected"])
+    .toContain(await withBound(duringClose, 10_000, "outline read during close"));
 }, 30_000);

@@ -1,8 +1,8 @@
 import type { Node } from "@vscode/tree-sitter-wasm";
 import { children, namedChildren, renderedTypeName } from "./lang/ast.ts";
+import { parseSourceForLanguage } from "./lang/parse.ts";
 import { analysisLanguageForPath, highlightLanguageForPath } from "./lang/registry.ts";
 import {
-  parseRustSource,
   RUST_ENTITY_KIND_BY_NODE,
   rustBodyMethods,
   rustImplTargetName,
@@ -11,10 +11,10 @@ import {
 import {
   annotationType,
   ENTITY_KIND_BY_NODE,
+  forEachBindingName,
   isAccessor,
   METHOD_NODE_TYPES,
   memberName,
-  parseTypeScriptSource,
   topLevelDeclarations,
 } from "./lang/typescript.ts";
 import { isDeclarationPath } from "./source.ts";
@@ -213,7 +213,7 @@ export function parseDefinitionSpans(path: string, content: string): ParsedDefin
   if (isDeclarationPath(path)) return [];
   const language = analysisLanguageForPath(path);
   if (language === undefined) return [];
-  const parsed = language === "rust" ? parseRustSource(content) : parseTypeScriptSource(path, content);
+  const parsed = parseSourceForLanguage(language, path, content);
   if (!parsed) return [];
   try {
     return definitionSpans(
@@ -465,30 +465,9 @@ function collectBindingPattern(
   kind: FileDefinitionKind,
   out: OutlineCollector,
 ): void {
-  switch (pattern.type) {
-    case "identifier":
-    case "shorthand_property_identifier_pattern":
-      emitDefinition(out, scope, pattern, declaration, pattern.text, kind, null, false);
-      return;
-    case "pair_pattern": {
-      const value = pattern.childForFieldName("value");
-      if (value) collectBindingPattern(value, declaration, scope, kind, out);
-      return;
-    }
-    case "assignment_pattern":
-    case "object_assignment_pattern": {
-      const left = pattern.childForFieldName("left");
-      if (left) collectBindingPattern(left, declaration, scope, kind, out);
-      return;
-    }
-    case "rest_pattern":
-    case "object_pattern":
-    case "array_pattern":
-      for (const child of namedChildren(pattern)) {
-        collectBindingPattern(child, declaration, scope, kind, out);
-      }
-      return;
-  }
+  forEachBindingName(pattern, (nameNode) => {
+    emitDefinition(out, scope, nameNode, declaration, nameNode.text, kind, null, false);
+  });
 }
 
 /** `namespace A.B` declares `A` and `A.B`, each at its own token; returns the innermost scope. */
@@ -928,7 +907,7 @@ export function collectFileDefinitionNodes(path: string, root: Node): ParsedFile
 export function parseFileDefinitions(path: string, content: string): FileDefinition[] {
   const language = highlightLanguageForPath(path);
   if (language === undefined) return [];
-  const parsed = language === "rust" ? parseRustSource(content) : parseTypeScriptSource(path, content);
+  const parsed = parseSourceForLanguage(language, path, content);
   if (!parsed) return [];
   try {
     return collectFileDefinitionNodes(path, parsed.root).map((entry) => entry.definition);

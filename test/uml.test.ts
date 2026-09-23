@@ -1,25 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import type { UmlDiagramPayload } from "../src/types.ts";
-import { createFixtureTracker } from "./support/fixtures.ts";
 import { toFileContract, toUmlContract, umlLabel } from "./support/uml-contract.ts";
-import { buildUmlProject, readCompleteUml, type UmlProject } from "./support/uml-project.ts";
+import { createUmlProjectTracker, readCompleteUml } from "./support/uml-project.ts";
 
-const fixtures = createFixtureTracker();
-const projects: UmlProject[] = [];
+const { openProject, cleanup } = createUmlProjectTracker();
 
-afterEach(async () => {
-  for (const project of projects.splice(0)) project.close();
-  await fixtures.cleanup();
-});
-
-async function openProject(
-  prefix: string,
-  files: Record<string, string>,
-): Promise<UmlProject> {
-  const project = await buildUmlProject(await fixtures.fixtureRoot(prefix, files));
-  projects.push(project);
-  return project;
-}
+afterEach(cleanup);
 
 /** `label -> test` for every node of a definition selection. */
 function nodeTestFlags(diagram: UmlDiagramPayload): [string, boolean][] {

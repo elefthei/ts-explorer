@@ -15,7 +15,19 @@ export function rustMemberModifiers(node: Node): UmlModifier[] {
   return orderUmlModifiers([rustVisibility(node)]);
 }
 
-/** Rust keeps the bare return type under `return_type`; tuple fields have none. */
-export function rustMemberReturnType(node: Node): string | undefined {
-  return node.childForFieldName("return_type")?.text;
+/** Bare name of a possibly generic/reference/scoped type node. */
+export function rustBareTypeName(node: Node): string | undefined {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current.type === "generic_type" || current.type === "reference_type") {
+      current = current.childForFieldName("type") ?? undefined;
+      continue;
+    }
+    if (current.type === "scoped_type_identifier" || current.type === "scoped_identifier") {
+      current = current.childForFieldName("name") ?? undefined;
+      continue;
+    }
+    return current.text || undefined;
+  }
+  return undefined;
 }

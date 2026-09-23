@@ -3,3 +3,6 @@ dist/
 .DS_Store
 .explore/
 test-results/
+graphify-out/
+.hermes/
+package-lock.json

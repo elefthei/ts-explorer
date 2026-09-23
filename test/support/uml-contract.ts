@@ -1,5 +1,5 @@
-import type { FileDefinition, UmlDiagramPayload } from "../../src/types.ts";
-import type { UmlDefinitionEdge } from "../../src/uml/view.ts";
+import type { DiagramPayload, FileDefinition, UmlDiagramPayload } from "../../src/types.ts";
+import type { UmlDefinitionEdge, UmlViewModel } from "../../src/uml/view.ts";
 
 /**
  * Readable identity of one graph node: `qualifiedName@path`. Tests assert these instead of raw
@@ -7,6 +7,64 @@ import type { UmlDefinitionEdge } from "../../src/uml/view.ts";
  */
 export function umlLabel(definition: FileDefinition): string {
   return `${definition.qualifiedName}@${definition.source.path}`;
+}
+
+/** The bare declaration name, for suites whose fixtures declare each name exactly once. */
+export function qualifiedNameLabel(definition: FileDefinition): string {
+  return definition.qualifiedName;
+}
+
+/** How a suite chooses to identify one node in an assertion. */
+export type NodeLabeller = (definition: FileDefinition) => string;
+
+export type DefinitionsView = Extract<UmlViewModel, { kind: "definitions" }>;
+export type FilesView = Extract<UmlViewModel, { kind: "files" }>;
+
+/** Narrows a diagram to its rooted definition graph; throws on any other payload or view. */
+export function definitionsView(diagram: DiagramPayload): DefinitionsView {
+  if (diagram.kind !== "uml") throw new Error(`expected a uml diagram, received ${diagram.kind}`);
+  const { view } = diagram;
+  if (view.kind !== "definitions") {
+    throw new Error(`expected a definitions view, received ${view.kind}`);
+  }
+  return view;
+}
+
+/** Narrows a diagram to its file-import graph; throws on any other payload or view. */
+export function filesView(diagram: DiagramPayload): FilesView {
+  if (diagram.kind !== "uml") throw new Error(`expected a uml diagram, received ${diagram.kind}`);
+  const { view } = diagram;
+  if (view.kind !== "files") {
+    throw new Error(`expected a files view, received ${view.kind}`);
+  }
+  return view;
+}
+
+/**
+ * Edges as `source -kind-> target` rows, sorted so assertions never pin a key serialization or the
+ * order the view happened to emit.
+ */
+export function edgeRows(view: DefinitionsView, label: NodeLabeller): string[] {
+  const names = new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
+  return view.edges
+    .map((edge) =>
+      `${names.get(edge.sourceKey) ?? edge.sourceKey} -${edge.kind}-> ${
+        names.get(edge.targetKey) ?? edge.targetKey
+      }`
+    )
+    .sort();
+}
+
+/** One row per frame, in the view's own order, each frame's closure sorted by label. */
+export function frameRows(
+  view: DefinitionsView,
+  label: NodeLabeller,
+): { root: string; nodes: string[] }[] {
+  const names = new Map(view.nodes.map((node) => [node.definition.key, label(node.definition)]));
+  return view.frames.map((frame) => ({
+    root: names.get(frame.rootKey) ?? frame.rootKey,
+    nodes: frame.nodeKeys.map((key) => names.get(key) ?? key).sort(),
+  }));
 }
 
 export type ContractEdge = {

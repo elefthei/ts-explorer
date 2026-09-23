@@ -1,3 +1,4 @@
+import type { EventEmitter } from "node:events";
 import { lstat, readFile as readFileBytes } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { format, formatWithCursor } from "prettier";
@@ -10,9 +11,8 @@ import {
 import type { PackageDiagramGraph, UmlDiagramGraph, UmlFileOutcome } from "./diagram-graph.ts";
 import { collectFileDefinitionNodes, parseDefinitionSpans } from "./goto-definition.ts";
 import { computeHighlightSpans } from "./highlight.ts";
+import { parseSourceForLanguage } from "./lang/parse.ts";
 import { highlightLanguageForPath } from "./lang/registry.ts";
-import { parseRustSource } from "./lang/rust.ts";
-import { parseTypeScriptSource } from "./lang/typescript.ts";
 import {
   discoverPackages,
   extractPackageDiagramGraph,
@@ -38,6 +38,7 @@ import {
   isSourcePath,
 } from "./source.ts";
 import { buildTree, collectTreeEntries, computeSourceFingerprint } from "./tree.ts";
+import { DEFAULT_UML_DEPTH } from "./types.ts";
 import type {
   DiagramRequest,
   EditorGotoDefinition,
@@ -158,7 +159,12 @@ function parseDiagramRequest(value: unknown): DiagramRequest {
   if (value.kind !== "uml") {
     throw new PreprocessRequestError("BAD_REQUEST", "kind must be packages or uml");
   }
-  return { kind: "uml", target: parseUmlTarget(value.target) };
+  const target = parseUmlTarget(value.target);
+  const depth = value.depth === undefined
+    ? DEFAULT_UML_DEPTH
+    : requireSafeInteger(value.depth, "depth", 0);
+  // A directory view is an import graph, not a dependency closure: its depth is never applied.
+  return { kind: "uml", target, depth: target.kind === "directory" ? DEFAULT_UML_DEPTH : depth };
 }
 
 function parseRequest(value: unknown): PreprocessRequest {
@@ -373,33 +379,15 @@ async function indexDefinitions(
       const result = decoded[index];
       if (!result) continue;
       const language = highlightLanguageForPath(entry.path) ?? null;
-      snapshots.push(
-        "failure" in result
-          ? {
-            path: entry.path,
-            rawContent: null,
-            displayContent: null,
-            sourceError: result.failure,
-            formatError: null,
-            language,
-          }
-          : {
-            path: entry.path,
-            rawContent: result.text,
-            displayContent: null,
-            sourceError: null,
-            formatError: null,
-            language,
-          },
-      );
+      snapshots.push(decodedFileWrite(entry.path, result, language));
     }
     preprocessState.cache.writeSourceSnapshots(generationId, snapshots);
     for (const [index, entry] of batch.entries()) {
       const result = decoded[index];
       if (!result || "failure" in result) continue;
-      const parsed = highlightLanguageForPath(entry.path) === "rust"
-        ? parseRustSource(result.text)
-        : parseTypeScriptSource(entry.path, result.text);
+      const language = highlightLanguageForPath(entry.path);
+      if (language === undefined) continue;
+      const parsed = parseSourceForLanguage(language, entry.path, result.text);
       if (!parsed) continue;
       try {
         facts.push(
@@ -436,6 +424,30 @@ function indexDisplayDefinitions(
       ? [{ ...definition, displayFrom: display.from, displayTo: display.to }]
       : [];
   });
+}
+
+function decodedFileWrite(
+  path: string,
+  decoded: { text: string } | { failure: string },
+  language: CacheFileWrite["language"],
+): CacheFileWrite {
+  return "failure" in decoded
+    ? {
+      path,
+      rawContent: null,
+      displayContent: null,
+      sourceError: decoded.failure,
+      formatError: null,
+      language,
+    }
+    : {
+      path,
+      rawContent: decoded.text,
+      displayContent: null,
+      sourceError: null,
+      formatError: null,
+      language,
+    };
 }
 
 async function preprocessFile(
@@ -524,23 +536,7 @@ async function preprocessScope(
     const decoded = await readFileBytes(absolutePath).then(decodeSourceBytes, () => ({
       failure: "file is not valid UTF-8 text" as const,
     }));
-    source = "failure" in decoded
-      ? {
-        path: scope.path,
-        rawContent: null,
-        displayContent: null,
-        sourceError: decoded.failure,
-        formatError: null,
-        language: highlightLanguageForPath(scope.path) ?? null,
-      }
-      : {
-        path: scope.path,
-        rawContent: decoded.text,
-        displayContent: null,
-        sourceError: null,
-        formatError: null,
-        language: highlightLanguageForPath(scope.path) ?? null,
-      };
+    source = decodedFileWrite(scope.path, decoded, highlightLanguageForPath(scope.path) ?? null);
   }
 
   const buildsUml = isSourcePath(scope.path);
@@ -770,14 +766,16 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
         return success(request, { state: "complete", diagram });
       }
       const target = request.request.target;
-      if (target.kind !== "directory") {
-        await resolveValidatedPath(preprocessState, target.path);
-      } else if (target.path) {
+      if (target.kind !== "directory" || target.path) {
         await resolveValidatedPath(preprocessState, target.path);
       }
       return success(
         request,
-        preprocessState.cache.readUmlDiagram(request.generationId, target),
+        preprocessState.cache.readUmlDiagram(
+          request.generationId,
+          target,
+          request.request.depth,
+        ),
       );
     }
     case "read-file":
@@ -849,6 +847,13 @@ const sendToParent = process.send?.bind(process) ?? (() => {
   throw new Error("preprocess child requires an IPC channel");
 })();
 
+/**
+ * `bun-types` 1.4 declares `off`/`removeListener` on `NodeJS.Process` carrying only its
+ * `memoryPressure` overload, and `@types/node` declares neither there, so that augmentation
+ * shadows the signatures every other event needs. The base emitter still exposes them.
+ */
+const processEvents: EventEmitter = process;
+
 function sendMessage(message: PreprocessResponse | PreprocessProgressEvent): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -856,7 +861,7 @@ function sendMessage(message: PreprocessResponse | PreprocessProgressEvent): Pro
     const settle = (error?: Error | null) => {
       if (settled) return;
       settled = true;
-      process.off("disconnect", onDisconnect);
+      processEvents.off("disconnect", onDisconnect);
       if (error) reject(error);
       else resolve();
     };
@@ -886,7 +891,7 @@ function closeCacheAndExit(exitCode: number): void {
 function finalizeChild(exitCode: number): void {
   if (finalizing) return;
   finalizing = true;
-  process.off("message", onMessage);
+  processEvents.off("message", onMessage);
   processing = processing.then(
     () => closeCacheAndExit(exitCode),
     () => closeCacheAndExit(exitCode),

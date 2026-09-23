@@ -13,6 +13,7 @@ import {
   type PreprocessScope,
 } from "./preprocess-protocol.ts";
 import type { DiagramReadResult } from "./preprocess-protocol.ts";
+import { DEFAULT_UML_DEPTH } from "./types.ts";
 import type {
   DiagramPayload,
   DiagramRequest,
@@ -185,18 +186,32 @@ function findTreeKind(tree: TreeNode, path: string): "directory" | "file" | unde
   return undefined;
 }
 
+/** An omitted depth resolves to the shared default; a supplied one must be a non-negative integer. */
+function normalizeDiagramDepth(depth: number | undefined): number {
+  if (depth === undefined) return DEFAULT_UML_DEPTH;
+  if (!Number.isSafeInteger(depth) || depth < 0) {
+    throw new PreprocessorError("INVALID_INPUT", "depth must be a non-negative integer");
+  }
+  return depth;
+}
+
 /** Canonical request identity; a definition root is part of the dedupe key, never the path alone. */
 function normalizeDiagramRequest(request: DiagramRequest): DiagramRequest {
   if (request.kind === "packages") return { kind: "packages", scopePath: "" };
   const target = request.target;
   const path = normalizeRelativePath(target.path);
-  if (target.kind === "directory") return { kind: "uml", target: { kind: "directory", path } };
+  const depth = normalizeDiagramDepth(request.depth);
+  if (target.kind === "directory") {
+    // A directory view is an import graph, not a dependency closure: its depth is never applied.
+    return { kind: "uml", target: { kind: "directory", path }, depth: DEFAULT_UML_DEPTH };
+  }
   if (!path) throw new PreprocessorError("INVALID_INPUT", "path is required");
-  if (target.kind === "file") return { kind: "uml", target: { kind: "file", path } };
+  if (target.kind === "file") return { kind: "uml", target: { kind: "file", path }, depth };
   if (!target.definitionKey) throw new PreprocessorError("INVALID_INPUT", "definition is required");
   return {
     kind: "uml",
     target: { kind: "definition", path, definitionKey: target.definitionKey },
+    depth,
   };
 }
 
@@ -280,13 +295,8 @@ export class Preprocessor {
     );
   }
   
-  public getDiagram(request: DiagramRequest): Promise<DiagramPayload> {
-    let normalized: DiagramRequest;
-    try {
-      normalized = normalizeDiagramRequest(request);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  public async getDiagram(request: DiagramRequest): Promise<DiagramPayload> {
+    const normalized = normalizeDiagramRequest(request);
     // One repair rebuild per diagram request, never per retry of the same read.
     const repair = { used: false };
     return this.dedupe(
@@ -327,7 +337,7 @@ export class Preprocessor {
       throw new PreprocessorError("INTERNAL", "UML cache remains incomplete after rebuild");
     }
     repair.used = true;
-    this.rebuild("watch");
+    this.rebuild();
     await this.awaitBuildingGeneration();
     throw new PreprocessorError("NOT_FOUND", "diagram is not cached in the active generation");
   }
@@ -376,16 +386,11 @@ export class Preprocessor {
     }
   }
   
-  public readFile(
+  public async readFile(
     relativePath: string,
     location?: { line: number; column: number },
   ): Promise<FileResponse> {
-    let path: string;
-    try {
-      path = normalizeRelativePath(relativePath);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    const path = normalizeRelativePath(relativePath);
     const locationKey = location ? `${location.line}:${location.column}` : "";
     return this.dedupe(
       `read-file:${path}:${locationKey}`,
@@ -399,16 +404,11 @@ export class Preprocessor {
     );
   }
   
-  public getDefinition(
+  public async getDefinition(
     path: string,
     location: { line: number; column: number },
   ): Promise<GotoDefinition | null> {
-    let normalizedPath: string;
-    try {
-      normalizedPath = normalizeRelativePath(path);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    const normalizedPath = normalizeRelativePath(path);
     if (
       !Number.isSafeInteger(location.line) ||
       location.line <= 0 ||
@@ -425,13 +425,8 @@ export class Preprocessor {
     );
   }
 
-  public getFileDefinitions(relativePath: string): Promise<FileDefinition[]> {
-    let path: string;
-    try {
-      path = normalizeRelativePath(relativePath);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  public async getFileDefinitions(relativePath: string): Promise<FileDefinition[]> {
+    const path = normalizeRelativePath(relativePath);
     if (!path) {
       return Promise.reject(new PreprocessorError("INVALID_INPUT", "path is required"));
     }
@@ -463,17 +458,12 @@ export class Preprocessor {
     );
   }
   
-  public lookupDefinition(
+  public async lookupDefinition(
     path: string,
     name: string,
     qualifiedName: string,
   ): Promise<UmlSourceLocation | null> {
-    let normalizedPath: string;
-    try {
-      normalizedPath = normalizeRelativePath(path);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    const normalizedPath = normalizeRelativePath(path);
     if (!name || !qualifiedName) {
       return Promise.reject(
         new PreprocessorError("INVALID_INPUT", "name and qualifiedName are required"),
@@ -1097,6 +1087,14 @@ export class Preprocessor {
     }
     generation.scopeWaiters.clear();
   }
+
+  /** Rejects every generation-scoped waiter in one place; callers must have marked the state. */
+  private rejectGeneration(generation: GenerationState, error: Error): void {
+    generation.discovered.reject(error);
+    generation.promoted.reject(error);
+    generation.definitionsIndexed.reject(error);
+    this.rejectScopeWaiters(generation, error);
+  }
   
   private failGeneration(
     generation: GenerationState,
@@ -1108,10 +1106,7 @@ export class Preprocessor {
     generation.failure = cause;
     this.latestBuildError = cause;
     this.removeQueuedGenerationJobs(generation.id, cause);
-    this.rejectScopeWaiters(generation, cause);
-    generation.discovered.reject(cause);
-    generation.promoted.reject(cause);
-    generation.definitionsIndexed.reject(cause);
+    this.rejectGeneration(generation, cause);
     if (this.building === generation) {
       this.building = undefined;
       this.buildingSignal = createDeferred<void>();
@@ -1319,10 +1314,7 @@ export class Preprocessor {
     this.ipcCache.clear();
     const error = new SupersededGenerationError();
     this.removeQueuedGenerationJobs(generation.id, error);
-    this.rejectScopeWaiters(generation, error);
-    generation.discovered.reject(error);
-    generation.promoted.reject(error);
-    generation.definitionsIndexed.reject(error);
+    this.rejectGeneration(generation, error);
     if (this.building === generation) {
       this.building = undefined;
       this.buildingSignal = createDeferred<void>();
@@ -1438,19 +1430,13 @@ export class Preprocessor {
     return promise;
   }
   
-  private async readStable<Type extends "read-tree" | "read-packages" | "search">(
+  private async readStable<Type extends "read-tree" | "search">(
     request: Omit<RequestFor<Type>, "generationId">,
   ): Promise<PreprocessResultMap[Type]> {
     await this.readyDeferred.promise;
     while (!this.closed) {
       if (this.watchRebuilding) {
-        const generation = await this.awaitBuildingGeneration();
-        try {
-          await generation.promoted.promise;
-        } catch (error) {
-          if (error instanceof SupersededGenerationError) continue;
-          throw error;
-        }
+        await this.awaitPromotedGeneration();
         continue;
       }
       if (this.activeGenerationId !== null) {
@@ -1459,15 +1445,20 @@ export class Preprocessor {
           "interactive",
         );
       }
-      const generation = await this.awaitBuildingGeneration();
-      try {
-        await generation.promoted.promise;
-      } catch (error) {
-        if (error instanceof SupersededGenerationError) continue;
-        throw error;
-      }
+      await this.awaitPromotedGeneration();
     }
     throw this.closedError();
+  }
+
+  /** Waits for the building generation's promotion; supersession is swallowed so callers retry. */
+  private async awaitPromotedGeneration(): Promise<void> {
+    const generation = await this.awaitBuildingGeneration();
+    try {
+      await generation.promoted.promise;
+    } catch (error) {
+      if (error instanceof SupersededGenerationError) return;
+      throw error;
+    }
   }
   
   private async readBuildingPackages(): Promise<readonly PackageInfo[]> {
@@ -1533,8 +1524,7 @@ export class Preprocessor {
     await generation.discovered.promise;
     // Every interactive scope needs the catalogue, not just background traversal.
     await generation.definitionsIndexed.promise;
-    if (generation.superseded) throw new SupersededGenerationError();
-    if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
+    this.assertGenerationUsable(generation);
   
     const existing = generation.scopes.get(path);
     if (existing) {
@@ -1548,8 +1538,7 @@ export class Preprocessor {
     }
   
     const inferred = knownKind ?? await this.inferScopeKind(generation.id, path);
-    if (generation.superseded) throw new SupersededGenerationError();
-    if (generation.failed) throw generation.failure ?? new PreprocessorError("INTERNAL", "generation failed");
+    this.assertGenerationUsable(generation);
     const discoveredWhileInferring = generation.scopes.get(path);
     if (discoveredWhileInferring) {
       this.repositionQueuedJob(discoveredWhileInferring.job);
@@ -1680,8 +1669,8 @@ export class Preprocessor {
       throw new PreprocessorError("NOT_FOUND", `path not found: ${resource}`);
     }
     return kind === "directory"
-      ? { kind: "uml", target: { kind: "directory", path: resource } }
-      : { kind: "uml", target: { kind: "file", path: resource } };
+      ? { kind: "uml", target: { kind: "directory", path: resource }, depth: DEFAULT_UML_DEPTH }
+      : { kind: "uml", target: { kind: "file", path: resource }, depth: DEFAULT_UML_DEPTH };
   }
 
   private async controlPriorityRequest(request: PriorityRequest): Promise<void> {
@@ -1728,13 +1717,8 @@ export class Preprocessor {
   }
   
 
-  public prioritize(resource: string): Promise<PreprocessPriorityResponse> {
-    let normalizedResource: string;
-    try {
-      normalizedResource = normalizeRelativePath(resource);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  public async prioritize(resource: string): Promise<PreprocessPriorityResponse> {
+    const normalizedResource = normalizeRelativePath(resource);
   
     const existing = this.priorityRequestByResource.get(normalizedResource);
     if (existing) {
@@ -1802,10 +1786,7 @@ export class Preprocessor {
     this.idleDeferred.reject(error);
     this.buildingSignal.reject(error);
     if (this.building) {
-      this.building.discovered.reject(error);
-      this.building.promoted.reject(error);
-      this.building.definitionsIndexed.reject(error);
-      this.rejectScopeWaiters(this.building, error);
+      this.rejectGeneration(this.building, error);
     }
     for (const promise of this.queryDedupe.values()) {
       void promise.catch(() => undefined);
@@ -1863,8 +1844,8 @@ export class Preprocessor {
     await Promise.all(exitPromises);
   }
 
-  public rebuild(cause: "watch"): void {
-    if (cause !== "watch" || this.closed) return;
+  public rebuild(): void {
+    if (this.closed) return;
     this.watchRebuilding = true;
     this.watchRequested = true;
     this.latestBuildError = undefined;

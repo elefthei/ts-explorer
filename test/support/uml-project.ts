@@ -14,7 +14,13 @@ import { collectTreeEntries } from "../../src/tree.ts";
 import type { FileDefinition, TreeNode, UmlTarget } from "../../src/types.ts";
 import { extractFileUmlGraph } from "../../src/uml.ts";
 import { buildCatalogue, collectFileFacts, type FileFacts } from "../../src/uml/catalogue.ts";
-import type { DefinitionIndexSnapshot } from "../../src/uml/model.ts";
+import {
+  FULL_UML_VISIBILITY,
+  type DefinitionIndexSnapshot,
+  type UmlVisibility,
+} from "../../src/uml/model.ts";
+import { renderUmlView, type RenderedUmlView } from "../../src/uml/view.ts";
+import { createFixtureTracker } from "./fixtures.ts";
 
 let projectOrdinal = 0;
 
@@ -27,7 +33,8 @@ export type UmlProject = {
   /** Every visible source file, in tree order. */
   sourcePaths: string[];
   fileGraph(path: string): UmlDiagramGraph;
-  read(target: UmlTarget): UmlDiagramRead;
+  /** Omitting `depth` selects `DEFAULT_UML_DEPTH`, exactly like an omitted request field. */
+  read(target: UmlTarget, depth?: number): UmlDiagramRead;
   definitions(path: string): FileDefinition[];
   /** The catalogue key of one qualified declaration, asserted to exist. */
   key(path: string, qualifiedName: string): string;
@@ -121,8 +128,8 @@ export async function buildUmlProject(root: string): Promise<UmlProject> {
         if (!graph) throw new Error(`no UML graph for ${path}`);
         return graph;
       },
-      read(target) {
-        return cache.readUmlDiagram(generationId, target);
+      read(target, depth) {
+        return cache.readUmlDiagram(generationId, target, depth);
       },
       definitions(path) {
         return cache.readFileDefinitions(generationId, path);
@@ -147,10 +154,66 @@ export async function buildUmlProject(root: string): Promise<UmlProject> {
 }
 
 /** The completed selection for `target`, asserting the read did not report missing file graphs. */
-export function readCompleteUml(project: UmlProject, target: UmlTarget) {
-  const result = project.read(target);
+export function readCompleteUml(project: UmlProject, target: UmlTarget, depth?: number) {
+  const result = project.read(target, depth);
   if (result.state !== "complete") {
     throw new Error(`selection is pending: ${result.files.join(", ")}`);
   }
   return result.diagram;
+}
+
+/**
+ * Renders one selection at full visibility, minus `overrides`. The render is a pure projection of
+ * the completed read, so tests can vary visibility without re-indexing.
+ */
+export function renderSelection(
+  project: UmlProject,
+  target: UmlTarget,
+  overrides: Partial<UmlVisibility> = {},
+  depth?: number,
+): RenderedUmlView {
+  const diagram = readCompleteUml(project, target, depth);
+  return renderUmlView(diagram.view, { ...FULL_UML_VISIBILITY, ...overrides }, target);
+}
+
+export type UmlProjectTracker = {
+  /** A temporary fixture root holding `files`, removed by `cleanup`; nothing is indexed. */
+  fixtureRoot(prefix: string, files: Record<string, string | Uint8Array>): Promise<string>;
+  /**
+   * Indexes a fresh fixture root and keeps the project open until `cleanup`. `prepare` runs after
+   * the files are written and before indexing, for fixtures needing state no file content creates.
+   */
+  openProject(
+    prefix: string,
+    files: Record<string, string>,
+    prepare?: (root: string) => Promise<void>,
+  ): Promise<UmlProject>;
+  /** Closes every project opened through this tracker, then removes every fixture root. */
+  cleanup(): Promise<void>;
+};
+
+/**
+ * The per-file lifecycle every UML suite needs: fixture roots plus the projects built over them,
+ * torn down in one `afterEach(cleanup)`. Projects close before their roots are removed, or the
+ * open sqlite handle would keep the cache directory alive on Windows.
+ */
+export function createUmlProjectTracker(): UmlProjectTracker {
+  const fixtures = createFixtureTracker();
+  const projects: UmlProject[] = [];
+  return {
+    fixtureRoot: (prefix, files) => fixtures.fixtureRoot(prefix, files),
+
+    async openProject(prefix, files, prepare) {
+      const root = await fixtures.fixtureRoot(prefix, files);
+      await prepare?.(root);
+      const project = await buildUmlProject(root);
+      projects.push(project);
+      return project;
+    },
+
+    async cleanup() {
+      for (const project of projects.splice(0)) project.close();
+      await fixtures.cleanup();
+    },
+  };
 }

@@ -22,7 +22,7 @@ export function randomVersionSeed(): number {
 }
 
 export function createFixtureTracker(): {
-  temporaryRoot(prefix: string): Promise<string>;
+  temporaryRoot(prefix: string, baseDir?: string): Promise<string>;
   writeFixtureFile(
     root: string,
     relativePath: string,
@@ -33,8 +33,8 @@ export function createFixtureTracker(): {
 } {
   const roots: string[] = [];
 
-  const temporaryRoot = async (prefix: string): Promise<string> => {
-    const root = await mkdtemp(join(tmpdir(), prefix));
+  const temporaryRoot = async (prefix: string, baseDir: string = tmpdir()): Promise<string> => {
+    const root = await mkdtemp(join(baseDir, prefix));
     roots.push(root);
     return root;
   };

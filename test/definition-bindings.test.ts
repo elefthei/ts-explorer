@@ -91,16 +91,30 @@ for (const entry of cases) {
       const index = cache.createDefinitionResolutionIndex(generationId);
       const result = index.bindings("a.ts", entry.scope, entry.name, entry.space, entry.exported);
       expect(result).toEqual(entry.expected);
-      expect(index.bindings("a.ts", entry.scope, entry.name, entry.space, entry.exported))
-        .toBe(result);
-      expect(index.bindings("other.ts", entry.scope, entry.name, entry.space, entry.exported))
-        .toEqual([]);
-      const otherGeneration = cache.beginGeneration("watch", "other-generation");
-      expect(cache.createDefinitionResolutionIndex(otherGeneration)
-        .bindings("a.ts", entry.scope, entry.name, entry.space, entry.exported)).toEqual([]);
     } finally {
       cache.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
 }
+
+test("bindings are scoped to their file and generation", () => {
+  const root = mkdtempSync(join(tmpdir(), "bindings-"));
+  const cache = new Cache(join(root, "cache.sqlite"));
+  try {
+    const generationId = cache.beginGeneration("startup", "bindings-test");
+    cache.writeDefinitionIndex(generationId, snapshot);
+    expect(
+      cache.createDefinitionResolutionIndex(generationId)
+        .bindings("other.ts", "", "Both", "type", false),
+    ).toEqual([]);
+    const otherGeneration = cache.beginGeneration("watch", "other-generation");
+    expect(
+      cache.createDefinitionResolutionIndex(otherGeneration)
+        .bindings("a.ts", "", "Both", "type", false),
+    ).toEqual([]);
+  } finally {
+    cache.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

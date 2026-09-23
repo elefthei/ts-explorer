@@ -1,7 +1,9 @@
 import {
   expect,
   test,
+  type Browser,
   type BrowserContext,
+  type Locator,
   type Page,
   type Request,
   type Response,
@@ -25,11 +27,15 @@ import type {
   SearchResponse,
   WatchMessage,
 } from "../../src/types.ts";
+import { withBound } from "../support/async.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const outputTailLimit = 64 * 1024;
 const bindErrorPattern = /EADDRINUSE|port\b.*\bin use/i;
-const retryableNavigationPattern = /ERR_CONNECTION_(?:REFUSED|RESET)|page\.goto: Timeout \d+ms exceeded/;
+// A server that is listening but has not finished its first accept answers with an invalid or
+// empty response, not a refusal; both are "not ready yet", so the 30-second loop must retry them.
+const retryableNavigationPattern =
+  /ERR_CONNECTION_(?:REFUSED|RESET)|ERR_(?:INVALID_HTTP_RESPONSE|EMPTY_RESPONSE)|page\.goto: Timeout \d+ms exceeded/;
 
 type CliChild = ChildProcessByStdio<null, Readable, Readable>;
 type CliExit = { code: number | null; signal: NodeJS.Signals | null };
@@ -53,6 +59,12 @@ type TestResource = {
 };
 
 type PrintCounterWindow = Window & { printCalls?: number };
+type RepaintFlagWindow = Window & { umlRepaintSuperseded?: boolean };
+type DiagramWorkerProbeWindow = Window & {
+  Worker: typeof Worker;
+  __e2eLayoutStarted?: boolean;
+  __e2eNativeWorker?: typeof Worker;
+};
 
 class OutputTail {
   private bytes = Buffer.alloc(0);
@@ -71,29 +83,6 @@ class OutputTail {
 }
 
 const resources = new Set<TestResource>();
-
-function withBound<Value>(
-  promise: Promise<Value>,
-  timeout: number,
-  description: string,
-): Promise<Value> {
-  return new Promise<Value>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`timed out after ${timeout}ms: ${description}`)),
-      timeout,
-    );
-    void promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
 
 function describeCli(cli: SpawnedCli): string {
   const exit = cli.child.exitCode !== null
@@ -271,6 +260,26 @@ function registerResource(): TestResource {
   const resource: TestResource = { clis: [] };
   resources.add(resource);
   return resource;
+}
+
+async function openPage(browser: Browser, resource: TestResource): Promise<Page> {
+  resource.context = await browser.newContext();
+  resource.page = await resource.context.newPage();
+  return resource.page;
+}
+
+async function openUmlFixturePage(
+  browser: Browser,
+  resource: TestResource,
+  readyDescription: string,
+): Promise<{ page: Page; watch: CacheReadyWatch; fixtureRoot: string }> {
+  const fixtureRoot = await createUmlFixture(resource);
+  const page = await openPage(browser, resource);
+  const watch = watchCacheReady(page);
+  await navigateToCli(page, fixtureRoot, resource);
+  await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+  await withBound(watch.cacheReady, 60_000, readyDescription);
+  return { page, watch, fixtureRoot };
 }
 
 function cleanupResource(resource: TestResource): Promise<void> {
@@ -498,6 +507,39 @@ async function createBulkFixture(resource: TestResource): Promise<string> {
   return fixtureRoot;
 }
 
+/**
+ * 23 x 23 distinct import pairs inside `graph/`: 529 edges, comfortably past Mermaid's default
+ * limit of 500 and heavy enough that its layout solve is worth interrupting. Package creation
+ * stays with the caller so the same graph can be dropped into any fixture.
+ */
+async function addDenseImportFixture(fixtureRoot: string): Promise<{
+  expectedNodes: string[];
+  edgeCount: number;
+}> {
+  await mkdir(join(fixtureRoot, "graph"), { recursive: true });
+  const leaves = Array.from({ length: 23 }, (_, index) => `leaf${String(index).padStart(2, "0")}`);
+  const hubs = Array.from({ length: 23 }, (_, index) => `hub${String(index).padStart(2, "0")}`);
+  await Promise.all([
+    ...leaves.map((leaf, index) =>
+      writeFile(join(fixtureRoot, "graph", `${leaf}.ts`), `export const ${leaf} = ${index};\n`)
+    ),
+    ...hubs.map((hub) =>
+      writeFile(
+        join(fixtureRoot, "graph", `${hub}.ts`),
+        [
+          ...leaves.map((leaf) => `import { ${leaf} } from "./${leaf}.ts";`),
+          `export const ${hub} = [${leaves.join(", ")}];`,
+          "",
+        ].join("\n"),
+      )
+    ),
+  ]);
+  return {
+    expectedNodes: [...hubs, ...leaves].map((name) => `graph/${name}.ts`).sort(),
+    edgeCount: leaves.length * hubs.length,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Watcher + CLI helpers
 // ---------------------------------------------------------------------------
@@ -513,10 +555,12 @@ function isWatchMessage(value: unknown): value is WatchMessage {
     Array.isArray(candidate.events) && candidate.events.every((event) => typeof event === "string");
 }
 
-function watchCacheReady(page: Page): {
+type CacheReadyWatch = {
   history: readonly WatchMessage[];
   cacheReady: Promise<WatchMessage>;
-} {
+};
+
+function watchCacheReady(page: Page): CacheReadyWatch {
   const history: WatchMessage[] = [];
   let settled = false;
   let resolveReady!: (message: WatchMessage) => void;
@@ -849,9 +893,7 @@ function afterTwoAnimationFrames(page: Page): Promise<void> {
 }
 
 /** Viewport coordinates of an element, scrolled into the stage first so a press can reach it. */
-async function centreOf(
-  locator: ReturnType<Page["locator"]>,
-): Promise<{ x: number; y: number }> {
+async function centreOf(locator: Locator): Promise<{ x: number; y: number }> {
   await locator.scrollIntoViewIfNeeded();
   const box = await locator.boundingBox();
   if (!box) throw new Error("the element has no bounding box");
@@ -905,14 +947,7 @@ test("tree labels select UML targets while chevrons only change expansion", asyn
   test.setTimeout(150_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
     await expect(page.locator("#packages-mode")).toHaveClass(/\bactive\b/);
     await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 30_000 });
 
@@ -1005,9 +1040,7 @@ test("double-click opens the exact source while its diagram response is held", a
   const resource = registerResource();
   try {
     const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await expect(treeRow(page, "consumer.ts")).toBeVisible({ timeout: 15_000 });
@@ -1099,14 +1132,7 @@ test("a diagram double-tap opens the first pressed target", async ({ browser }) 
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
     await expandTree(page, "feature");
 
     const selectRootFile = async (): Promise<void> => {
@@ -1219,14 +1245,11 @@ test("a held root response never repaints over the next selection", async ({ bro
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page, fixtureRoot } = await openUmlFixturePage(
+      browser,
+      resource,
+      "uml fixture cache-ready",
+    );
     await expandTree(page, "feature");
     await expandTree(page, "feature/root.ts");
     await expect(definitionRow(page, "feature/root.ts", "Isolated")).toHaveCount(1, {
@@ -1294,14 +1317,7 @@ test("renders root frames, directory imports and their detail controls", async (
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
     await expandTree(page, "feature");
 
     // A file selection shows exactly its root frames, each headed by its root and source path.
@@ -1435,14 +1451,7 @@ test("keyboard navigation selects UML and opens sources", async ({ browser }) =>
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
 
     // ArrowRight expands, ArrowDown walks rows, Enter selects.
     await treeRow(page, "feature").focus();
@@ -1512,14 +1521,7 @@ test("search results select definition roots and open their sources", async ({ b
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
 
     const searchInput = page.locator("#node-search");
     const runSearch = async (query: string): Promise<void> => {
@@ -1543,6 +1545,8 @@ test("search results select definition roots and open their sources", async ({ b
     await rootResult.click();
     await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"], { timeout: 60_000 });
     expect(await diagramNodeNames(page)).toEqual(["B", "C", "Root"]);
+    await expect(page.locator("#diagram-loading")).toBeHidden();
+    await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
     await expect(page.locator("#editor-panel")).toBeHidden();
 
     // A double click opens the hit's own source position.
@@ -1589,14 +1593,160 @@ test("search results select definition roots and open their sources", async ({ b
   }
 });
 
+/** Commits the `Root` search and settles the overview paint that a selection then supersedes. */
+async function commitRootSearch(page: Page): Promise<Locator> {
+  const searchInput = page.locator("#node-search");
+  const searched = page.waitForResponse((candidate) => {
+    const url = new URL(candidate.url());
+    return url.pathname === "/api/search" && url.searchParams.get("q") === "Root";
+  });
+  await searchInput.fill("Root");
+  await searchInput.press("Enter");
+  expect((await searched).status()).toBe(200);
+  await expect(page.locator("#status")).toContainText("Search · ", { timeout: 60_000 });
+  await expect(page.locator("#diagram-loading")).toBeHidden();
+  const rootResult = page
+    .locator("#definition-results .definition-result", { hasText: "class · Root" })
+    .filter({ hasText: "feature/root.ts:2" });
+  await expect(rootResult).toBeVisible();
+  return rootResult;
+}
+
+test("finishes loading after a visibility repaint supersedes a selected graph", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const { page } = await openUmlFixturePage(
+      browser,
+      resource,
+      "visibility repaint fixture cache-ready",
+    );
+    const rootResult = await commitRootSearch(page);
+
+    const gate = createResponseGate((url) => isUmlDiagramUrl(url, "definition", "feature/root.ts"));
+    await page.route("**/api/diagram?*", gate.handler);
+    try {
+      await rootResult.click();
+      await withBound(gate.captured, 30_000, "held Root definition diagram");
+      await expect(page.locator("#diagram-loading")).toBeVisible();
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "true");
+
+      // The selection installs its model and empties the holder before painting it. Unchecking a
+      // compartment exactly there supersedes a request whose own finalizer can never run again.
+      await page.evaluate(() => {
+        const holder = document.querySelector("#svg-holder");
+        const stage = document.querySelector("#diagram-stage");
+        const methods = document.querySelector<HTMLInputElement>("#uml-show-methods");
+        if (!holder || !stage || !methods) throw new Error("diagram controls are missing");
+        const flag: RepaintFlagWindow = window;
+        flag.umlRepaintSuperseded = false;
+        const observer = new MutationObserver(() => {
+          if (holder.childElementCount !== 0) return;
+          if (stage.getAttribute("aria-busy") !== "true") return;
+          observer.disconnect();
+          methods.checked = false;
+          methods.dispatchEvent(new Event("change"));
+          flag.umlRepaintSuperseded = true;
+        });
+        observer.observe(holder, { childList: true });
+      });
+      gate.release();
+      await withBound(gate.finished, 30_000, "released Root definition diagram");
+      await page.waitForFunction(
+        () => (window as RepaintFlagWindow).umlRepaintSuperseded === true,
+        undefined,
+        { timeout: 15_000 },
+      );
+
+      // The superseding repaint owns the outcome: its model paints and its finalizer ends loading.
+      await expect(frameHeadings(page)).toHaveText(["Root · feature/root.ts"]);
+      expect(await diagramNodeNames(page)).toEqual(["B", "C", "Root"]);
+      await expect(page.locator("#dsl-content")).not.toContainText("+run()");
+      await expect(page.locator("#diagram-loading")).toBeHidden();
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+    } finally {
+      gate.release();
+      await page.unroute("**/api/diagram?*", gate.handler);
+    }
+
+    // A released overlay stops covering the stage, so the painted graph stays navigable.
+    await tap(page, await centreOf(definitionLink(page, "B")));
+    await expect(frameHeadings(page)).toHaveText(["B · feature/b.ts"], { timeout: 60_000 });
+    expect(await diagramNodeNames(page)).toEqual(["B", "C"]);
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+test("clears diagram loading when editor navigation fails after superseding it", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const { page } = await openUmlFixturePage(
+      browser,
+      resource,
+      "failed editor fixture cache-ready",
+    );
+    const rootResult = await commitRootSearch(page);
+    const overviewHeadings = await frameHeadings(page).allTextContents();
+
+    let failedReads = 0;
+    const failRootSource = async (route: Route): Promise<void> => {
+      const url = new URL(route.request().url());
+      if (failedReads > 0 || url.searchParams.get("path") !== "feature/root.ts") {
+        await route.continue();
+        return;
+      }
+      failedReads++;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "source unavailable" }),
+      });
+    };
+    const gate = createResponseGate((url) => isUmlDiagramUrl(url, "definition", "feature/root.ts"));
+    await page.route("**/api/diagram?*", gate.handler);
+    await page.route("**/api/file?*", failRootSource);
+    try {
+      await rootResult.click();
+      await withBound(gate.captured, 30_000, "held Root definition diagram");
+      await expect(page.locator("#diagram-loading")).toBeVisible();
+      await expect(rootResult).toBeVisible();
+
+      // The double click abandons the held selection; its own failure must still free the overlay.
+      await rootResult.dblclick();
+      await expect(page.locator("#status")).toHaveText("source unavailable", { timeout: 30_000 });
+      await expect(page.locator("#status")).toHaveClass(/\berror\b/);
+      await expect(page.locator("#diagram-loading")).toBeHidden();
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+      expect(failedReads).toBe(1);
+
+      // The abandoned response lands afterwards: it may neither repaint nor restore loading.
+      gate.release();
+      await withBound(gate.finished, 30_000, "released Root definition diagram");
+      await afterTwoAnimationFrames(page);
+      await delay(500);
+      await expect(page.locator("#diagram-loading")).toBeHidden();
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+      await expect(page.locator("#editor-panel")).toBeHidden();
+      await expect(page.locator("#graph-panel")).toBeVisible();
+      expect(await frameHeadings(page).allTextContents()).toEqual(overviewHeadings);
+    } finally {
+      gate.release();
+      await page.unroute("**/api/file?*", failRootSource);
+      await page.unroute("**/api/diagram?*", gate.handler);
+    }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
 test("dismisses search results outside the search control", async ({ browser }) => {
   test.setTimeout(180_000);
   const resource = registerResource();
   try {
     const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     const cli = resource.clis.at(-1);
@@ -1726,14 +1876,7 @@ test("pans and zooms the diagram viewport", async ({ browser }) => {
   test.setTimeout(150_000);
   const resource = registerResource();
   try {
-    const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
-    const watch = watchCacheReady(page);
-    await navigateToCli(page, fixtureRoot, resource);
-    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
-    await withBound(watch.cacheReady, 60_000, "uml fixture cache-ready");
+    const { page } = await openUmlFixturePage(browser, resource, "uml fixture cache-ready");
     await expandTree(page, "feature");
     await treeRow(page, "feature/root.ts").click();
     await expect(frameHeadings(page)).toHaveText(
@@ -1784,9 +1927,7 @@ test("directories select import graphs while the Packages tab keeps the manifest
   const resource = registerResource();
   try {
     const fixtureRoot = await createNestedPackagesFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     const runtimeRow = treeRow(page, "junco-runtime");
@@ -1857,9 +1998,7 @@ test("a failed diagram shows the server error instead of mermaid output", async 
   const resource = registerResource();
   try {
     const fixtureRoot = await createUmlFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     const diagramRoute = (url: URL): boolean => url.pathname === "/api/diagram";
     const failUmlDiagram = async (route: Route): Promise<void> => {
@@ -1906,6 +2045,398 @@ test("a failed diagram shows the server error instead of mermaid output", async 
   }
 });
 
+/**
+ * Mermaid replaces any diagram whose preprocessed text exceeds `maxTextSize` with a one-node
+ * "Maximum text size in diagram exceeded" graph and still resolves successfully, so a passing
+ * render is no proof on its own. Both an oversized package graph and a genuinely oversized class
+ * frame must paint their real content.
+ */
+test("oversized diagrams render complete content", async ({ browser }, testInfo) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-large-diagram-e2e-"));
+    resource.fixtureRoot = fixtureRoot;
+    const memberType = "Alpha".repeat(32);
+    const memberNames = Array.from(
+      { length: 384 },
+      (_, index) => `member${String(index).padStart(3, "0")}`,
+    );
+    // The annotation identifier never resolves: the explorer reads source syntax without
+    // compiling the inspected project, and the type text is what makes one frame oversized.
+    const source = [
+      "export class HugeWidget {",
+      ...memberNames.map((name) => `  ${name}: ${memberType};`),
+      "}",
+      "",
+    ].join("\n");
+    await Promise.all([
+      writeFile(
+        join(fixtureRoot, "package.json"),
+        `${JSON.stringify({ name: "huge-e2e", private: true })}\n`,
+      ),
+      writeFile(join(fixtureRoot, "index.ts"), source),
+    ]);
+
+    const page = await openPage(browser, resource);
+    const watch = watchCacheReady(page);
+    const holder = page.locator("#svg-holder");
+    const sizeLimitMessage = "Maximum text size in diagram exceeded";
+
+    // Padding the direction keyword is the only way to cross the limit without adding nodes,
+    // edges or wide labels: comments, frontmatter and directives are stripped before Mermaid
+    // measures the text, while `flowchart\s*LR` keeps lexing.
+    const packagesRoute = (url: URL): boolean =>
+      url.pathname === "/api/diagram" && url.searchParams.get("kind") === "packages";
+    const padPackagesDiagram = async (route: Route): Promise<void> => {
+      const response = await route.fetch();
+      const diagram = await response.json() as Extract<DiagramResponse, { kind: "packages" }>;
+      const dsl = diagram.dsl.replace("flowchart LR", `flowchart ${" ".repeat(60_000)}LR`);
+      expect(dsl.length).toBeGreaterThan(60_000);
+      // The upstream content-length measures the original body; Playwright recomputes it only
+      // when the header is absent, and a stale one truncates the padded JSON.
+      const headers = { ...response.headers() };
+      delete headers["content-length"];
+      await route.fulfill({
+        response,
+        headers,
+        body: JSON.stringify({ ...diagram, dsl, dsls: [dsl] }),
+      });
+    };
+    await page.route(packagesRoute, padPackagesDiagram);
+    try {
+      await navigateToCli(page, fixtureRoot, resource);
+      await expect(treeRow(page, "index.ts")).toBeVisible({ timeout: 15_000 });
+      await withBound(watch.cacheReady, 60_000, "oversized diagram cache-ready");
+      await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 60_000 });
+      await expect.poll(() => diagramNodeNames(page), { timeout: 60_000 }).toEqual(["huge-e2e"]);
+      await expect(holder.locator(".package-link")).toHaveCount(1);
+      await expect(holder).not.toContainText(sizeLimitMessage);
+      await attachScreenshot(page, testInfo, "oversized-packages");
+    } finally {
+      await page.unroute(packagesRoute, padPackagesDiagram);
+    }
+
+    /** Every declared member, the full type text and a single-frame DSL past the old ceiling. */
+    const expectCompleteWidget = async (): Promise<void> => {
+      await expect.poll(() => diagramNodeNames(page, 0), { timeout: 60_000 })
+        .toEqual(["HugeWidget"]);
+      await expect
+        .poll(async () => (await holder.textContent() ?? "").match(/\bmember\d{3}\b/g), {
+          timeout: 60_000,
+        })
+        .toEqual(memberNames);
+      await expect(holder).toContainText(memberType, { timeout: 60_000 });
+      await expect
+        .poll(
+          async () =>
+            (await page.locator("#dsl-content").textContent() ?? "")
+              .replace(/^%%[^\n]*\n/, "")
+              .length,
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(60_000);
+      await expect(holder).not.toContainText(sizeLimitMessage);
+      await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+      await expect(page.locator("#error-panel")).toBeHidden();
+    };
+
+    await treeRow(page, "index.ts").click();
+    await expect(frameHeadings(page)).toHaveText(["HugeWidget · index.ts"], { timeout: 60_000 });
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 60_000 });
+    await expectCompleteWidget();
+    await attachScreenshot(page, testInfo, "oversized-definition");
+
+    // The retained model repaints locally, so the threshold is crossed again without a request.
+    await page.locator("#uml-show-attributes").uncheck();
+    await expect.poll(() => diagramNodeNames(page, 0), { timeout: 60_000 })
+      .toEqual(["HugeWidget"]);
+    await expect(holder).not.toContainText("member383", { timeout: 60_000 });
+    await page.locator("#uml-show-attributes").check();
+    await expect(holder).toContainText("member383", { timeout: 60_000 });
+    await expectCompleteWidget();
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+/**
+ * Mermaid's flowchart DB throws `Edge limit exceeded` past `maxEdges`, another secure config only
+ * `initialize` can raise. A directory whose files import each other densely must still paint every
+ * node and every link.
+ */
+test("dense import graphs render every edge", async ({ browser }, testInfo) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "ts-explorer-dense-edges-e2e-"));
+    resource.fixtureRoot = fixtureRoot;
+    await writeFile(
+      join(fixtureRoot, "package.json"),
+      `${JSON.stringify({ name: "dense-e2e", private: true })}\n`,
+    );
+    const { expectedNodes, edgeCount } = await addDenseImportFixture(fixtureRoot);
+
+    const page = await openPage(browser, resource);
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "graph")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "dense import graph cache-ready");
+
+    await treeRow(page, "graph").click();
+    await expect(frameHeadings(page)).toHaveText(["graph"], { timeout: 60_000 });
+    await expect(page.locator("#diagram-loading")).toBeHidden({ timeout: 60_000 });
+
+    // The generated DSL really does declare more links than Mermaid's default ceiling allows.
+    const dsl = await page.locator("#dsl-content").textContent() ?? "";
+    expect((dsl.match(/-->/g) ?? []).length).toBe(edgeCount);
+    expect(edgeCount).toBeGreaterThan(500);
+
+    await expect.poll(() => diagramNodeNames(page, 0), { timeout: 60_000 }).toEqual(expectedNodes);
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() =>
+            document.querySelectorAll("#svg-holder .edgePaths path, #svg-holder path.flowchart-link")
+              .length
+          ),
+        { timeout: 60_000 },
+      )
+      .toBe(edgeCount);
+    await expect(page.locator("#svg-holder")).not.toContainText("Edge limit exceeded");
+    await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+    await expect(page.locator("#error-panel")).toBeHidden();
+    await attachScreenshot(page, testInfo, "dense-edges");
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+/**
+ * Loading may only withhold the selected diagram's own unfinished content. Both phases make one
+ * diagram genuinely unavailable — first a held HTTP response, then an eight-second layout solve
+ * burning worker CPU — while search, disclosure and the next file selection stay usable.
+ */
+test("keeps search and file navigation responsive during diagram loading", async ({ browser }, testInfo) => {
+  test.setTimeout(300_000);
+  const resource = registerResource();
+  try {
+    const fixtureRoot = await createUmlFixture(resource);
+    const dense = await addDenseImportFixture(fixtureRoot);
+    const page = await openPage(browser, resource);
+    const watch = watchCacheReady(page);
+    await navigateToCli(page, fixtureRoot, resource);
+    await expect(treeRow(page, "feature")).toBeVisible({ timeout: 15_000 });
+    await withBound(watch.cacheReady, 60_000, "responsive fixture cache-ready");
+    await commitRootSearch(page);
+
+    const searchInput = page.locator("#node-search");
+    const results = page.locator("#definition-results");
+    const filesHeading = page.locator(".sidebar-head h2");
+    const loading = page.locator("#diagram-loading");
+    const stage = page.locator("#diagram-stage");
+    const unrelatedRow = treeRow(page, "unrelated.ts");
+
+    const gate = createResponseGate((url) => isUmlDiagramUrl(url, "file", "consumer.ts"));
+    await page.route("**/api/diagram?*", gate.handler);
+    try {
+      await treeRow(page, "consumer.ts").click();
+      await withBound(gate.captured, 30_000, "held consumer.ts diagram");
+      await expect(loading).toBeVisible();
+      await expect(stage).toHaveAttribute("aria-busy", "true");
+
+      // Retained results still reopen and still dismiss while that one file is unavailable.
+      await searchInput.click();
+      await expect(results).toBeVisible({ timeout: 2_000 });
+      await filesHeading.click();
+      await expect(results).toBeHidden({ timeout: 2_000 });
+      await expect(searchInput).toHaveValue("Root");
+      await expect(loading).toBeVisible();
+
+      // A chevron changes its own disclosure and dismisses the popup, both still under loading.
+      await searchInput.click();
+      await expect(results).toBeVisible({ timeout: 2_000 });
+      const rootToggle = treeToggle(page, "feature/root.ts");
+      const expandedBefore = await rootToggle.getAttribute("aria-expanded");
+      await rootToggle.click();
+      await expect(rootToggle)
+        .toHaveAttribute("aria-expanded", expandedBefore === "true" ? "false" : "true", {
+          timeout: 2_000,
+        });
+      await expect(results).toBeHidden({ timeout: 2_000 });
+      await expect(loading).toBeVisible();
+      await attachScreenshot(page, testInfo, "responsive-held-response");
+
+      // The next file paints without waiting for the held one, and the held one never returns.
+      await unrelatedRow.click();
+      await expect(unrelatedRow).toHaveAttribute("aria-current", "true", { timeout: 30_000 });
+      await expect(frameHeadings(page)).toHaveText(["Unrelated · unrelated.ts"], {
+        timeout: 30_000,
+      });
+      gate.release();
+      await withBound(gate.finished, 15_000, "released consumer.ts diagram");
+      await afterTwoAnimationFrames(page);
+      await expect(frameHeadings(page)).toHaveText(["Unrelated · unrelated.ts"]);
+      await expect(results).toBeHidden();
+      await expect(loading).toBeHidden();
+      await expect(unrelatedRow).toHaveAttribute("aria-current", "true");
+    } finally {
+      gate.release();
+      await page.unroute("**/api/diagram?*", gate.handler);
+    }
+
+    // Phase two exercises CPU, not latency: the prefix runs before the worker's real handler,
+    // announces the dense layout request and then spins for eight seconds inside the worker.
+    const workerScript = (url: URL): boolean => url.pathname === "/diagram-worker.js";
+    const stallPrefix = [
+      'self.addEventListener("message", (event) => {',
+      "  const request = event.data;",
+      `  if (!request || request.kind !== "layout") return;`,
+      `  if (request.graph.edges.length !== ${dense.edgeCount}) return;`,
+      '  self.postMessage({ kind: "__e2e-layout-started" });',
+      "  const until = Date.now() + 8000;",
+      "  while (Date.now() < until) {}",
+      "});",
+      "",
+    ].join("\n");
+    const prefixWorkerScript = async (route: Route): Promise<void> => {
+      const response = await route.fetch();
+      // The upstream content-length measures the original body; a stale one truncates the prefix.
+      const headers = { ...response.headers() };
+      delete headers["content-length"];
+      await route.fulfill({ response, headers, body: `${stallPrefix}${await response.text()}` });
+    };
+    await page.route(workerScript, prefixWorkerScript);
+    await page.evaluate(() => {
+      const scope = window as DiagramWorkerProbeWindow;
+      const NativeWorker = scope.Worker;
+      scope.__e2eNativeWorker = NativeWorker;
+      scope.__e2eLayoutStarted = false;
+      class ProbeWorker extends NativeWorker {
+        constructor(url: string | URL, options?: WorkerOptions) {
+          super(url, options);
+          // Registered before the application's listener, so the marker never reaches it.
+          this.addEventListener("message", (event: MessageEvent) => {
+            if ((event.data as { kind?: string } | null)?.kind !== "__e2e-layout-started") return;
+            event.stopImmediatePropagation();
+            scope.__e2eLayoutStarted = true;
+          });
+        }
+      }
+      scope.Worker = ProbeWorker;
+    });
+    try {
+      await treeRow(page, "graph").click();
+      await withBound(
+        page.waitForFunction(
+          () => (window as DiagramWorkerProbeWindow).__e2eLayoutStarted === true,
+          undefined,
+          { polling: "raf", timeout: 30_000 },
+        ),
+        30_000,
+        "dense layout solve started inside the diagram worker",
+      );
+      await expect(loading).toBeVisible();
+      await expect(stage).toHaveAttribute("aria-busy", "true");
+
+      // The popup opens and closes *while* the worker is still burning CPU on the old diagram.
+      await searchInput.click();
+      await expect(results).toBeVisible({ timeout: 2_000 });
+      await filesHeading.click();
+      await expect(results).toBeHidden({ timeout: 2_000 });
+      await expect(loading).toBeVisible();
+      await attachScreenshot(page, testInfo, "responsive-busy-worker");
+
+      // The obsolete eight-second solve must not delay the replacement selection.
+      await unrelatedRow.click();
+      await expect(unrelatedRow).toHaveAttribute("aria-current", "true", { timeout: 2_000 });
+      await expect(frameHeadings(page)).toHaveText(["Unrelated · unrelated.ts"], { timeout: 2_000 });
+      await expect(loading).toBeHidden({ timeout: 10_000 });
+
+      // Outliving the abandoned solve: it reports no error and repaints nothing.
+      await delay(9_000);
+      await expect(frameHeadings(page)).toHaveText(["Unrelated · unrelated.ts"]);
+      await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+      await expect(page.locator("#error-panel")).toBeHidden();
+      await expect(loading).toBeHidden();
+      await expect(unrelatedRow).toHaveAttribute("aria-current", "true");
+      await attachScreenshot(page, testInfo, "responsive-replacement-selection");
+    } finally {
+      await page.unroute(workerScript, prefixWorkerScript);
+      await page.evaluate(() => {
+        const scope = window as DiagramWorkerProbeWindow;
+        if (scope.__e2eNativeWorker) scope.Worker = scope.__e2eNativeWorker;
+        delete scope.__e2eNativeWorker;
+        delete scope.__e2eLayoutStarted;
+      });
+    }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
+/** A dead worker may cost its own diagram, never the retained search state or the next selection. */
+test("keeps navigation usable after a diagram worker failure", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const resource = registerResource();
+  try {
+    const { page } = await openUmlFixturePage(
+      browser,
+      resource,
+      "worker failure fixture cache-ready",
+    );
+    await commitRootSearch(page);
+
+    const searchInput = page.locator("#node-search");
+    const results = page.locator("#definition-results");
+    const loading = page.locator("#diagram-loading");
+    const workerScript = (url: URL): boolean => url.pathname === "/diagram-worker.js";
+    let broken = false;
+    const breakNextWorker = async (route: Route): Promise<void> => {
+      if (broken) {
+        await route.continue();
+        return;
+      }
+      broken = true;
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/javascript; charset=utf-8" },
+        body: 'throw new Error("forced diagram worker failure");',
+      });
+    };
+    await page.route(workerScript, breakNextWorker);
+    try {
+      await searchInput.click();
+      await searchInput.press("Enter");
+      await expect(page.locator("#error-panel")).toContainText("forced diagram worker failure", {
+        timeout: 60_000,
+      });
+      await expect(loading).toBeHidden({ timeout: 60_000 });
+      await expect(page.locator("#diagram-stage")).toHaveAttribute("aria-busy", "false");
+
+      // The failure costs the diagram, not the committed search.
+      await expect(searchInput).toHaveValue("Root");
+      await expect(treeRow(page, "feature/root.ts")).toHaveClass(/\bsearch-match\b/);
+      await searchInput.click();
+      await expect(results.locator(".definition-result", { hasText: "class · Root" }))
+        .toHaveCount(1);
+
+      // A later selection gets a fresh worker; no retry of the failed operation is expected.
+      await treeRow(page, "unrelated.ts").click();
+      await expect(frameHeadings(page)).toHaveText(["Unrelated · unrelated.ts"], {
+        timeout: 60_000,
+      });
+      await expect(page.locator("#error-panel")).toBeHidden();
+      await expect(page.locator(".uml-frame.error")).toHaveCount(0);
+      await expect(loading).toBeHidden();
+    } finally {
+      await page.unroute(workerScript, breakNextWorker);
+    }
+  } finally {
+    await cleanupResource(resource);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Tree, search and editor lifecycle
 // ---------------------------------------------------------------------------
@@ -1915,9 +2446,7 @@ test("renders a live tree independently and observes cache completion", async ({
   const resource = registerResource();
   try {
     const fixtureRoot = await createBulkFixture(resource);
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
 
@@ -2014,9 +2543,7 @@ test("submits case-insensitive search only after Enter", async ({ browser }) => 
     ].join("\n");
     await writeFile(fixturePath, initialSource);
 
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     const cli = resource.clis.at(-1);
@@ -2245,9 +2772,7 @@ test("prints the open file with light syntax colors", async ({ browser }) => {
       ].join("\n"),
     );
 
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     await page.addInitScript(() => {
       const counter: PrintCounterWindow = window;
       counter.printCalls = 0;
@@ -2312,9 +2837,7 @@ test("resolves concurrent file outlines independently and discards superseded on
     await writeFile(join(fixtureRoot, "beta.ts"), 'export const BETA: string = "b";\n');
     await writeFile(join(fixtureRoot, "gamma.ts"), "export const GAMMA: boolean = true;\n");
 
-    resource.context = await browser.newContext();
-    resource.page = await resource.context.newPage();
-    const page = resource.page;
+    const page = await openPage(browser, resource);
     const watch = watchCacheReady(page);
     await navigateToCli(page, fixtureRoot, resource);
     await withBound(watch.cacheReady, 45_000, "outline fixture cache-ready");

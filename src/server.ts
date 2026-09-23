@@ -1,8 +1,10 @@
+import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Server, ServerWebSocket } from "bun";
 import { ExplorerStore, InputError } from "./store.ts";
 import { PathError } from "./paths.ts";
 import { isRecord, type PreprocessProgressEvent } from "./preprocess-protocol.ts";
+import { DEFAULT_UML_DEPTH } from "./types.ts";
 import type {
   DiagramRequest,
   PreprocessControlRequest,
@@ -24,6 +26,7 @@ type Socket = ServerWebSocket<undefined>;
 export class ExplorerServer {
   private readonly options: ServerOptions;
   private readonly mainJs: ArrayBuffer;
+  private readonly diagramWorkerJs: ArrayBuffer;
   private readonly clients: Set<Socket>;
   private readonly store: ExplorerStore;
   private server: Server<undefined> | undefined;
@@ -34,19 +37,29 @@ export class ExplorerServer {
     const bundle = await Bun.build({
       entrypoints: [
         fileURLToPath(new URL("./web/main.ts", import.meta.url)),
+        fileURLToPath(new URL("./web/diagram-worker.ts", import.meta.url)),
       ],
       target: "browser",
       format: "esm",
+      splitting: false,
+      naming: "[name].js",
       minify: false,
     });
     if (!bundle.success) {
       throw new AggregateError(bundle.logs, "client bundle failed");
     }
-    const output = bundle.outputs[0];
-    if (!output) throw new Error("client bundle produced no output");
+    // Resolved by name: two entrypoints have no guaranteed output order.
+    const outputs = new Map(
+      bundle.outputs.map((output) => [basename(output.path), output] as const),
+    );
+    const mainOutput = outputs.get("main.js");
+    if (!mainOutput) throw new Error("client bundle missing main.js");
+    const workerOutput = outputs.get("diagram-worker.js");
+    if (!workerOutput) throw new Error("client bundle missing diagram-worker.js");
     const explorerServer = new ExplorerServer(
       options,
-      await output.arrayBuffer(),
+      await mainOutput.arrayBuffer(),
+      await workerOutput.arrayBuffer(),
     );
     try {
       explorerServer.listen();
@@ -62,9 +75,10 @@ export class ExplorerServer {
     }
   }
 
-  private constructor(options: ServerOptions, mainJs: ArrayBuffer) {
+  private constructor(options: ServerOptions, mainJs: ArrayBuffer, diagramWorkerJs: ArrayBuffer) {
     this.options = options;
     this.mainJs = mainJs;
+    this.diagramWorkerJs = diagramWorkerJs;
     this.clients = new Set<Socket>();
     this.cacheReadyVersion = undefined;
     this.stopPromise = undefined;
@@ -144,6 +158,11 @@ export class ExplorerServer {
       }
       if (url.pathname === "/main.js") {
         return new Response(this.mainJs, {
+          headers: { "content-type": "application/javascript; charset=utf-8" },
+        });
+      }
+      if (url.pathname === "/diagram-worker.js") {
+        return new Response(this.diagramWorkerJs, {
           headers: { "content-type": "application/javascript; charset=utf-8" },
         });
       }
@@ -274,7 +293,9 @@ export class ExplorerServer {
     );
   }
 
-  /** `?kind=packages` or `?kind=uml&target=definition|file|directory&path=…&definition=…`. */
+  /**
+   * `?kind=packages` or `?kind=uml&target=definition|file|directory&path=…&definition=…&depth=…`.
+   */
   private static parseDiagramRequest(searchParams: URLSearchParams): DiagramRequest {
     const kind = searchParams.get("kind");
     if (kind !== "packages" && kind !== "uml") {
@@ -290,11 +311,24 @@ export class ExplorerServer {
     if (target !== "definition" && definition !== null) {
       throw new InputError("definition is only valid for a definition target");
     }
-    if (target === "directory") return { kind, target: { kind: "directory", path } };
+    const depth = ExplorerServer.parseDiagramDepth(searchParams);
+    if (target === "directory") return { kind, target: { kind: "directory", path }, depth };
     if (!path) throw new InputError("path is required");
-    if (target === "file") return { kind, target: { kind: "file", path } };
+    if (target === "file") return { kind, target: { kind: "file", path }, depth };
     if (definition === null || definition === "") throw new InputError("definition is required");
-    return { kind, target: { kind: "definition", path, definitionKey: definition } };
+    return { kind, target: { kind: "definition", path, definitionKey: definition }, depth };
+  }
+
+  /** An omitted depth means the shared default; a present one must be a non-negative integer. */
+  private static parseDiagramDepth(searchParams: URLSearchParams): number {
+    const value = searchParams.get("depth");
+    if (value === null) return DEFAULT_UML_DEPTH;
+    if (!/^\d+$/.test(value)) throw new InputError("depth must be a non-negative integer");
+    const depth = Number(value);
+    if (!Number.isSafeInteger(depth) || depth < 0) {
+      throw new InputError("depth must be a non-negative integer");
+    }
+    return depth;
   }
 
   private static parseFileLocation(
