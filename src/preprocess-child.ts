@@ -687,9 +687,31 @@ async function handleRequest(request: PreprocessRequest): Promise<PreprocessResp
     const sourceFingerprint = await computeSourceFingerprint(sourceDir);
     const cache = new Cache(request.dbPath);
     try {
-      const activeGenerationId = request.recover
+      let activeGenerationId = request.recover
         ? cache.recover(sourceFingerprint)
         : cache.getActiveGenerationId();
+      // The fingerprint only covers the traversable tree, while package discovery reads workspace
+      // manifests anywhere under the root, so a package can disappear without changing it. Rejecting
+      // the candidate only withholds it from this session: the persisted active generation survives
+      // for the explicitly marked package-error fallback until promotion replaces it.
+      if (request.recover && activeGenerationId !== null) {
+        try {
+          const cached = cache.readPackages(activeGenerationId);
+          const current = await discoverPackages(sourceDir);
+          const matches = cached.length === current.length
+            && current.every((pkg, index) => {
+              const previous = cached[index];
+              return previous !== undefined
+                && previous.name === pkg.name
+                && previous.path === normalizeRelativePath(pkg.path)
+                && previous.dependencies.length === pkg.dependencies.length
+                && previous.dependencies.every((name, position) => name === pkg.dependencies[position]);
+            });
+          if (!matches) activeGenerationId = null;
+        } catch {
+          activeGenerationId = null;
+        }
+      }
       state = { sourceDir, cache };
       return success(request, {
         activeGenerationId,

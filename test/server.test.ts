@@ -24,6 +24,7 @@ import type {
   GotoDefinition,
   PackageDiagramNode,
   PackageDiagramPayload,
+  PackageInfo,
   SearchResponse,
   TreeNode,
   WatchEventName,
@@ -170,6 +171,12 @@ async function fetchDiagram(base: string, query: string): Promise<DiagramRespons
   const response = await fetch(`${base}/api/diagram?${query}`);
   expect(response.status, query).toBe(200);
   return await response.json() as DiagramResponse;
+}
+
+async function fetchPackages(base: string): Promise<PackageInfo[]> {
+  const response = await fetch(`${base}/api/packages`);
+  expect(response.status).toBe(200);
+  return (await response.json() as { packages: PackageInfo[] }).packages;
 }
 
 /** The outline key of one declaration, obtained the way the browser obtains it. */
@@ -1494,6 +1501,98 @@ test("warm restart rebuilds when sources changed while stopped and reuses the ca
     await watch?.close();
     await secondServer?.stop();
     await firstServer?.stop();
+  }
+}, 60_000);
+
+function packageNodeShapes(
+  payload: PackageDiagramPayload,
+): { name: string; path: string }[] {
+  return payload.packageNodes.map((node) => ({ name: node.name, path: node.path }));
+}
+
+test("warm restart removes deleted packages outside the source fingerprint", async () => {
+  const root = await fixtures.temporaryRoot("ts-explorer-package-deleted-");
+  await writeFixtureFile(root, "package.json", JSON.stringify({ workspaces: ["out/*"] }));
+  await writeFixtureFile(
+    root,
+    "out/app/package.json",
+    JSON.stringify({ name: "app", dependencies: { "rmux-windows-console": "*" } }),
+  );
+  await writeFixtureFile(
+    root,
+    "out/rmux-windows-console/package.json",
+    JSON.stringify({ name: "rmux-windows-console" }),
+  );
+
+  let server: RunningServer | undefined;
+  let watch: WatchClient | undefined;
+  try {
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    let base = `http://127.0.0.1:${server.port}`;
+    watch = await openWatch(base);
+    await watch.waitFor((message) => message.type === "cache-ready");
+
+    const seeded = packagesPayload(await fetchDiagram(base, "kind=packages&path="));
+    expect(seeded.status).toBe("ready");
+    expect(packageNodeShapes(seeded)).toEqual([
+      { name: "app", path: "out/app" },
+      { name: "rmux-windows-console", path: "out/rmux-windows-console" },
+    ]);
+    expect(seeded.dsl).toContain("-->");
+    expect(await fetchPackages(base)).toEqual([
+      { name: "app", path: "out/app", dependencies: ["rmux-windows-console"] },
+      { name: "rmux-windows-console", path: "out/rmux-windows-console", dependencies: [] },
+    ]);
+
+    await watch.close();
+    watch = undefined;
+    await server.stop();
+    server = undefined;
+
+    await rm(join(root, "out", "rmux-windows-console"), { recursive: true, force: true });
+
+    // `out` is excluded from the traversal the fingerprint hashes, so this deletion leaves the
+    // fingerprint identical: the very first read of the recovered cache must already be current.
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    base = `http://127.0.0.1:${server.port}`;
+    expect(await fetchPackages(base)).toEqual([
+      { name: "app", path: "out/app", dependencies: [] },
+    ]);
+    const recovered = packagesPayload(await fetchDiagram(base, "kind=packages&path="));
+    expect(recovered.status).toBe("ready");
+    expect(packageNodeShapes(recovered)).toEqual([{ name: "app", path: "out/app" }]);
+    expect(recovered.dsl).not.toContain("rmux-windows-console");
+    expect(recovered.dsl).not.toContain("-->");
+
+    watch = await openWatch(base);
+    await watch.waitFor((message) => message.type === "cache-ready");
+    expect(await fetchPackages(base)).toEqual([
+      { name: "app", path: "out/app", dependencies: [] },
+    ]);
+    const promoted = packagesPayload(await fetchDiagram(base, "kind=packages&path="));
+    expect(promoted.status).toBe("ready");
+    expect(packageNodeShapes(promoted)).toEqual([{ name: "app", path: "out/app" }]);
+
+    await watch.close();
+    watch = undefined;
+    await server.stop();
+    server = undefined;
+
+    // The root manifest carries no `name`, so the npm root fallback cannot invent a package.
+    await rm(join(root, "out", "app"), { recursive: true, force: true });
+
+    server = await startServer({ sourceDir: root, host: "127.0.0.1", port: 0 });
+    base = `http://127.0.0.1:${server.port}`;
+    expect(await fetchPackages(base)).toEqual([]);
+    const emptied = packagesPayload(await fetchDiagram(base, "kind=packages&path="));
+    expect(emptied.status).toBe("ready");
+    expect(emptied.packageNodes).toEqual([]);
+
+    watch = await openWatch(base);
+    await watch.waitFor((message) => message.type === "cache-ready");
+  } finally {
+    await watch?.close();
+    await server?.stop();
   }
 }, 60_000);
 
